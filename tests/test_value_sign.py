@@ -67,12 +67,21 @@ class ValueSignTest(unittest.TestCase):
 
     def test_long_game_cap(self):
         """构造 250 ply 长局：moves_left 截断 200。"""
-        board = chess.Board()
-        sans = []
-        while len(sans) < 240 and not board.is_game_over():
-            mv = list(board.legal_moves)[0]
-            sans.append(board.san(mv))
-            board.push(mv)
+        import random
+
+        rng = random.Random(1)
+        for _attempt in range(50):
+            board = chess.Board()
+            sans = []
+            while len(sans) < 240 and not board.is_game_over():
+                mv = rng.choice(list(board.legal_moves))
+                sans.append(board.san(mv))
+                board.push(mv)
+            if len(sans) >= 201:
+                break
+        else:  # pragma: no cover
+            self.fail("未能随机出 201+ ply 长局")
+        # 未到自然终局但按实际计为和棋（abandoned 口径，§4.1）
         pgn_text = '[Result "1/2-1/2"]\n\n' + " ".join(sans) + " 1/2-1/2"
         game = chess.pgn.read_game(io.StringIO(pgn_text))
         meta = {"elo_mean": None, "time_control": None, "result": "1/2-1/2", "variant": "Standard"}
