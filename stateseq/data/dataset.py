@@ -21,9 +21,12 @@ from .sequences import T_MAX, _board_key
 
 
 def replay_game(actions: np.ndarray, meta: np.ndarray) -> dict[str, np.ndarray]:
-    """动作 id 序列 → 逐步张量（含断言：动作必须在合法着集合内，规则引擎权威）。"""
+    """动作 id 序列 → 逐步张量（含断言：动作必须在合法着集合内，规则引擎权威）。
+    序列截断到 T_MAX=200（设计文档 T≤200，§7.3）。"""
     import chess  # 延迟导入：worker 进程内初始化
 
+    if len(actions) > T_MAX:
+        actions = actions[:T_MAX]
     board = chess.Board()
     n = len(actions)
     feats = np.zeros((n, FEATURE_DIM), dtype=np.float32)
@@ -141,25 +144,23 @@ class SequenceDataset:
             "valid": valid,
         }
 
-    def epoch_batches(self, microbatch: int, device: str, shuffle: bool = True):
-        """生成一整 epoch 的 microbatch（惰性，主进程内串行产出）。"""
+    def epoch_batches(self, microbatch: int, device: str, shuffle: bool = True, prefetch: int = 3):
+        """生成一整 epoch 的 microbatch；map_async 预取 depth=prefetch 与 GPU 计算重叠。"""
         idxs = self.train_indices.copy()
         if shuffle:
             rng = np.random.default_rng(self.seed)
             rng.shuffle(idxs)
-        buf: list = []
-        for idx in idxs:
-            buf.append(idx)
-            if len(buf) >= microbatch * 4:  # 小池乱序后按长度排序
-                pool = [buf[i] for i in np.random.permutation(len(buf))]
-                for j in range(0, len(pool), microbatch):
-                    yield self._build_batch(pool[j:j + microbatch], device)
-                buf = []
-        if buf:
-            yield self._build_batch(buf, device)
+        chunks = [idxs[j:j + microbatch] for j in range(0, len(idxs), microbatch)]
+        pending: list = []
+        for ch in chunks[:prefetch]:
+            pending.append(self.pool.map_async(_worker_build, ch))
+        for i, ch in enumerate(chunks):
+            items = pending.pop(0).get()
+            if i + prefetch < len(chunks):
+                pending.append(self.pool.map_async(_worker_build, chunks[i + prefetch]))
+            yield self._build_batch(items, device)
 
-    def _build_batch(self, indices: list[int], device: str):
-        items = self.pool.map(_worker_build, indices)
+    def _build_batch(self, items: list[tuple[int, dict, float, float, int]], device: str):
         out = self._collate(items)
         out["batch"] = _to_device(out["batch"], device)
         out["valid"] = out["valid"].to(device, non_blocking=True)
@@ -171,7 +172,8 @@ class SequenceDataset:
                           replace=False)
         out = []
         for j in range(0, len(idxs), microbatch):
-            out.append(self._build_batch(list(idxs[j:j + microbatch]), device))
+            items = self.pool.map(_worker_build, list(idxs[j:j + microbatch]))
+            out.append(self._build_batch(items, device))
         return out
 
     def close(self) -> None:
