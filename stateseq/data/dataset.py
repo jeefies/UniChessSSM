@@ -100,6 +100,7 @@ class SequenceDataset:
     def __init__(self, shard_dir: str, workers: int = 12, seed: int = 20260915):
         self.reader = ShardReader(shard_dir)
         self.n_games = len(self.reader.meta_all)
+        self.lengths = self.reader.meta_all["n_plies"].astype(np.int64)
         self.workers = workers
         self.seed = seed
         self.pool = mp.Pool(workers, initializer=_worker_init, initargs=(shard_dir,))
@@ -145,12 +146,16 @@ class SequenceDataset:
         }
 
     def epoch_batches(self, microbatch: int, device: str, shuffle: bool = True, prefetch: int = 3):
-        """生成一整 epoch 的 microbatch；map_async 预取 depth=prefetch 与 GPU 计算重叠。"""
-        idxs = self.train_indices.copy()
+        """生成一整 epoch 的 microbatch；长度分桶（块内等长减少填充）+ map_async 预取重叠 GPU。"""
         if shuffle:
+            order = np.argsort(self.lengths[self.train_indices], kind="stable")
+            chunks = [self.train_indices[i] for i in order]
+            chunks = [chunks[j:j + microbatch] for j in range(0, len(chunks), microbatch)]
             rng = np.random.default_rng(self.seed)
-            rng.shuffle(idxs)
-        chunks = [idxs[j:j + microbatch] for j in range(0, len(idxs), microbatch)]
+            rng.shuffle(chunks)  # 只乱桶序，桶内保持长度有序
+        else:
+            chunks = [self.train_indices[j:j + microbatch]
+                      for j in range(0, len(self.train_indices), microbatch)]
         pending: list = []
         for ch in chunks[:prefetch]:
             pending.append(self.pool.map_async(_worker_build, ch))
