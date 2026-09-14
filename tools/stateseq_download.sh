@@ -12,7 +12,8 @@ MONTHS="2026-08 2026-07 2026-06"
 
 fetch_chunk() { # $1=month $2=idx
   local month=$1 i=$2
-  local s=$((i * CHUNK_BYTES)) e=$((s + CHUNK_BYTES - 1))
+  local s=$((i * CHUNK_BYTES))
+  local e=$((s + CHUNK_BYTES - 1))
   local out="data/raw/${month}.chunk$(printf %02d "$i")"
   local tries=0
   while [ $tries -lt 30 ]; do
