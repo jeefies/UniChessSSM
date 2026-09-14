@@ -1,0 +1,17 @@
+[project]
+name = "unichess-ssm"
+version = "0.0.1"
+description = "UniChess state-sequence model (E: square-level Transformer -> R: Mamba -> f: policy/WDL/moves-left)"
+requires-python = ">=3.12"
+# 依赖实际由远端 conda 环境 unichess 提供（复用，不单独建 env）：
+dependencies = [
+    "torch>=2.11",
+    "numpy",
+    "python-chess>=1.999",
+    "zstandard",
+    "mamba-ssm",
+    "causal-conv1d",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
