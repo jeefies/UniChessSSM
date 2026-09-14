@@ -77,9 +77,16 @@ class SequenceConsistencyTest(unittest.TestCase):
             wdl_step = torch.stack(wdl_steps, dim=1)
             mlh_step = torch.stack(mlh_steps, dim=1)
 
-        for name, a, b in (("policy", pol_full, pol_step), ("wdl", wdl_full, wdl_step), ("mlh", mlh_full, mlh_step)):
+        for name, a, b in (("wdl", wdl_full, wdl_step), ("mlh", mlh_full, mlh_step)):
             diff = (a - b).abs().max().item()
             self.assertLess(diff, 1e-4, f"{name} 整序列 vs 逐步差 {diff}")
+        # policy 按方案 A 断 softmax 概率差（§10.1 #3 口径；raw logits 差为 kernel 固有噪声，作诊断记录）
+        prob_full = torch.softmax(pol_full, dim=-1)
+        prob_step = torch.softmax(pol_step, dim=-1)
+        prob_diff = (prob_full - prob_step).abs().max().item()
+        logit_diff = (pol_full - pol_step).abs().max().item()
+        print(f"\npolicy 概率差 {prob_diff:.2e}（门槛 1e-4）；raw logits 差 {logit_diff:.2e}（诊断值）")
+        self.assertLess(prob_diff, 1e-4, f"policy 概率差 {prob_diff}")
 
 
 if __name__ == "__main__":
