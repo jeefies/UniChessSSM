@@ -76,7 +76,7 @@ class SeqModel(nn.Module):
         h = self.trunk(x + cond)                                          # (B, T, 512)
         policy_logits, wdl_logits, mlh = self.f(h)
 
-        l_pol = losses.policy_loss(policy_logits, batch.actions, batch.elo_weight.expand(bsz, seqlen))
+        l_pol = losses.policy_loss(policy_logits, batch.actions, batch.elo_weight.unsqueeze(1).expand(bsz, seqlen))
         l_val = losses.value_loss(wdl_logits, batch.results)
         l_mlh = losses.mlh_loss(mlh, batch.moves_left)
 
