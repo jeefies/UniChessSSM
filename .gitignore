@@ -1,7 +1,7 @@
 # 运行时产物
-data/
-runs/
-logs/
+/data/
+/runs/
+/logs/
 
 # Python
 __pycache__/

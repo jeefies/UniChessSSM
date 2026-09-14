@@ -32,14 +32,15 @@ g（残差动力学）不参与推理。预热用 Lichess 人类棋谱行为克�
 ```
 UniChessSSM/
 ├── AGENTS.md  README.md  pyproject.toml
-├── stateseq/            # Python 包
+├── stateseq/            # Python 包（model.py 为总装）
 │   ├── actions.py       # 1936 动作空间常量表 + 双射
 │   ├── features.py      # 785 维局面特征编码/解码（设计文档称"约790"）
 │   ├── conditions.py    # time_control/elo/color 条件
 │   ├── model_e.py       # 格子级 Transformer E
 │   ├── model_r.py       # Mamba 主干 R（官方 mamba_ssm）
+│   ├── model_d.py       # D 重建解码器（仅训练；原拟名 aux.py 系 Windows 保留名）
+│   ├── model_g.py       # g 残差动力学侧枝（仅训练）
 │   ├── heads.py         # f: policy/WDL/moves-left
-│   ├── aux.py           # D 重建 + g 动力学（仅训练）
 │   ├── losses.py        # 五损失（统一归约口径）
 │   └── data/            # PGN 下载/序列构建/分片/Elo 加权
 ├── tools/               # 冒烟与一次性脚本
