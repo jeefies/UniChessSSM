@@ -10,7 +10,12 @@ UniChessSSM 是 UniChess 的**新架构独立项目**：状态序列模型（sta
 g（残差动力学）不参与推理。预热用 Lichess 人类棋谱行为克隆（**不用 Stockfish 蒸馏**）。
 
 **权威设计文档**：`../UniChess/docs/state-sequence-model-design.md`（v2.0）。
+**偏差记录**：`docs/design-deviations.md`（实现时经文档作者确认的口径调整，原目录文档不动）。
 决策 D1–D10 已锁定，实现时不得偏离；不确定处回到文档作者（用户）确认。
+
+**当前状态（2026-09-14）：阶段 0 已验收通过**——7 项清单全绿（17 个单测 OK），
+冒烟：参数实测 26.40M（预算 ~27M），五损失首轮合理。下一步 Stage A（全量 Lichess 数据
++ 正式训练），启动前须经用户确认数据下载。
 
 与原项目 UniChess（ResNet 46M + MCTS + autoloop）**完全隔离**：本目录独立开发、独立数据、
 独立 git 仓库；不得修改 `/home/jeefy/UniChess` 的任何文件或服务配置。
@@ -25,7 +30,8 @@ g（残差动力学）不参与推理。预热用 Lichess 人类棋谱行为克�
 - git 同步：本地 commit → push 到远端 bare → 远端工作目录 `git pull`。
 - 远端 conda 环境（与原项目共用，**复用不改动**）：
   `/home/jeefy/miniconda3/envs/unichess/bin/python`（Python 3.12.14，torch 2.11.0+cu128）。
-- mamba-ssm / causal-conv1d 已安装进该 conda env（2026-09-14 源码编译，CUDA 12.9）。
+  2026-09-14 已装入 mamba-ssm 2.3.2 / causal-conv1d 1.7.0（源码编译，CUDA 12.9；torch 保持 2.11 未动）。
+  注意：Mamba2 单步 decode kernel 仅 CUDA 可用；CPU 上只能跑非 R 模块的单测（GPU 项自动跳过）。
 
 ## 3. 目录结构
 
@@ -44,9 +50,9 @@ UniChessSSM/
 │   ├── losses.py        # 五损失（统一归约口径）
 │   └── data/            # PGN 下载/序列构建/分片/Elo 加权
 ├── tools/               # 冒烟与一次性脚本
-├── tests/               # 阶段 0 七项验收单测（unittest）
+├── tests/               # 阶段 0 七项验收单测（unittest，全部通过）
 ├── data/  runs/         # 运行时产物（gitignore；磁盘水位见 §5）
-└── docs/
+└── docs/                # design-deviations.md（与原文档的偏差记录）
 ```
 
 ## 4. 构建与测试
