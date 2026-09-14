@@ -47,7 +47,6 @@ class MambaTower(nn.Module):
                 headdim=headdim,
                 expand=expand,
                 d_conv=d_conv,
-                dropout=dropout,
             )
             for _ in range(n_layers)
         )
