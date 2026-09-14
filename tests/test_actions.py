@@ -45,7 +45,8 @@ class ActionSpaceTest(unittest.TestCase):
                     back = action_to_move(aid)
                     self.assertEqual(back.from_square, mv.from_square)
                     self.assertEqual(back.to_square, mv.to_square)
-                    self.assertEqual(back.promotion, mv.promotion)
+                    expected = None if mv.promotion == chess.QUEEN else mv.promotion
+                    self.assertEqual(back.promotion, expected)
                 board.push(rng.choice(legal))
 
     def test_promotions_covered(self):

@@ -38,7 +38,7 @@ class StepRecord:
 def _board_key(board: chess.Board) -> tuple:
     """局面重复判定键：棋子布置 + 走子方 + 易位权 + 合法过路兵（等价于 FEN 前三段+ep，裁判口径）。"""
     return (
-        board.piece_map(),
+        tuple(sorted(board.piece_map().items())),
         board.turn,
         board.castling_rights,
         board.ep_square if board.has_legal_en_passant() else None,
