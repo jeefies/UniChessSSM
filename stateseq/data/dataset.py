@@ -119,26 +119,26 @@ class SequenceDataset:
         t = max(len(it[1]["actions"]) for it in items)
         from ..model import TrainBatch  # 延迟导入避免环
 
-        features = torch.zeros(b, t, FEATURE_DIM)
-        legal = torch.zeros(b, t, NUM_ACTIONS, dtype=torch.bool)
-        actions = torch.zeros(b, t, dtype=torch.long)
-        results = torch.ones(b, t, dtype=torch.long)   # 填充位置置 DRAW（masked 后不贡献）
-        moves_left = torch.zeros(b, t)
-        color = torch.zeros(b, t, dtype=torch.long)
-        elo_w = torch.ones(b)
-        elo_std = torch.zeros(b)
-        tc = torch.zeros(b, dtype=torch.long)
-        valid = torch.zeros(b, t, dtype=torch.bool)
-        for i, (_, d, w, es, tb) in enumerate(items):
-            n = len(d["actions"])
-            features[i, :n] = torch.from_numpy(d["features"])
-            legal[i, :n] = torch.from_numpy(d["legal_mask"])
-            actions[i, :n] = torch.from_numpy(d["actions"])
-            results[i, :n] = torch.from_numpy(d["results"])
-            moves_left[i, :n] = torch.from_numpy(d["moves_left"])
-            color[i, :n] = torch.from_numpy(d["color"])
-            valid[i, :n] = True
-            elo_w[i], elo_std[i], tc[i] = w, es, tb
+        # numpy 侧 pad+stack（逐行 np 赋值是 memcpy），再一次 from_numpy；避免 torch 逐行 setitem（实测慢 100×）
+        def pad_stack(key: str, dtype, shape_tail: tuple = ()) -> torch.Tensor:
+            out = np.zeros((b, t) + shape_tail, dtype=dtype)
+            for i, (_, d, *_rest) in enumerate(items):
+                n = len(d["actions"])
+                out[i, :n] = d[key]
+            return torch.from_numpy(out)
+
+        features = pad_stack("features", np.float32, (FEATURE_DIM,))
+        legal = pad_stack("legal_mask", np.bool_, (NUM_ACTIONS,))
+        actions = pad_stack("actions", np.int64)
+        results = pad_stack("results", np.int64)          # 填充位保持 0（masked 不贡献）
+        moves_left = pad_stack("moves_left", np.float32)
+        color = pad_stack("color", np.int64)
+        valid = torch.from_numpy(
+            np.arange(t)[None, :] < np.asarray([len(it[1]["actions"]) for it in items])[:, None]
+        )
+        elo_w = torch.tensor([it[2] for it in items], dtype=torch.float32)
+        elo_std = torch.tensor([it[3] for it in items], dtype=torch.float32)
+        tc = torch.tensor([it[4] for it in items], dtype=torch.long)
         return {
             "batch": TrainBatch(features, actions, legal, results, moves_left,
                                 elo_w, tc, elo_std, color),
