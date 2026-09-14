@@ -90,7 +90,8 @@ class ShardBuilder:
         os.replace(tmp, base + ".actions.bin")
         fd, tmp = tempfile.mkstemp(dir=self.out_dir, suffix=".tmp")
         os.close(fd)
-        np.savez(tmp, metas=metas, offsets=offsets)
+        with open(tmp, "wb") as fh:
+            np.savez(fh, metas=metas, offsets=offsets)
         os.replace(tmp, base + ".meta.npz")
         self.shard_files.append(base)
         self._metas, self._action_chunks = [], []
