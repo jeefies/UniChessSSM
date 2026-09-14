@@ -56,12 +56,12 @@ def start_seg(month: str, seg_idx: int, path: str, start: int, end: int, out: st
     have = os.path.getsize(out) if os.path.exists(out) else 0
     if have > 0:
         print(f"  resume seg{seg_idx} {path} at +{have/1e6:.1f}MB", flush=True)
-    cmd = ["curl", "-s", "--fail", "--max-time", str(MAX_SEG_SEC),
-           "-r", f"{start + have}-{end}"]
+    # 追加写入（shell >>）：curl -o 默认截断，重启会丢已下字节（v2 教训）
+    cmd = f"curl -s -f --max-time {MAX_SEG_SEC} -r {start + have}-{end} "
     if path == "proxy":
-        cmd += ["-x", PROXY]
-    cmd += ["-o", out, url(month)]
-    return subprocess.Popen(cmd)
+        cmd += f"-x {PROXY} "
+    cmd += f"\"{url(month)}\" >> {out}"
+    return subprocess.Popen(["bash", "-c", cmd])
 
 
 def seg_complete(out: str, expect: int) -> bool:
@@ -80,6 +80,7 @@ def download_month(month: str) -> None:
     expects = [e - s + 1 for _, s, e in SEGMENTS]
 
     procs: list[subprocess.Popen | None] = [None] * len(SEGMENTS)
+    seg_path = [SEGMENTS[i][0] for i in range(len(SEGMENTS))]
     last_size = [0] * len(SEGMENTS)
     last_time = [0.0] * len(SEGMENTS)
     consec_restart = [0] * len(SEGMENTS)
@@ -95,8 +96,8 @@ def download_month(month: str) -> None:
         if time.time() < cooldown_until[i]:
             procs[i] = None
             return
-        path, s, e = SEGMENTS[i]
-        procs[i] = start_seg(month, i, path, s, e, outs[i])
+        _tag, s, e = SEGMENTS[i]
+        procs[i] = start_seg(month, i, seg_path[i], s, e, outs[i])
         last_size[i] = os.path.getsize(outs[i]) if os.path.exists(outs[i]) else 0
         last_time[i] = time.time()
 
@@ -126,9 +127,9 @@ def download_month(month: str) -> None:
             if stalled:
                 consec_restart[i] += 1
                 if consec_restart[i] >= 3:
-                    cooldown_until[i] = time.time() + 5 * 60   # 该路径连续低速→休眠 5 分钟
+                    seg_path[i] = "proxy" if seg_path[i] == "direct" else "direct"  # 翻转路径
                     consec_restart[i] = 0
-                    print(f"  seg{i} 连续低速，路径休眠 5 分钟", flush=True)
+                    print(f"  seg{i} 连续低速，切换路径→{seg_path[i]}", flush=True)
                 else:
                     print(f"  seg{i} 低速 {rate/1024:.0f}KB/s，重启", flush=True)
                 kill(i)
