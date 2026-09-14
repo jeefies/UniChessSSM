@@ -45,7 +45,7 @@ def encode_game_record(actions: list[int], tc: str | None, result: str,
 
 
 META_DTYPE = np.dtype([
-    ("n_plies", np.uint8),
+    ("n_plies", np.uint16),
     ("tc_bucket", np.uint8),
     ("result", np.uint8),
     ("elo_missing", np.uint8),
