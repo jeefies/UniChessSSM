@@ -69,9 +69,10 @@ def recon_loss(d_out: dict[str, torch.Tensor], features: torch.Tensor) -> tuple[
     )
     loss = board_ce + 0.3 * aux
     with torch.no_grad():
+        pred_cls = d_out["board_logits"].argmax(dim=-1)  # (..., 64)
         diag = {
             "recon_board_ce": float(board_ce),
-            "recon_whole_board_acc": float((per_sq.argmin(dim=-1) == target_cls).all(dim=-1).float().mean()),
+            "recon_whole_board_acc": float((pred_cls == target_cls).all(dim=-1).float().mean()),
         }
     return loss, diag
 
