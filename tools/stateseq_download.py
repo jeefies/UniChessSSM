@@ -82,12 +82,17 @@ def download_month(month: str) -> None:
     procs: list[subprocess.Popen | None] = [None] * len(SEGMENTS)
     last_size = [0] * len(SEGMENTS)
     last_time = [0.0] * len(SEGMENTS)
+    consec_restart = [0] * len(SEGMENTS)
+    cooldown_until = [0.0] * len(SEGMENTS)
     t_start = time.time()
 
     def ensure(i: int) -> None:
         if procs[i] is not None and procs[i].poll() is None:
             return
         if seg_complete(outs[i], expects[i]):
+            procs[i] = None
+            return
+        if time.time() < cooldown_until[i]:
             procs[i] = None
             return
         path, s, e = SEGMENTS[i]
@@ -119,10 +124,17 @@ def download_month(month: str) -> None:
             rate = (sz - last_size[i]) / max(now - last_time[i], 1)
             stalled = rate < STALL_BPS
             if stalled:
-                print(f"  seg{i} 低速 {rate/1024:.0f}KB/s，重启", flush=True)
+                consec_restart[i] += 1
+                if consec_restart[i] >= 3:
+                    cooldown_until[i] = time.time() + 5 * 60   # 该路径连续低速→休眠 5 分钟
+                    consec_restart[i] = 0
+                    print(f"  seg{i} 连续低速，路径休眠 5 分钟", flush=True)
+                else:
+                    print(f"  seg{i} 低速 {rate/1024:.0f}KB/s，重启", flush=True)
                 kill(i)
                 ensure(i)
             else:
+                consec_restart[i] = 0
                 last_size[i], last_time[i] = sz, now
         if time.time() - t_start > GLOBAL_RESTART_SEC:
             print("  定时全局重启", flush=True)
