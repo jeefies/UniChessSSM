@@ -45,9 +45,10 @@ class LegalMaskTest(unittest.TestCase):
                 mv = chess.Move(frm, to, promotion=promo)
                 if board.is_legal(mv):
                     continue
-                # 王车易位 / 吃过路兵的旗标修正
+                # 王车易位 / 吃过路兵 / 升后(Q→后走法 id) 的旗标修正
                 for candidate in board.legal_moves:
-                    if candidate.from_square == frm and candidate.to_square == to and candidate.promotion == promo:
+                    cand_promo = None if candidate.promotion == chess.QUEEN else candidate.promotion
+                    if candidate.from_square == frm and candidate.to_square == to and cand_promo == promo:
                         break
                 else:
                     self.fail(f"mask 动作 {i} 非合法着: {board.fen()}")

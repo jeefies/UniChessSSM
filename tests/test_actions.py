@@ -35,9 +35,9 @@ class ActionSpaceTest(unittest.TestCase):
         rng = random.Random(20260914)
         for game in range(30):
             board = chess.Board()
-            seen = set()
             while not board.is_game_over() and board.ply() < 250:
                 legal = list(board.legal_moves)
+                seen: set[int] = set()  # 同一局面内合法着 id 互异；跨局面允许重复
                 for mv in legal:
                     aid = move_to_action(mv)
                     self.assertNotIn(aid, seen, f"动作 id 冲突: {aid}")
@@ -63,7 +63,9 @@ class ActionSpaceTest(unittest.TestCase):
                 if mv.promotion:
                     found.add(mv.promotion)
                     aid = move_to_action(mv)
-                    self.assertEqual(action_to_move(aid).promotion, mv.promotion)
+                    back = action_to_move(aid)
+                    expected = None if mv.promotion == chess.QUEEN else mv.promotion  # 升后走 Q→后走法 id
+                    self.assertEqual(back.promotion, expected)
         self.assertEqual(found, {chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT})
 
     def test_castling_via_queen_pair(self):
