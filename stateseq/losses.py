@@ -32,57 +32,90 @@ def elo_weights(elo_mean: torch.Tensor, e_min: float, e_max: float, r: float = 2
     return w.clamp(min=1.0, max=r)
 
 
-def policy_loss(logits: torch.Tensor, target_action: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+def _mask(weights: torch.Tensor, pos_mask: torch.Tensor | None) -> torch.Tensor:
+    """可选填充掩码（True=有效步）按位并入权重。"""
+    if pos_mask is None:
+        return weights
+    return weights * pos_mask.float()
+
+
+def policy_loss(logits: torch.Tensor, target_action: torch.Tensor, weights: torch.Tensor,
+                pos_mask: torch.Tensor | None = None) -> torch.Tensor:
     """加权 CE，按有效权重和归一。logits/target/weights 任意同形批量维。"""
     ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), target_action.reshape(-1).long(), reduction="none")
-    w = weights.reshape(-1).float()
+    w = _mask(weights.reshape(-1).float(), pos_mask.reshape(-1) if pos_mask is not None else None)
     return (ce * w).sum() / w.sum().clamp(min=1e-8)
 
 
-def value_loss(wdl_logits: torch.Tensor, result: torch.Tensor) -> torch.Tensor:
+def value_loss(wdl_logits: torch.Tensor, result: torch.Tensor,
+               pos_mask: torch.Tensor | None = None) -> torch.Tensor:
     """result: 0 胜 / 1 和 / 2 负（对行棋方归一）。"""
-    return F.cross_entropy(wdl_logits.reshape(-1, 3), result.reshape(-1).long())
+    ce = F.cross_entropy(wdl_logits.reshape(-1, 3), result.reshape(-1).long(), reduction="none")
+    w = torch.ones_like(ce) if pos_mask is None else pos_mask.reshape(-1).float()
+    return (ce * w).sum() / w.sum().clamp(min=1e-8)
 
 
-def mlh_loss(mlh_pred: torch.Tensor, moves_left: torch.Tensor) -> torch.Tensor:
+def mlh_loss(mlh_pred: torch.Tensor, moves_left: torch.Tensor,
+             pos_mask: torch.Tensor | None = None) -> torch.Tensor:
     """Huber(δ=1) 于剩余 ply 预测；moves_left 以 ply 计、截断到 T_max=200。"""
-    return F.huber_loss(mlh_pred.reshape(-1).float(), moves_left.reshape(-1).float(), delta=1.0)
+    h = F.huber_loss(mlh_pred.reshape(-1).float(), moves_left.reshape(-1).float(), delta=1.0, reduction="none")
+    w = torch.ones_like(h) if pos_mask is None else pos_mask.reshape(-1).float()
+    return (h * w).sum() / w.sum().clamp(min=1e-8)
 
 
-def recon_loss(d_out: dict[str, torch.Tensor], features: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
-    """L_recon：每格 CE（按格平均）+ 0.3·辅助位损失。返回 (loss, 诊断指标)。"""
+def recon_loss(d_out: dict[str, torch.Tensor], features: torch.Tensor,
+               pos_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, dict[str, float]]:
+    """L_recon：每格 CE（按格平均）+ 0.3·辅助位损失；pos_mask 屏蔽填充步。返回 (loss, 诊断指标)。"""
     target_cls = board_classes(features)                                   # (..., 64)
     per_sq = F.cross_entropy(
         d_out["board_logits"].reshape(-1, 13), target_cls.reshape(-1).long(), reduction="none"
     ).reshape(target_cls.shape)
-    board_ce = per_sq.mean()
+    if pos_mask is not None:
+        m = pos_mask.float().unsqueeze(-1)
+        board_ce = (per_sq * m).sum() / m.sum().clamp(min=1e-8) / per_sq.shape[-1]
+    else:
+        board_ce = per_sq.mean()
+
+    def _masked_mean(loss_vec: torch.Tensor) -> torch.Tensor:
+        w = torch.ones_like(loss_vec) if pos_mask is None else pos_mask.reshape(-1).float()
+        return (loss_vec * w).sum() / w.sum().clamp(min=1e-8)
 
     aux = (
-        F.cross_entropy(d_out["side_logits"].reshape(-1, 2), (features[..., 768] > 0.5).long().reshape(-1))
-        + F.binary_cross_entropy_with_logits(
-            d_out["castling_logits"].reshape(-1, 4), features[..., 769:773].reshape(-1, 4)
-        )
-        + F.cross_entropy(
+        _masked_mean(F.cross_entropy(d_out["side_logits"].reshape(-1, 2), (features[..., 768] > 0.5).long().reshape(-1), reduction="none"))
+        + _masked_mean(F.binary_cross_entropy_with_logits(
+            d_out["castling_logits"].reshape(-1, 4), features[..., 769:773].reshape(-1, 4), reduction="none"
+        ).mean(-1))
+        + _masked_mean(F.cross_entropy(
             d_out["halfmove_logits"].reshape(-1, HALFMOVE_BUCKETS),
-            halfmove_bucket(features[..., 781]).reshape(-1),
-        )
+            halfmove_bucket(features[..., 781]).reshape(-1), reduction="none",
+        ))
     )
     loss = board_ce + 0.3 * aux
     with torch.no_grad():
         pred_cls = d_out["board_logits"].argmax(dim=-1)  # (..., 64)
+        if pos_mask is not None:
+            whole = ((pred_cls == target_cls).all(dim=-1) & pos_mask.bool()).float().sum() / pos_mask.sum().clamp(min=1)
+        else:
+            whole = (pred_cls == target_cls).all(dim=-1).float().mean()
         diag = {
             "recon_board_ce": float(board_ce),
-            "recon_whole_board_acc": float((pred_cls == target_cls).all(dim=-1).float().mean()),
+            "recon_whole_board_acc": float(whole),
         }
     return loss, diag
 
 
-def dyn_loss(delta_hat: torch.Tensor, x_t: torch.Tensor, x_prev: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
+def dyn_loss(delta_hat: torch.Tensor, x_t: torch.Tensor, x_prev: torch.Tensor,
+             pos_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, dict[str, float]]:
     """L_dyn = mean_t (1/d)·‖Δ̂_t − sg(x_t − x_{t-1})‖²；target 与 base 双侧 sg（§7.1 答案侧保护）。"""
     d = x_t.shape[-1]
     delta = (x_t - x_prev).detach()
     diff = delta_hat - delta
-    loss = (diff.pow(2).sum(-1) / d).mean()
+    per_t = diff.pow(2).sum(-1) / d
+    if pos_mask is None:
+        loss = per_t.mean()
+    else:
+        w = pos_mask.float()
+        loss = (per_t * w).sum() / w.sum().clamp(min=1e-8)
     with torch.no_grad():
         num = diff.pow(2).sum(-1).mean()
         den = delta.pow(2).sum(-1).mean()

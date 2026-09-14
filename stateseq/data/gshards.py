@@ -118,16 +118,15 @@ class ShardReader:
         with open(os.path.join(shard_dir, "manifest.json"), encoding="utf-8") as fh:
             self.manifest = json.load(fh)
         self.metas: list[np.ndarray] = []
+        self.offsets: list[np.ndarray] = []
         self.pools: list[np.memmap] = []
-        base_names: list[str] = []
         for name in self.manifest["shards"]:
             base = os.path.join(shard_dir, name)
             npz = np.load(base + ".meta.npz")
             self.metas.append(npz["metas"])
+            self.offsets.append(npz["offsets"])
             self.pools.append(np.memmap(base + ".actions.bin", dtype=np.uint16, mode="r"))
-            base_names.append(name)
         self.meta_all = np.concatenate(self.metas)
-        # 全局局索引 → (片号, 片内序号)
         counts = [len(m) for m in self.metas]
         self.shard_of = np.repeat(np.arange(len(counts)), counts)
         self._cumcounts = np.concatenate([[0], np.cumsum(counts)])
@@ -137,10 +136,6 @@ class ShardReader:
         shard = int(self.shard_of[global_index])
         local = global_index - int(self._cumcounts[shard])
         npz_meta = self.metas[shard][local]
-        pool = self.pools[shard]
-        offsets_start = 0
-        # offsets 需要按局重建：用 n_plies 前缀和（meta 内顺序即局顺序）
-        # 为免逐局累积，构造时保存 offsets；这里直接从 meta 前序求和：
+        start = int(self.offsets[shard][local])
         n = int(npz_meta["n_plies"])
-        start = int(np.cumsum(self.metas[shard]["n_plies"][:local], dtype=np.int64)[-1]) if local > 0 else 0
-        return npz_meta, np.asarray(pool[start:start + n])
+        return npz_meta, np.asarray(self.pools[shard][start:start + n])

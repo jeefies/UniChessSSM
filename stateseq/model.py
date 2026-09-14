@@ -68,24 +68,27 @@ class SeqModel(nn.Module):
         cond = self.cond(tc, elo, batch.color)  # (B, T, d)
         return cond
 
-    def forward_train(self, batch: TrainBatch, weights: losses.LossWeights, step: int, total_steps: int) -> tuple[torch.Tensor, dict[str, float]]:
-        """整序列前向 + 五损失。返回 (总损失, 指标 dict)。"""
+    def forward_train(self, batch: TrainBatch, weights: losses.LossWeights, step: int, total_steps: int,
+                      valid_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, dict[str, float]]:
+        """整序列前向 + 五损失；valid_mask (B,T) 屏蔽填充步。返回 (总损失, 指标 dict)。"""
         bsz, seqlen, _ = batch.features.shape
         x = self.encode(batch.features)                                   # (B, T, 512)
         cond = self._cond_expand(batch, x.shape[:2] + (x.shape[-1],))
         h = self.trunk(x + cond)                                          # (B, T, 512)
         policy_logits, wdl_logits, mlh = self.f(h)
 
-        l_pol = losses.policy_loss(policy_logits, batch.actions, batch.elo_weight.unsqueeze(1).expand(bsz, seqlen))
-        l_val = losses.value_loss(wdl_logits, batch.results)
-        l_mlh = losses.mlh_loss(mlh, batch.moves_left)
+        l_pol = losses.policy_loss(policy_logits, batch.actions,
+                                   batch.elo_weight.unsqueeze(1).expand(bsz, seqlen), valid_mask)
+        l_val = losses.value_loss(wdl_logits, batch.results, valid_mask)
+        l_mlh = losses.mlh_loss(mlh, batch.moves_left, valid_mask)
 
         d_out = self.d(x)
-        l_rec, diag_rec = losses.recon_loss(d_out, batch.features)
+        l_rec, diag_rec = losses.recon_loss(d_out, batch.features, valid_mask)
 
-        # g 动力学：t≥1（t=0 无 x_{-1}，不入 L_dyn）
+        # g 动力学：t≥1（t=0 无 x_{-1}，不入 L_dyn）；valid 取 t≥1 段
         delta_hat = self.g(h[:, :-1], batch.actions[:, 1:])  # (h_{t-1}, a_t)
-        l_dyn, diag_dyn = losses.dyn_loss(delta_hat, x[:, 1:], x[:, :-1])
+        dyn_mask = valid_mask[:, 1:] if valid_mask is not None else None
+        l_dyn, diag_dyn = losses.dyn_loss(delta_hat, x[:, 1:], x[:, :-1], dyn_mask)
 
         total = (
             weights.w_p * l_pol
