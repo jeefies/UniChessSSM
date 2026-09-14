@@ -13,9 +13,13 @@ g（残差动力学）不参与推理。预热用 Lichess 人类棋谱行为克�
 **偏差记录**：`docs/design-deviations.md`（实现时经文档作者确认的口径调整，原目录文档不动）。
 决策 D1–D10 已锁定，实现时不得偏离；不确定处回到文档作者（用户）确认。
 
-**当前状态（2026-09-14）：阶段 0 已验收通过**——7 项清单全绿（17 个单测 OK），
-冒烟：参数实测 26.40M（预算 ~27M），五损失首轮合理。下一步 Stage A（全量 Lichess 数据
-+ 正式训练），启动前须经用户确认数据下载。
+**当前状态（2026-09-15）：阶段 0 已验收通过**（7 项清单全绿，17 单测 OK）；
+Stage A 进行中：3 个月度前缀切片（2026-08/07/06，各 4 GB）经双路径看门狗下载
+（tools/stateseq_download.py，实测管道 ~140-300 KB/s，防 429 限速重启），
+动作列表分片（~150 B/局，tools/stateseq_build_shards.py），训练加载器重放重建
+（stateseq/data/dataset.py，长度分桶 + 预取双缓冲，实测 150k pos/s），
+训练器 train/stage_a.py（§7.3 锁定超参；microbatch 32 × accum 16 = 512 局有效 batch，
+GPU 实测 ~22k pos/s → 35M 局 1 epoch 约 31 小时）。
 
 与原项目 UniChess（ResNet 46M + MCTS + autoloop）**完全隔离**：本目录独立开发、独立数据、
 独立 git 仓库；不得修改 `/home/jeefy/UniChess` 的任何文件或服务配置。
@@ -49,9 +53,15 @@ UniChessSSM/
 │   ├── heads.py         # f: policy/WDL/moves-left
 │   ├── losses.py        # 五损失（统一归约口径）
 │   └── data/            # PGN 下载/序列构建/分片/Elo 加权
-├── tools/               # 冒烟与一次性脚本
+├── train/
+│   └── stage_a.py       # Stage A 训练器（§7.3 锁定超参；原子检查点；SIGTERM 优雅退出）
+├── tools/               # 冒烟与运维脚本
+│   ├── stateseq_download.py    # 双路径下载看门狗（低速自动重启/路径休眠防 429）
+│   ├── stateseq_build_shards.py # .pgn.zst 前缀流 → 动作列表分片
+│   ├── stateseq_throughput.py  # GPU/加载器吞吐探测
+│   └── stateseq_smoke.py       # 阶段 0 冒烟
 ├── tests/               # 阶段 0 七项验收单测（unittest，全部通过）
-├── data/  runs/         # 运行时产物（gitignore；磁盘水位见 §5）
+├── data/  runs/         # 运行时产物（gitignore；常驻水位 ≤10 GB，临时 ≤50 GB）
 └── docs/                # design-deviations.md（与原文档的偏差记录）
 ```
 
@@ -66,8 +76,8 @@ UniChessSSM/
 - **远端是生产主机**：网站、隧道、autoloop（4 个 actor 进程批量 GPU 推理）常驻。
   跑任何 GPU 任务前 `nvidia-smi` 确认占用；训练先小步验证吞吐再放大。
 - **不碰原项目**：`/home/jeefy/UniChess` 下的一切（源码、数据、systemd 服务、检查点）只读引用。
-- **磁盘**：本目录数据/模型总量水位暂定 60 GiB（原始 Lichess 文件解析后删除中间产物）。
-  检查点原子保存（写 `.tmp` 再 `replace`）。
+- **磁盘**：本目录常驻水位 ≤10 GiB（动作列表分片），临时 ≤50 GiB（月度 .pgn.zst 前缀切片，
+  解析后可删）。检查点原子保存（写 `.tmp` 再 `replace`）。
 - **检查点纪律**：正式权重不容许被冒烟测试覆盖（用隔离 runs 子目录）。
 - **实验纪律（D8）**：不做消融矩阵；只保留最小冒烟门禁。
 - **判定权威**：走法合法性、重复/终局判定一律以规则引擎（python-chess）为准，网络特征不作判定依据。
