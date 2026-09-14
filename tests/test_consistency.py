@@ -55,7 +55,11 @@ class SequenceConsistencyTest(unittest.TestCase):
         # 整序列前向
         with torch.no_grad():
             x = model.encode(feats)
-            cond = model.cond(tc, elo, color[:, 0]).unsqueeze(1)
+            cond = model.cond(
+                tc.unsqueeze(1).expand(-1, n_ply),
+                elo.unsqueeze(1).expand(-1, n_ply),
+                color,
+            )
             h = model.trunk(x + cond)
             pol_full, wdl_full, mlh_full = model.f(h)
 

@@ -60,10 +60,13 @@ class SeqModel(nn.Module):
         """R：x (B, T, 512) → h (B, T, 512)（整序列并行扫描）。"""
         return self.r(self.in_norm(x))
 
-    def _cond_expand(self, batch: TrainBatch, shape: tuple[int, ...]) -> torch.Tensor:
-        """条件向量 (B, d) → (B, T, d) 广播到每步。"""
-        cond = self.cond(batch.tc_bucket, batch.elo_std, batch.color[:, 0] if batch.color.dim() > 1 else batch.color)
-        return cond.unsqueeze(1).expand(shape)
+    def _cond_expand(self, batch: "TrainBatch", shape: tuple[int, ...]) -> torch.Tensor:
+        """条件向量按步展开：(B,) 对局级 tc/elo 广播到 (B,T)，color 逐步取值（D2）。"""
+        bsz, seqlen = batch.features.shape[:2]
+        tc = batch.tc_bucket.unsqueeze(1).expand(bsz, seqlen)
+        elo = batch.elo_std.unsqueeze(1).expand(bsz, seqlen)
+        cond = self.cond(tc, elo, batch.color)  # (B, T, d)
+        return cond
 
     def forward_train(self, batch: TrainBatch, weights: losses.LossWeights, step: int, total_steps: int) -> tuple[torch.Tensor, dict[str, float]]:
         """整序列前向 + 五损失。返回 (总损失, 指标 dict)。"""
