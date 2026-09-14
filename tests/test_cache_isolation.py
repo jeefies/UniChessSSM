@@ -36,17 +36,21 @@ class CacheIsolationTest(unittest.TestCase):
                 _, _, _, _, cache = model.step(feats[:, t], tc, elo, color, cache)
             parent_cache = clone_cache(cache)
 
-            # 两个子树沿不同动作扩展（动作只影响 g 无关的推理主路径；这里用不同后续局面即可）
+            # 两个子树沿不同后续局面扩展；c2_frozen 冻结备份用于事后验证“静止子树不受影响”
             c1 = clone_cache(parent_cache)
             c2 = clone_cache(parent_cache)
+            c2_frozen = clone_cache(c2)
             color7 = feats[:, 7, 768].long()
             p1, w1, m1, _, c1 = model.step(feats[:, 7], tc, elo, color7, c1)
-            p2, w2, m2, _, c2 = model.step(feats[:, 9], tc, elo, feats[:, 9, 768].long(), c2)  # 不同局面
+            color9 = feats[:, 9, 768].long()
+            p2, w2, m2, _, c2 = model.step(feats[:, 9], tc, elo, color9, c2)  # 不同局面
 
             # 子树 1 继续两步，子树 2 静止：互不影响
             for t in (8, 9):
                 p1b, w1b, m1b, _, c1 = model.step(feats[:, t], tc, elo, feats[:, t, 768].long(), c1)
-            p2_after, w2_after, m2_after, _, _ = model.step(feats[:, 9], tc, elo, feats[:, 9, 768].long(), clone_cache(c2))
+            p2_after, w2_after, m2_after, _, _ = model.step(
+                feats[:, 9], tc, elo, color9, clone_cache(c2_frozen)
+            )
 
             self.assertTrue(torch.equal(p2, p2_after))
             self.assertTrue(torch.equal(w2, w2_after))

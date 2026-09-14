@@ -9,6 +9,7 @@ E 只看当前局面（无跨步注意力）；推理时每节点一次。
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -62,22 +63,25 @@ class BoardEncoderE(nn.Module):
         """features: (..., 785) → x_t: (..., 512)。"""
         *lead, feat_dim = features.shape
         assert feat_dim == FEATURE_DIM
-        planes = features[..., : PIECE_PLANES * 64].reshape(*lead, PIECE_PLANES, 64)
-        occupied = planes.sum(dim=-2) > 0.5                    # (..., 64)
-        piece_idx = planes.argmax(dim=-2)                      # (..., 64) 0..11
+        n = int(np.prod(lead)) if lead else 1
+        flat = features.reshape(n, FEATURE_DIM)
+        planes = flat[:, : PIECE_PLANES * 64].reshape(n, PIECE_PLANES, 64)
+        occupied = planes.sum(dim=-2) > 0.5                      # (n, 64)
+        piece_idx = planes.argmax(dim=-2)                        # (n, 64) 0..11
         piece_idx = torch.where(occupied, piece_idx, torch.full_like(piece_idx, PIECE_PLANES))
 
         s = (
-            self.piece_emb(piece_idx)                          # (..., 64, d_e)
-            + self.pos_emb.weight                              # (64, d_e)
-            + self.w_g(features[..., PIECE_PLANES * 64:]).unsqueeze(-2)
+            self.piece_emb(piece_idx)                            # (n, 64, d_e)
+            + self.pos_emb.weight                                # (64, d_e)
+            + self.w_g(flat[:, PIECE_PLANES * 64:]).unsqueeze(-2)
         )
-        s = self.block(self.block(s))                          # 同一权重走两遍（K=1）
+        s = self.block(self.block(s))                            # 同一权重走两遍（K=1）
         # 单查询 cross-attn：x = RMSNorm(q + CrossAttn(RMSNorm(q), S, S))
-        q = self.q.expand(*lead, 1, self.d_e)
-        n = self.attn_norm(q)
+        q = self.q.expand(n, 1, self.d_e)
+        nq = self.attn_norm(q)
         k = self.k_proj(s)
         v = self.v_proj(s)
-        attn = torch.softmax((n @ k.transpose(-1, -2)) / (self.d_e ** 0.5), dim=-1)
-        x = self.out_norm(q + attn @ v).squeeze(-2)            # (..., d_e)
-        return self.final_norm(self.w_proj(x))                 # (..., 512)
+        attn = torch.softmax((nq @ k.transpose(-1, -2)) / (self.d_e ** 0.5), dim=-1)
+        x = self.out_norm(q + attn @ v).squeeze(-2)              # (n, d_e)
+        out = self.final_norm(self.w_proj(x))                    # (n, 512)
+        return out.reshape(*lead, out.shape[-1]) if lead else out
