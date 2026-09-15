@@ -110,9 +110,10 @@ struct Board {
                 if (p) {
                     int a = std::abs(p);
                     bool rook_like = (begin == 0 && end == 4);
-                    if ((rook_like && (a == 4 || a == 5)) || (!rook_like && (a == 3 || a == 5)))
-                        return (p > 0) == by_white;
-                    break;
+                    if ((rook_like && (a == 4 || a == 5)) || (!rook_like && (a == 3 || a == 5))) {
+                        if ((p > 0) == by_white) return true;  // 找到同型攻击者
+                    }
+                    break;  // 被挡（或异色同型不攻击）：试下一方向
                 }
                 ff += QDIRS[d][0]; rr += QDIRS[d][1];
             }
