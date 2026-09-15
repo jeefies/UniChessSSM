@@ -62,10 +62,12 @@ def make_batches(ds: SequenceDataset, idxs: np.ndarray, microbatch: int):
     return out
 
 
-def val_subset_indices(ds: SequenceDataset, n_batches: int, microbatch: int) -> np.ndarray:
-    """与 SequenceDataset.val_batch(seed=777) 完全同口径的局索引（顺序也一致）。"""
+def val_subset_indices(ds: SequenceDataset, n_batches: int,
+                       sel_microbatch: int = 32) -> np.ndarray:
+    """与 SequenceDataset.val_batch(seed=777, microbatch=sel_microbatch) 同口径的局索引。"""
     rng = np.random.default_rng(VAL_SEED)
-    return rng.choice(ds.val_indices, size=min(n_batches * microbatch, len(ds.val_indices)),
+    return rng.choice(ds.val_indices,
+                      size=min(n_batches * sel_microbatch, len(ds.val_indices)),
                       replace=False)
 
 
@@ -620,7 +622,10 @@ def main() -> None:
     ap.add_argument("--also-best", action="store_true")
     ap.add_argument("--train-games", type=int, default=1024)
     ap.add_argument("--val-batches", type=int, default=8)
-    ap.add_argument("--microbatch", type=int, default=32)
+    ap.add_argument("--microbatch", type=int, default=32,
+                    help="val 子集选局口径（训练 --microbatch，只影响选局数量）")
+    ap.add_argument("--fwd-batch", type=int, default=4,
+                    help="前向评估批大小（局数）；训练占用 GPU 时用小值防 OOM")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--data", default=os.path.join(HERE, "data", "shards"))
     ap.add_argument("--out-dir", default=None)
@@ -650,7 +655,7 @@ def main() -> None:
           f"装载耗时 {time.time()-t0:.1f}s", flush=True)
 
     t0 = time.time()
-    val_batches = make_batches(ds, val_idxs, args.microbatch)
+    val_batches = make_batches(ds, val_idxs, args.fwd_batch)
     print(f"重放 val 子集 {len(val_batches)} 批，耗时 {time.time()-t0:.1f}s", flush=True)
 
     t0 = time.time()
