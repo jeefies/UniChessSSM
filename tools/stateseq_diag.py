@@ -670,13 +670,23 @@ def main() -> None:
     value = analyze_value(acc, q_train)
     dyn_latent = analyze_dyn_latent(acc)
     policy = analyze_policy(acc)
+    # 全局面口径（与训练 8×32 批平均的微小差异：批大小不同导致的加权不同）
+    sanity_global = {
+        "val_value_ce_global": value["model_ce_on_val"],
+        "val_policy_ce_w_global": float(np.concatenate(acc.pol_ce_w).mean()
+                                        / np.concatenate(acc.elo).mean()),
+        "val_policy_ce_uw_global": float(np.concatenate(acc.pol_ce_uw).mean()),
+    }
+    sanity = {**sanity, **sanity_global}
 
     t0 = time.time()
     try:
         diag_d = action_correspondence(model, ds, val_batches, stored_x, stored_h,
                                        device, n_samples=args.n_d_samples)
     except Exception as exc:  # noqa: BLE001 - 诊断脚本不因块 D 失败而整体失败
-        diag_d = {"skipped": f"块 D 异常：{type(exc).__name__}: {exc}"}
+        import traceback
+        diag_d = {"skipped": f"块 D 异常：{type(exc).__name__}: {exc}",
+                  "traceback": traceback.format_exc()}
     print(f"块 D 完成：{diag_d}，耗时 {time.time()-t0:.1f}s", flush=True)
 
     report: dict = {
