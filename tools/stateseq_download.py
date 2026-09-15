@@ -26,9 +26,9 @@ os.makedirs(RAW, exist_ok=True)
 PROXY = "http://172.16.1.55:7897"
 MONTHS = ["2026-08", "2026-07", "2026-06"]
 PREFIX_BYTES = 4 * 1024**3          # 每月取前 4 GB
-SEGMENTS = [                          # (路径, 起点, 终点) —— 两段并行
+SEGMENTS = [                          # 两段并行（用户指示：纯直连不走代理）
     ("direct", 0, PREFIX_BYTES // 2),
-    ("proxy", PREFIX_BYTES // 2, PREFIX_BYTES),
+    ("direct", PREFIX_BYTES // 2, PREFIX_BYTES),
 ]
 STALL_BPS = 30 * 1024                 # 单段低于此速率即重启
 GLOBAL_RESTART_SEC = 20 * 60
@@ -126,12 +126,7 @@ def download_month(month: str) -> None:
             stalled = rate < STALL_BPS
             if stalled:
                 consec_restart[i] += 1
-                if consec_restart[i] >= 3:
-                    seg_path[i] = "proxy" if seg_path[i] == "direct" else "direct"  # 翻转路径
-                    consec_restart[i] = 0
-                    print(f"  seg{i} 连续低速，切换路径→{seg_path[i]}", flush=True)
-                else:
-                    print(f"  seg{i} 低速 {rate/1024:.0f}KB/s，重启", flush=True)
+                print(f"  seg{i} 低速 {rate/1024:.0f}KB/s，重启", flush=True)
                 kill(i)
                 ensure(i)
             else:
