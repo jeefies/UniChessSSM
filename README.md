@@ -5,7 +5,8 @@ UniChess 新架构：状态序列模型（格子级 Transformer E → 12 层 Mam
 
 - 权威设计文档：`../UniChess/docs/state-sequence-model-design.md`（D1–D10 已锁定）
 - 开发约定与双设备路由：见 [AGENTS.md](AGENTS.md)
-- 当前阶段：**阶段 0 · 接口验证**（七项验收清单见设计文档 §10.1）
+- 当前阶段：**Stage A · 人类棋谱 BC 预训练进行中**（run `runs/stage_a_20260915`，1 epoch = 37,758 步）
+- 实验报告（审查用，含管线/公式/流程图/曲线）：[docs/stage-a-experiment.md](docs/stage-a-experiment.md)
 
 ## 快速开始（远端 5070 Ti）
 
