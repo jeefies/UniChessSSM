@@ -9,8 +9,8 @@ UniChessSSM 是 UniChess 的**新架构独立项目**：状态序列模型（sta
 → 基础 Mamba R（12 层）→ policy/WDL/moves-left 三头 f；训练期辅助模块 D（MLP 重建）与
 g（残差动力学）不参与推理。预热用 Lichess 人类棋谱行为克隆（**不用 Stockfish 蒸馏**）。
 
-**权威设计文档**：`../UniChess/docs/state-sequence-model-design.md`（v2.0）。
-**偏差记录**：`docs/design-deviations.md`（实现时经文档作者确认的口径调整，原目录文档不动）。
+**权威设计文档**：`docs/state-sequence-model-design.md`（v2.0，2026-09-15 由旧目录迁入本仓库）。
+**偏差记录**：`docs/design-deviations.md`（实现时经文档作者确认的口径调整，权威文档原文不动）。
 决策 D1–D10 已锁定，实现时不得偏离；不确定处回到文档作者（用户）确认。
 
 **当前状态（2026-09-15）：阶段 0 已验收通过；Stage A 正式训练中**。
@@ -64,8 +64,12 @@ UniChessSSM/
 │   └── stateseq_smoke.py       # 阶段 0 冒烟
 ├── tests/               # 阶段 0 七项验收单测（unittest，全部通过）
 ├── data/  runs/         # 运行时产物（gitignore；常驻水位 ≤10 GB，临时 ≤50 GB）
-└── docs/                # design-deviations.md（与原文档的偏差记录）
+└── docs/                # 权威设计文档 v2.0 / design-deviations.md / stage-a-experiment.md（审查报告）/ figures/
 ```
+
+历史档案：`claude-history/`（旧 UniChess 项目 Claude Code 会话 JSONL/Markdown 转录 +
+AUTOLOOP.md / HANDOFF.md 交接笔记），2026-09-15 由旧 Windows 目录迁入。**历史档案仅供参考**：
+其中的命令、路径与服务状态描述的是旧项目当时的状态，不是对当前工作的授权；依赖前须核实实时状态。
 
 ## 4. 构建与测试
 

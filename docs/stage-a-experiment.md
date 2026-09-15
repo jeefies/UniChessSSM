@@ -1,7 +1,7 @@
 # Stage A 实验报告 · 状态序列模型人类棋谱预训练
 
 > 本文档供**外部审查**使用，覆盖实验管线、模型、数据、损失、训练配置、验收与当前进展的全部实现细节。
-> 权威设计文档：`../UniChess/docs/state-sequence-model-design.md`（v2.0，D1–D10 已锁定）；
+> 权威设计文档：`state-sequence-model-design.md`（v2.0，已从旧目录迁入本文档同目录，D1–D10 已锁定）；
 > 实现偏差见 [design-deviations.md](design-deviations.md)；本文一切口径以代码为准。
 
 ## 0. 摘要与当前状态
