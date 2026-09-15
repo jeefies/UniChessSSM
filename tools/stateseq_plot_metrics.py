@@ -11,7 +11,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
+plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "Noto Sans CJK HK", "Droid Sans Fallback", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
