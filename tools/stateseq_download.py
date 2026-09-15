@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import signal
 import subprocess
@@ -163,6 +164,13 @@ def download_month(month: str) -> None:
 
 
 def main() -> None:
+    # 单实例锁：防重复启动双写
+    lock = open(os.path.join(RAW, ".download.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("另一下载实例在运行，退出", flush=True)
+        sys.exit(1)
     for month in MONTHS:
         download_month(month)
     print("ALL_MONTHS_DONE", flush=True)
