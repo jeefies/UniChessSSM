@@ -524,7 +524,7 @@ int main(int argc, char** argv) {
         struct R { long long nodes; };
         std::function<long long(Board&, int)> perft = [&](Board& b, int d) -> long long {
             if (d == 0) return 1;
-            static std::vector<Board::Mv> ms;
+            std::vector<Board::Mv> ms;   // 必须局部：递归内 legal() 会重入
             b.legal(ms);
             long long n = 0;
             for (auto& m : ms) { Board c = b; c.apply(m.from, m.to, m.promo, m.epm, m.cm); n += perft(c, d - 1); }
@@ -533,9 +533,9 @@ int main(int argc, char** argv) {
         Board b; b.init();
         long long n4 = perft(b, 4);
         std::cout << "perft(4) = " << n4 << (n4 == 197281 ? " OK" : " MISMATCH!") << "\n";
-        // SAN 往返抽测
-        const char* sans[] = {"e4", "e5", "Nf3", "Nc6", "Bb5", "a6", "O-O", "Nf6", "Re1", "b5",
-                              "exd5", "Nxd5", "Nxe5", "Nxe4", "Qe2", "Nf6", "Nxf7", "Kxf7", "d4"};
+        // SAN 抽测（西班牙封闭真实棋线，含双易位/吃过路兵前置）
+        const char* sans[] = {"e4", "e5", "Nf3", "Nc6", "Bb5", "a6", "Ba4", "Nf6", "O-O", "Be7",
+                              "Re1", "b5", "Bb3", "d6", "c3", "O-O", "h3", "Be6"};
         Board g; g.init();
         bool ok = true;
         for (const char* s : sans) if (San::parse(std::string(s), g, T) < 0) { ok = false; std::cout << "SAN fail: " << s << "\n"; }
