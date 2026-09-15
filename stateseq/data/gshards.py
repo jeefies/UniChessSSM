@@ -150,7 +150,7 @@ class ShardReader:
         is_val_parts: list[np.ndarray] = []
         for name in self.manifest["shards"]:
             base = os.path.join(shard_dir, name)
-            if name.endswith(".meta.bin"):  # v2
+            if os.path.exists(base + ".meta.bin"):  # v2（C++ 二进制）
                 raw = np.fromfile(base + ".meta.bin", dtype=np.uint8).reshape(-1, 16)
                 meta = np.zeros(len(raw), dtype=META_V2_DTYPE)
                 meta["n_plies"] = raw[:, 0:2].copy().view(np.uint16).reshape(-1)
@@ -159,12 +159,16 @@ class ShardReader:
                 meta["elo_missing"] = raw[:, 4]
                 meta["elo_mean"] = raw[:, 6:10].copy().view(np.float32).reshape(-1)
                 meta["local_idx"] = raw[:, 10:14].copy().view(np.uint32).reshape(-1)
-                toks = os.path.basename(name)[: -len(".meta.bin")].split("-")  # shard,MONTH,wK
-                month_crc = zlib.crc32(toks[1].encode())
-                worker = int(toks[2][1:])
+                toks = os.path.basename(name).split("-")  # shard,YYYY,MM,wK
+                month = "-".join(toks[1:-1])
+                month_crc = zlib.crc32(month.encode())
+                worker = int(toks[-1][1:])
                 h = _splitmix64(np.full(len(meta), month_crc, dtype=np.uint64) ^ np.uint64(worker) << 32)
                 h = _splitmix64(h ^ meta["local_idx"].astype(np.uint64))
                 is_val_parts.append((h % 100000) < 500)
+                off = np.zeros(len(meta) + 1, dtype=np.int64)
+                np.cumsum(meta["n_plies"].astype(np.int64), out=off[1:])
+                self.offsets.append(off)
             else:  # v1 npz
                 npz = np.load(base + ".meta.npz")
                 meta = npz["metas"]
@@ -173,10 +177,6 @@ class ShardReader:
                 is_val_parts.append(np.array([is_val_key(str(k)) for k in keys]))
             self.metas.append(meta)
             self.pools.append(np.memmap(base + ".actions.bin", dtype=np.uint16, mode="r"))
-            if name.endswith(".meta.bin"):
-                off = np.zeros(len(meta) + 1, dtype=np.int64)
-                np.cumsum(meta["n_plies"].astype(np.int64), out=off[1:])
-                self.offsets.append(off)
         self.meta_all = np.concatenate(self.metas)
         self.is_val_arr = np.concatenate(is_val_parts)
         counts = [len(m) for m in self.metas]

@@ -34,7 +34,7 @@ def main() -> None:
         es = os.path.join(args.out, base + ".elosample.bin")
         if os.path.exists(es):
             elo_samples.append(np.fromfile(es, dtype=np.float32))
-    months = sorted({s.split("-")[1] for s in shards})
+    months = sorted({"-".join(s.split("-")[1:-1]) for s in shards})
 
     elo_arr = np.concatenate(elo_samples) if elo_samples else np.array([1500.0], dtype=np.float64)
     elo_arr = elo_arr.astype(np.float64)
