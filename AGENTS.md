@@ -13,13 +13,13 @@ g（残差动力学）不参与推理。预热用 Lichess 人类棋谱行为克�
 **偏差记录**：`docs/design-deviations.md`（实现时经文档作者确认的口径调整，原目录文档不动）。
 决策 D1–D10 已锁定，实现时不得偏离；不确定处回到文档作者（用户）确认。
 
-**当前状态（2026-09-15）：阶段 0 已验收通过**（7 项清单全绿，17 单测 OK）；
-Stage A 进行中：3 个月度前缀切片（2026-08/07/06，各 4 GB）经双路径看门狗下载
-（tools/stateseq_download.py，实测管道 ~140-300 KB/s，防 429 限速重启），
-动作列表分片（~150 B/局，tools/stateseq_build_shards.py），训练加载器重放重建
-（stateseq/data/dataset.py，长度分桶 + 预取双缓冲，实测 150k pos/s），
-训练器 train/stage_a.py（§7.3 锁定超参；microbatch 32 × accum 16 = 512 局有效 batch，
-GPU 实测 ~22k pos/s → 35M 局 1 epoch 约 31 小时）。
+**当前状态（2026-09-15）：阶段 0 已验收通过；Stage A 正式训练中**。
+数据：3 个月度前缀切片（2026-08/07/06 各 4 GB zst）→ C++ 多进程构建器
+（`cpp/pgn2shards.cpp`，16 进程，~12.5 万局/s，比 python-chess 快 ~100×；
+perft(4)=197281 精确 + 12.5 万局与 Python 构建器逐字节对拍通过）→ 19.4M 局动作列表分片
+（v2 格式，常驻 2.8 GB）。
+训练：train/stage_a.py，microbatch 32 × accum 16 = 512 局/步，~19k pos/s，
+1 epoch = 37,758 步 ≈ 18-19 小时（runs/stage_a_20260915）。
 
 与原项目 UniChess（ResNet 46M + MCTS + autoloop）**完全隔离**：本目录独立开发、独立数据、
 独立 git 仓库；不得修改 `/home/jeefy/UniChess` 的任何文件或服务配置。
@@ -53,6 +53,8 @@ UniChessSSM/
 │   ├── heads.py         # f: policy/WDL/moves-left
 │   ├── losses.py        # 五损失（统一归约口径）
 │   └── data/            # PGN 下载/序列构建/分片/Elo 加权
+├── cpp/
+│   └── pgn2shards.cpp   # C++ 多进程 PGN→分片构建器（16 进程；perft/SAN/动作表自检；--verify 对拍）
 ├── train/
 │   └── stage_a.py       # Stage A 训练器（§7.3 锁定超参；原子检查点；SIGTERM 优雅退出）
 ├── tools/               # 冒烟与运维脚本
