@@ -192,6 +192,7 @@ struct Board {
                         int to = rr * 8 + ff;
                         if (!sq[to]) push(to);
                         else { if ((sq[to] > 0) != me) push(to); break; }
+                        if (a == 6) break;  // 王只走一格
                         ff += QDIRS[d][0]; rr += QDIRS[d][1];
                     }
                 }
