@@ -57,11 +57,12 @@ def start_seg(month: str, seg_idx: int, path: str, start: int, end: int, out: st
     if have > 0:
         print(f"  resume seg{seg_idx} {path} at +{have/1e6:.1f}MB", flush=True)
     # 追加写入（shell >>）：curl -o 默认截断，重启会丢已下字节（v2 教训）
+    # start_new_session=True：kill 时按进程组杀，防孤儿 curl 双写（v3 教训）
     cmd = f"curl -s -f --max-time {MAX_SEG_SEC} -r {start + have}-{end} "
     if path == "proxy":
         cmd += f"-x {PROXY} "
     cmd += f"\"{url(month)}\" >> {out}"
-    return subprocess.Popen(["bash", "-c", cmd])
+    return subprocess.Popen(["bash", "-c", cmd], start_new_session=True)
 
 
 def seg_complete(out: str, expect: int) -> bool:
@@ -103,7 +104,10 @@ def download_month(month: str) -> None:
 
     def kill(i: int) -> None:
         if procs[i] is not None and procs[i].poll() is None:
-            procs[i].send_signal(signal.SIGKILL)
+            try:
+                os.killpg(os.getpgid(procs[i].pid), signal.SIGKILL)  # 整组杀：bash+curl
+            except ProcessLookupError:
+                pass
             procs[i].wait()
         procs[i] = None
 
