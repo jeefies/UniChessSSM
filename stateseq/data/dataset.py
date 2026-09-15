@@ -16,7 +16,7 @@ import torch
 from ..actions import NUM_ACTIONS, move_to_action
 from ..features import FEATURE_DIM, encode
 from ..losses import elo_weights
-from .gshards import ShardReader, is_val_key
+from .gshards import ShardReader
 from .sequences import T_MAX, _board_key
 
 
@@ -104,10 +104,8 @@ class SequenceDataset:
         self.workers = workers
         self.seed = seed
         self.pool = mp.Pool(workers, initializer=_worker_init, initargs=(shard_dir,))
-        self.val_indices = [i for i in range(self.n_games)
-                            if is_val_key(str(self.reader.meta_all[i]["game_key"]))]
-        self.train_indices = [i for i in range(self.n_games)
-                              if not is_val_key(str(self.reader.meta_all[i]["game_key"]))]
+        self.val_indices = [i for i in range(self.n_games) if bool(self.reader.is_val_arr[i])]
+        self.train_indices = [i for i in range(self.n_games) if not bool(self.reader.is_val_arr[i])]
         if not self.val_indices:  # 小样本兜底：尾部 1% 作 val
             cut = max(self.n_games // 100, 1)
             self.val_indices = list(range(self.n_games - cut, self.n_games))

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Stage A 编排：月片到位即构建分片，全部构建完成后自动启动 1 epoch 正式训练。
+# Stage A 编排 v2：月片到位 → 解压 → C++ 多进程构建 → manifest 汇总 → 清理临时 pgn；
+# 全部构建完成后自动启动 1 epoch 正式训练。
 # 用法：setsid nohup bash tools/stateseq_pipeline.sh > data/pipeline.log 2>&1 &
 set -u
 cd "$(dirname "$0")/.."
@@ -9,22 +10,26 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 for month in 2026-08 2026-07 2026-06; do
   raw="data/raw/lichess_standard_${month}.pgn.zst"
   while [ ! -f "${raw}.done" ]; do
-    sleep 120
+    sleep 60
   done
   if [ -f "data/shards/.built_${month}" ]; then
     echo "已构建 $month，跳过"
     continue
   fi
-  echo "== 构建 $month 分片 $(date)"
-  if $PY tools/stateseq_build_shards.py --pgn "$raw" --month "$month" --out data/shards >> data/pipeline.log 2>&1; then
+  echo "== 构建 $month $(date)"
+  pgn="data/tmp_probe/month_${month}.pgn"
+  zstd -dc "$raw" > "$pgn"
+  if tools/pgn2shards --pgn "$pgn" --month "$month" --out data/shards --workers 16 >> data/pipeline.log 2>&1; then
+    rm -f "$pgn"
     touch "data/shards/.built_${month}"
     echo "== $month 构建完成 $(date)"
   else
-    echo "== $month 构建失败，退出（可重跑本脚本续作）"
+    echo "== $month 构建失败，退出（修复后重跑本脚本续作）"
     exit 1
   fi
 done
 
+$PY tools/stateseq_finalize_manifest.py --out data/shards
 echo "== 全部数据就绪，启动 Stage A 训练 $(date)"
 RUN=runs/stage_a_20260915
 if [ -f "$RUN/latest.pt" ]; then RESUME="--resume"; else RESUME=""; fi
