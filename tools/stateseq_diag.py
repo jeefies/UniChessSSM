@@ -57,6 +57,8 @@ def make_batches(ds: SequenceDataset, idxs: np.ndarray, microbatch: int):
     out = []
     for j in range(0, len(idxs), microbatch):
         items = ds.pool.map(_worker_build, [int(i) for i in idxs[j:j + microbatch]])
+        # 必须与 SequenceDataset._collate 同序（按局长度降序），否则 meta/行错位
+        items = sorted(items, key=lambda it: -len(it[1]["actions"]))
         coll = ds._collate(items)
         metas = ds.reader.meta_all[[int(it[0]) for it in items]]
         out.append((items, metas, coll["batch"], coll["valid"]))
