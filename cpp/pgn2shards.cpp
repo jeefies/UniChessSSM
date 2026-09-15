@@ -163,7 +163,7 @@ struct Board {
                 if (r1 >= 0 && r1 < 8) {
                     int to = s + dir;
                     if (!sq[to]) {
-                        if (r1 == promo_r) { for (int pr : {4,3,2}) push(to, pr); }
+                        if (r1 == promo_r) { for (int pr : {5,4,3,2}) push(to, pr); }
                         else push(to);
                         if (r == start_r && !sq[s + 2 * dir]) push(s + 2 * dir);
                     }
@@ -172,7 +172,7 @@ struct Board {
                         if (ff < 0 || ff >= 8) continue;
                         int t2 = s + dir + df;
                         if (sq[t2] && (sq[t2] > 0) != me) {
-                            if (r1 == promo_r) { for (int pr : {4,3,2}) push(t2, pr); }
+                            if (r1 == promo_r) { for (int pr : {5,4,3,2}) push(t2, pr); }
                             else push(t2);
                         }
                         if (t2 == ep && sq[t2] == 0) push(t2, 0, true);
@@ -246,7 +246,7 @@ struct Board {
 struct San {
     static int parse(const std::string& tok_raw, Board& b, const ActionTables& T) {
         std::string tok = tok_raw;
-        while (!tok.empty() && (tok.back() == '+' || tok.back() == '#')) tok.pop_back();
+        while (!tok.empty() && (tok.back() == '+' || tok.back() == '#' || tok.back() == '?' || tok.back() == '!')) tok.pop_back();
         if (tok.empty()) return -1;
         int ptype, to, promo = 0, ff = -1, rr = -1, fixed_from = -1;
         if (tok == "O-O" || tok == "0-0") { ptype = 6; to = b.white ? 62 % 64 : 62; to = b.white ? 6 : 62; fixed_from = b.white ? 4 : 60; }
