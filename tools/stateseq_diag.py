@@ -639,10 +639,13 @@ def main() -> None:
     os.makedirs(out_dir, exist_ok=True)
 
     t0 = time.time()
-    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
+    # 训练占满 GPU 时，直接 map_location=cuda 会在反序列化阶段 OOM；先 CPU 加载再搬模型
+    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     step = int(ckpt.get("step", -1)) + 1
-    model = SeqModel(dropout=0.1).to(device)
+    model = SeqModel(dropout=0.1)
     model.load_state_dict(ckpt["model"])
+    model.to(device)
+    del ckpt
     print(f"加载 {args.ckpt}（step {step}），耗时 {time.time()-t0:.1f}s", flush=True)
 
     t0 = time.time()
@@ -693,9 +696,10 @@ def main() -> None:
     if args.also_best:
         best_path = os.path.join(os.path.dirname(os.path.abspath(args.ckpt)), "best.pt")
         if os.path.exists(best_path):
-            bck = torch.load(best_path, map_location=device, weights_only=False)
-            bmodel = SeqModel(dropout=0.1).to(device)
+            bck = torch.load(best_path, map_location="cpu", weights_only=False)
+            bmodel = SeqModel(dropout=0.1)
             bmodel.load_state_dict(bck["model"])
+            bmodel.to(device)
             bsanity, _, _, _ = evaluate_ckpt(bmodel, val_batches, device)
             report["best"] = {"step": int(bck.get("step", -1)) + 1, "sanity": bsanity,
                               "train_val_at_save": bck.get("val")}
