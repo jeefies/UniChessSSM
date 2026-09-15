@@ -447,7 +447,7 @@ static void worker_run(int wid, const char* path, size_t begin, size_t end,
         while (!cur.eof() && !cur.at_event()) cur.get();
         if (cur.eof()) exit(0);
     }
-    ActionTables T;
+    static ActionTables T;
     std::string base = outdir + "/shard-" + month + "-w" + std::to_string(wid);
     FILE* fa = nullptr; FILE* fm = nullptr; FILE* fe = nullptr; FILE* fv = nullptr;
     if (verify_mode) {
@@ -512,7 +512,7 @@ int main(int argc, char** argv) {
         else if (a == "--selfcheck") selfcheck = true;
         else if (a == "--verify") verify = true;
     }
-    ActionTables T;
+    static ActionTables T;
     if (dump) {
         for (int a = 0; a < 1936; a++)
             printf("%d %d %d\n", T.from_tbl[a*3], T.from_tbl[a*3+1], T.from_tbl[a*3+2]);
