@@ -52,13 +52,14 @@ def to_device(batch: TrainBatch, device: str) -> TrainBatch:
 def make_batches(ds: SequenceDataset, idxs: np.ndarray, microbatch: int):
     """复用库内多进程重放与 _collate（只读使用，不改库代码）。
 
-    返回 [(items, TrainBatch(cpu), valid(cpu))]；items 含 (global_idx, data, w, elo_std, tc)。
+    返回 [(items, meta 数组, TrainBatch(cpu), valid(cpu))]；items 含 (global_idx, data, w, elo_std, tc)。
     """
     out = []
     for j in range(0, len(idxs), microbatch):
         items = ds.pool.map(_worker_build, [int(i) for i in idxs[j:j + microbatch]])
         coll = ds._collate(items)
-        out.append((items, coll["batch"], coll["valid"]))
+        metas = ds.reader.meta_all[[int(it[0]) for it in items]]
+        out.append((items, metas, coll["batch"], coll["valid"]))
     return out
 
 
@@ -117,7 +118,7 @@ class ValAccumulator:
         self.n_pos = 0
 
     def add_batch(self, model: SeqModel, batch: TrainBatch, valid: torch.Tensor,
-                  device: str, items: list) -> tuple[torch.Tensor, torch.Tensor]:
+                  device: str, metas: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         b = to_device(batch, device)
         v = valid.to(device)
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
@@ -170,7 +171,7 @@ class ValAccumulator:
         # 每桶局面数等：t / d 矩阵（n_plies 取分片 meta 未截断总局数）
         bsz, seqlen = vmask.shape
         t_mat = torch.arange(seqlen, device=device).unsqueeze(0).expand(bsz, seqlen)
-        n_plies = [int(it[0]["n_plies"]) for it in items]
+        n_plies = [int(m["n_plies"]) for m in metas]
         d_mat = torch.tensor(n_plies, device=device).unsqueeze(1) - t_mat
 
         idx = vmask.cpu().numpy()
@@ -194,8 +195,8 @@ def forward_val_subset(model, batches, device):
     """返回 (acc, stored_x, stored_h)：stored_* 供块 D 取 h_{t-1}/x_{t-1}。"""
     acc = ValAccumulator()
     stored_x, stored_h = [], []
-    for items, batch, valid in batches:
-        x, h = acc.add_batch(model, batch, valid, device, items)
+    for _items, metas, batch, valid in batches:
+        x, h = acc.add_batch(model, batch, valid, device, metas)
         stored_x.append(x)
         stored_h.append(h)
     return acc, stored_x, stored_h
@@ -371,7 +372,7 @@ def action_correspondence(model, ds, batches, stored_x, stored_h, device: str,
     rng = np.random.default_rng(seed)
     # 候选 (batch_i, row, 有效长度)
     cands = []
-    for bi, (items, batch, valid) in enumerate(batches):
+    for bi, (items, _metas, batch, valid) in enumerate(batches):
         lens = valid.sum(1).cpu().numpy()
         for row in range(len(items)):
             if lens[row] >= 3:
