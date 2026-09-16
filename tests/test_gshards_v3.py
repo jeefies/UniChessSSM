@@ -56,13 +56,14 @@ class V3ShardTest(unittest.TestCase):
             acts = [np.array([0, 1, 2], dtype=np.uint16) for _ in range(5)]
             probs = [np.array([0.5, 0.3, 0.2], dtype=np.float32) for _ in range(5)]
             pipol = encode_v3_pipol(acts, probs)
-            poff = np.array([0, 3, 6, 9, 12, 15], dtype=np.int32)
-            writer.add(meta, actions, pipol, poff)
+            byte_offsets = np.array([0, 12, 24, 36, 48, 60], dtype=np.int32)
+            writer.add(meta, actions, pipol, byte_offsets)
         writer.flush()
 
         reader = V3ShardReader(self.tmpdir)
         self.assertEqual(len(reader.metas[0]), 10)
         rec = reader.game(0)
+        print("game_key repr:", repr(reader.metas[0][0]["game_key"]))
         np.testing.assert_array_equal(rec["actions"], np.arange(5, dtype=np.uint16))
         self.assertIsNotNone(rec["pipol_actions"])
         self.assertEqual(len(rec["pipol_actions"]), 5)
@@ -102,8 +103,8 @@ class V3ShardTest(unittest.TestCase):
         acts = [np.array([0, 1], dtype=np.uint16) for _ in range(3)]
         probs = [np.array([0.6, 0.4], dtype=np.float32) for _ in range(3)]
         pipol = encode_v3_pipol(acts, probs)
-        poff = np.array([0, 2, 4, 6], dtype=np.int32)
-        writer.add(meta, actions, pipol, poff)
+        byte_offsets = np.array([0, 8, 16, 24], dtype=np.int32)
+        writer.add(meta, actions, pipol, byte_offsets)
         writer.flush()
 
         reader = V3ShardReader(self.tmpdir)
