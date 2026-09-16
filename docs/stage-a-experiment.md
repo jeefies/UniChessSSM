@@ -330,7 +330,19 @@ flowchart TD
 
 > **口径声明（评审要求补记）**：① 本节全部指标来自固定 256 局验证子集（seed 777，16,936 局面），非完整 97,123 局验证集，且同局局面彼此相关、非独立样本；独立 held-out 评估（2–4k 局未参与 best 选择）待补。② 文中 0.754（sanity 前向批口径）/ 0.766（value 块掩码口径）/ 0.767（训练时验证口径）三个 value CE 分属三种口径，勿混用；value_gain 只在同口径内成立。③ 此前"4-0 胜随机走子 ⇒ 适配器无 bug"的推论不成立——该冒烟只验证合法走子，value 视角/历史缓存/条件输入均未覆盖，端到端对拍见 §10。
 
-## 10. 监控与告警口径（§11 + §10.2）
+## 10. 推理链路审计与归因对照（2026-09-16，评审 review.txt 待办③④）
+
+**③ 链路审计——全部 PASS（适配器/链路嫌疑彻底排除）**：
+
+- **全链路对拍**（tools/ssm_path_audit.py，21 个真实分片局面含升变/过路兵/易位/重复局面）：原生路径 ↔ SSMAdapter ↔ 推理服务器三层，**fp32 下逐位一致**（maxΔ=0.0）；bf16 口径 maxΔ=1.5e-2 属 mamba-2 kernel 固有噪声（同输入重复前向 maxΔ=0 证实非实现问题）。双 --remote 客户端交错逐着一致、server 被杀重启无 stale socket。
+- **WDL→Q 符号**（tools/ssm_wdl_sign_audit.py）：旧 MCTS 合约 Q=wdl[0]−wdl[2] 行棋方视角（mcts.py:291）与 SSM 训练标签完全一致；人工小树回传、间谍 _backup 独立重算、一步杀终局真值（杀着边缘 Q=+1.000）全部正确。
+- **80 局终止审计**：79 负全部棋盘上正常输棋，**0 超时、0 协议/非法着判负**（超时机制真实存在——uci.py 不解析 go、O(T²) 根重放——但 --remote 模式 0.63s/步使其无实例）。受 arena.py 产物格式限制，79 负无法进一步拆分将杀/子力败局。
+
+**④ 归因对照（进行中，runs/stage_a_20260915/arena_selfplay_*.json）**：
+
+- **A 路：MCTS-400 vs 纯 policy = 31胜1和0负，+719.7 Elo（CI 下界 +527，32 局）**——搜索相对裸 policy 有巨大增益，**推翻"value 弱 ⇒ 搜索增益≈0、退化为 policy-only"的评审假设**。
+
+## 11. 监控与告警口径（§11 + §10.2）
 
 每 50 步记录（`metrics.jsonl`）：五损失、recon 双口径（CE + whole-board acc）、dyn rel err、分模块 grad norm、pos/s、data_wait。告警规则：
 
@@ -352,7 +364,7 @@ flowchart TD
 
 ---
 
-## 11. 复现指南
+## 12. 复现指南
 
 ```bash
 # 环境：Ubuntu + conda env（Python 3.12.14，torch 2.11.0+cu128，
@@ -383,7 +395,7 @@ python tools/stateseq_plot_metrics.py --run runs/stage_a_20260915
 
 ---
 
-## 12. 环境与框架版本
+## 13. 环境与框架版本
 
 | 项 | 值 |
 |---|---|
