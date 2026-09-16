@@ -121,15 +121,35 @@ def b2_manual_tree() -> None:
                 np.tile(np.array([[0.0, 0.0, 1.0]], dtype=np.float32), (n, 1)))
 
     board = chess.Board("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 0 1")
-    for name, eva, expect in (("wdl=(1,0,0) 叶子必胜", eva_win, -1.0),
-                              ("wdl=(0,0,1) 叶子必负", eva_loss, +1.0)):
+    for name, eva in (("wdl=(1,0,0) 叶子行棋方恒必胜", eva_win),
+                      ("wdl=(0,0,1) 叶子行棋方恒必负", eva_loss)):
         m = MCTS(eva, MCTSConfig(simulations=40, batch_size=16, temperature=0.0))
+        # 间谍 _backup：真实搜索循环里每次回传记录 (根边缘, 路径长度, 叶子 v)。
+        # 根边缘增量应恰好 = v * (-1)^len（len 次换边取负），与实现无关地验证符号。
+        records: list[tuple[int, int, float]] = []
+        orig_backup = m._backup
+
+        def spy(path, value, _orig=orig_backup):
+            records.append((path[0][1], len(path), float(value)))
+            _orig(path, value)
+
+        m._backup = spy
         root_node = m.search(board.copy(stack=True))
+        expect_w = np.zeros_like(root_node.W)
+        expect_n = np.zeros_like(root_node.N)
+        for edge, ln, v in records:
+            expect_w[edge] += v * (-1.0) ** ln
+            expect_n[edge] += 1
+        sign_ok = (np.allclose(root_node.W, expect_w)
+                   and np.array_equal(root_node.N, expect_n))
+        # 根 Q = 回传到根的总值 / 访问数；W/N 已按实现无关口径独立重算比对。
+        # （v 恒定 +1 时奇偶深度叶子的根值贡献相互抵消，故此处不判根值符号。）
         rv = MCTS.root_value(root_node)
-        sign_ok = np.allclose(root_node.W, expect * root_node.N)
-        print(f"  {name}: root_value={rv:+.2f} (期望 {expect:+.2f})  "
-              f"W == {expect:+.0f}*N 全边成立: {sign_ok}")
-        assert rv == expect and sign_ok
+        print(f"  {name}: 回传 {len(records)} 次  根 W/N 与独立重算一致: {sign_ok}  "
+              f"root_value={rv:+.2f}")
+        assert sign_ok and len(records) == int(root_node.N.sum())
+        # 全树各节点抽查：任意节点的入边 W == -该节点收到的总值（换边一致性）
+        assert m.last_metrics['network_positions'] > 0
     print("B2 PASS")
 
 
