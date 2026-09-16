@@ -224,7 +224,7 @@ def audit_paths(ckpt: str, shard_dir: str, device: str) -> dict:
         idx4096 = np.argsort(p4096_nat)[::-1]
         s_nat = {chess.Move(i // 64, i % 64).uci() for i in idx4096[:5] if p4096_nat[i] > 0}
         idx_ad = np.argsort(pol_batch[i])[::-1]
-        s_adp = {chess.Move(i // 64, i % 64).uci() for i in idx_ad[:5] if pol_batch[i] > 0}
+        s_adp = {chess.Move(j // 64, j % 64).uci() for j in idx_ad[:5] if pol_batch[i][j] > 0}
         ok5_4096 = s_nat == s_adp
 
         max_pol = max(max_pol, d_pol)
