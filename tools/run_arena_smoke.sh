@@ -13,7 +13,11 @@ PIDFILE=$SOCK.pid
 cd /home/jeefy/UniChess   # arena.py 的 sys.path 与 ./unichess_gpu.sh 相对路径都依赖这里
 
 # 单 GPU 推理服务器：4 个 UCI 客户端共享，避免每进程 Mamba autotune 并发踩踏
-if [ ! -S "$SOCK" ]; then
+PY=/home/jeefy/miniconda3/envs/unichess/bin/python
+server_up() {
+  [ -S "$SOCK" ] && "$PY" -c "import socket; s=socket.socket(socket.AF_UNIX); s.connect('$SOCK'); s.close()" 2>/dev/null
+}
+if ! server_up; then
   rm -f "$SOCK" "$READY"
   nohup /home/jeefy/miniconda3/envs/unichess/bin/python "$SSM/tools/ssm_infer_server.py" \
       --ckpt "$SSM/runs/stage_a_20260915/best.pt" --sock "$SOCK" --ready "$READY" \
