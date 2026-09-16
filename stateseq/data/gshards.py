@@ -79,7 +79,13 @@ def make_game_key(month: str, game_index: int) -> str:
 
 
 def is_val_key(game_key: str, val_frac: float = 0.005) -> bool:
-    return int(game_key[:2], 16) < val_frac * 256
+    gk = game_key
+    if isinstance(gk, bytes):
+        gk = gk.decode("utf-8", errors="ignore")
+    gk = str(gk).strip()
+    if not gk:
+        return False
+    return int(gk[:2], 16) < val_frac * 256
 
 
 def encode_game_record(actions: list[int], tc: str | None, result: str,
