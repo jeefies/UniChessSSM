@@ -47,6 +47,7 @@ class V3ShardTest(unittest.TestCase):
             meta["result"] = 0
             meta["elo_missing"] = 0
             meta["elo_mean"] = 2500.0
+            meta["game_key"] = f"{i:016x}"
             meta["gen_id"] = 1
             meta["ckpt_step"] = 1000
             meta["termination_reason"] = 0
@@ -83,6 +84,33 @@ class V3ShardTest(unittest.TestCase):
         da, dp = decode_v3_pipol(blob, 1)
         s = float(dp[0].sum())
         self.assertTrue(0.99 <= s <= 1.01)
+
+    def test_roundtrip_meta_fields(self):
+        writer = V3ShardWriter(self.tmpdir, "meta")
+        meta = np.zeros((), dtype=META_V3_DTYPE)
+        meta["n_plies"] = 3
+        meta["tc_bucket"] = 2
+        meta["result"] = 0
+        meta["elo_missing"] = 0
+        meta["elo_mean"] = 2500.0
+        meta["game_key"] = "abcd1234ef567890"
+        meta["gen_id"] = 7
+        meta["ckpt_step"] = 5000
+        meta["termination_reason"] = 1
+        meta["is_truncated"] = 0
+        actions = np.arange(3, dtype=np.uint16)
+        acts = [np.array([0, 1], dtype=np.uint16) for _ in range(3)]
+        probs = [np.array([0.6, 0.4], dtype=np.float32) for _ in range(3)]
+        pipol = encode_v3_pipol(acts, probs)
+        poff = np.array([0, 2, 4, 6], dtype=np.int32)
+        writer.add(meta, actions, pipol, poff)
+        writer.flush()
+
+        reader = V3ShardReader(self.tmpdir)
+        rec = reader.game(0)
+        self.assertEqual(int(rec["meta"]["gen_id"]), 7)
+        self.assertEqual(int(rec["meta"]["ckpt_step"]), 5000)
+        self.assertEqual(int(rec["meta"]["termination_reason"]), 1)
 
 
 if __name__ == "__main__":
