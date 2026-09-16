@@ -31,7 +31,7 @@ import chess  # noqa: E402
 
 from stateseq.actions import FROM_ACTION, move_to_action  # noqa: E402
 
-from core.encoding import orient_move  # noqa: E402  旧项目只读引用
+from core.encoding import orient_move, unorient_move  # noqa: E402  旧项目只读引用
 from core.moves import PROMO_PIECES, move_to_index  # noqa: E402
 
 
@@ -65,19 +65,25 @@ def test_a_roundtrip(n_positions: int, seed: int) -> None:
             if promo != expect_promo:
                 bad += 1
                 continue
-            # 4096 索引（orient 坐标系）-> 该 (from,to) 下的唯一动作反查
+            # 4096 索引（orient 坐标系）-> 走法 -> unorient 回到原着
             om = orient_move(mv, b.turn)
             idx = om.from_square * 64 + om.to_square
             frm2, to2 = divmod(idx, 64)
-            if (frm2, to2) != (frm, to):
+            if unorient_move(chess.Move(frm2, to2, promotion=promo), b.turn) != mv:
                 bad += 1
                 continue
-            # 同 (from,to) 的所有合法着必须全部映射到同一索引（保证 mcts 反查一致）
+            # 同 (from,to) 的合法着（升变四件套）必须全部映射到同一 4096 索引，
+            # 且各自动作 id 的 FROM_ACTION 反查 (from,to,promo) 与原着一致
             sibs = [m for m in b.legal_moves
                     if orient_move(m, b.turn).from_square == om.from_square
                     and orient_move(m, b.turn).to_square == om.to_square]
-            if any(move_to_action(m) != a for m in sibs):
-                bad += 1
+            for m in sibs:
+                am = move_to_action(m)
+                f3, t3, p3 = FROM_ACTION[am]
+                e3 = None if m.promotion in (None, chess.QUEEN) else m.promotion
+                if (f3, t3, p3) != (m.from_square, m.to_square, e3):
+                    bad += 1
+                    break
             # 动作 -> 走法（python-chess Move 相等只看 from/to/promotion）
             if chess.Move(frm, to, promotion=promo) != mv:
                 bad += 1
