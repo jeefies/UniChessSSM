@@ -291,6 +291,8 @@ class V3ShardWriter:
             fh.write(pipol_blob)
         os.replace(tmp, base + ".pipol.bin")
         self.shard_files.append(base)
+        write_manifest(self.out_dir, self.shard_files, [],
+                       {"games": self.games, "steps": self.steps})
         self._metas, self._action_chunks, self._pipol_chunks, self._pipol_offsets = [], [], [], []
 
 

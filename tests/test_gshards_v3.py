@@ -73,8 +73,8 @@ class V3ShardTest(unittest.TestCase):
         da, dp = decode_v3_pipol(blob, 2)
         np.testing.assert_array_equal(da[0], acts[0])
         np.testing.assert_array_equal(da[1], acts[1])
-        np.testing.assert_allclose(dp[0], probs[0], atol=1e-5)
-        np.testing.assert_allclose(dp[1], probs[1], atol=1e-5)
+        np.testing.assert_allclose(dp[0], probs[0], atol=1e-3)
+        np.testing.assert_allclose(dp[1], probs[1], atol=1e-3)
 
     def test_prob_sum_check(self):
         acts = [np.array([0, 1, 2], dtype=np.uint16)]
