@@ -84,11 +84,12 @@ class SSMAdapter:
 
     # ---- 序列重放：move_stack -> (features, colors)，末位即当前局面 ----
 
-    def _replay(self, board: chess.Board) -> tuple[np.ndarray, np.ndarray]:
+    def _replay(self, board: chess.Board) -> tuple[np.ndarray, np.ndarray, str]:
         b = board.copy()
         moves = list(b.move_stack)
         for mv in reversed(moves):
             b.pop()
+        root_fen = b.fen()  # FEN 根（arena 开局库）是序列重放的真实起点
         occ: dict = {}
         feats = np.zeros((len(moves) + 1, FEATURE_DIM), dtype=np.float32)
         colors = np.zeros(len(moves) + 1, dtype=np.int64)
@@ -100,7 +101,7 @@ class SSMAdapter:
             colors[t] = 1 if b.turn == chess.WHITE else 0
             if t < len(moves):
                 b.push(moves[t])
-        return feats, colors
+        return feats, colors, root_fen
 
     def _forward_last(self, feats_pad: torch.Tensor, colors_pad: torch.Tensor,
                       lengths: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -125,11 +126,13 @@ class SSMAdapter:
 
     def evaluate_batch(self, boards: list[chess.Board]):
         t0 = time.time()
-        # 同批内按 move_stack 去重（MCTS 叶子大量共享前缀）
+        # 同批内按 (根 FEN, move_stack) 去重（MCTS 叶子大量共享前缀；
+        # FEN 根的 move_stack 为空，只看 move_stack 会把不同开局塌缩成一条）
         uniq: dict[tuple, list[int]] = {}
         order: list[tuple] = []
+        root_fens: dict[tuple, str] = {}
         for i, b in enumerate(boards):
-            key = tuple(b.move_stack)
+            key = (b.root().fen(), tuple(b.move_stack))
             if key not in uniq:
                 uniq[key] = []
                 order.append(key)
@@ -137,10 +140,11 @@ class SSMAdapter:
 
         feats_list, colors_list, lengths = [], [], []
         for key in order:
-            f, c = self._replay(boards[uniq[key][0]])
+            f, c, root_fen = self._replay(boards[uniq[key][0]])
             feats_list.append(f)
             colors_list.append(c)
             lengths.append(len(f))
+            root_fens[key] = root_fen
 
         n, t_max = len(order), max(lengths)
         feats_pad = torch.zeros((n, t_max, FEATURE_DIM), dtype=torch.float32)
@@ -170,7 +174,8 @@ class SSMAdapter:
         promo_out = np.ones((len(boards), 4), dtype=np.float32)
         row_of = {key: i for i, key in enumerate(order)}
         for i, b in enumerate(boards):
-            row = row_of[tuple(b.move_stack)]
+            key = (b.root().fen(), tuple(b.move_stack))
+            row = row_of[key]
             self._fill_4096(b, probs_np[row], policy_out[i], promo_out[i])
 
         self.last_eval_seconds = time.time() - t0
