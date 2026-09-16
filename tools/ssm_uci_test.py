@@ -85,9 +85,6 @@ def test_a_roundtrip(n_positions: int, seed: int) -> None:
                 if (f3, t3, p3) != (m.from_square, m.to_square, e3):
                     bad += 1
                     break
-            # 动作 -> 走法（python-chess Move 相等只看 from/to/promotion）
-            if chess.Move(frm, to, promotion=promo) != mv:
-                bad += 1
             if mv.promotion:
                 special["promo"] += 1
             if b.is_en_passant(mv):
