@@ -182,11 +182,12 @@ def b3_terminal_ground_truth(ckpt: str, device: str, sims: int) -> dict:
             mv, root = mcts.best_move(board.copy(stack=True))
             rv = MCTS.root_value(root)
             child = board.copy(stack=True)
-            child.push_uci(want_mv)
+            mate_move = chess.Move.from_uci(want_mv)
+            child.push(mate_move)
             really_mate = child.is_checkmate()
             # 必胜分支口径：杀着边缘的 Q 应 ≈ +1（其全部子模拟都是终局将死，
             # 回传恒 +1）；根整体 Q 允许因其他分支走网络评估而 < 1。
-            mate_i = list(root.moves).index(child.move)
+            mate_i = list(root.moves).index(mate_move)
             q_mate = float(root.q()[mate_i])
             ok = (mv.uci() == want_mv and really_mate and q_mate > 0.99)
             print(f"  {name}: bestmove={mv.uci()} (期望 {want_mv}) 杀着真将死: {really_mate} "
