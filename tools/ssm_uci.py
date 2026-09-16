@@ -25,8 +25,15 @@
 搜索直接复用旧项目 search/mcts.py（只读 sys.path 引用），sims 从环境变量
 UNICHESS_MCTS 读取（默认 400），与旧引擎同口径。
 
+多进程 arena（4 worker × 双方引擎）共享单卡时，每个引擎进程都要各自做一次 Mamba-2
+triton kernel autotune（首 trunk 调用 ~4.2s，并发互相踩踏可到 ~18s），会超出
+python-chess 的 play 超时（10s + movetime）。因此 UCI 引擎支持 --remote 模式：
+本文件同时提供 tools/ssm_infer_server.py（单 GPU 推理进程，启动时热身一次），
+UCI 进程退化为纯 CPU 客户端（走 Unix socket），首个 go 即可 <1s，且不重复占显存。
+
 用法：
     UNICHESS_MCTS=400 python tools/ssm_uci.py --ckpt runs/stage_a_20260915/best.pt
+    UNICHESS_MCTS=400 python tools/ssm_uci.py --remote   # 走 ssm_infer_server
 """
 
 from __future__ import annotations
@@ -47,6 +54,9 @@ sys.path.insert(0, str(OLD_ROOT))
 
 import chess  # noqa: E402
 
+DEFAULT_SOCK = "/tmp/unichess-ssm-infer.sock"
+
+from stateseq.actions import NUM_ACTIONS as NUM_SSM_ACTIONS  # noqa: E402
 from stateseq.actions import move_to_action  # noqa: E402
 from stateseq.data.sequences import _board_key  # noqa: E402
 from stateseq.features import FEATURE_DIM, encode as ssm_encode  # noqa: E402
@@ -122,15 +132,14 @@ class SSMAdapter:
             policy_logits, wdl_logits, _ = self.model.f(h_last)
         return policy_logits.float(), wdl_logits.float()
 
-    # ---- 旧 evaluator 接口 ----
+    # ---- 推理核心：masked softmax 概率（供本地 evaluator 与远程 server 复用） ----
 
-    def evaluate_batch(self, boards: list[chess.Board]):
-        t0 = time.time()
+    def infer_probs(self, boards: list[chess.Board]) -> tuple[np.ndarray, np.ndarray]:
+        """返回 (probs[N,1936] 合法着 masked softmax, wdl[N,3])，N=len(boards)。"""
         # 同批内按 (根 FEN, move_stack) 去重（MCTS 叶子大量共享前缀；
         # FEN 根的 move_stack 为空，只看 move_stack 会把不同开局塌缩成一条）
         uniq: dict[tuple, list[int]] = {}
         order: list[tuple] = []
-        root_fens: dict[tuple, str] = {}
         for i, b in enumerate(boards):
             key = (b.root().fen(), tuple(b.move_stack))
             if key not in uniq:
@@ -140,11 +149,10 @@ class SSMAdapter:
 
         feats_list, colors_list, lengths = [], [], []
         for key in order:
-            f, c, root_fen = self._replay(boards[uniq[key][0]])
+            f, c, _root_fen = self._replay(boards[uniq[key][0]])
             feats_list.append(f)
             colors_list.append(c)
             lengths.append(len(f))
-            root_fens[key] = root_fen
 
         n, t_max = len(order), max(lengths)
         feats_pad = torch.zeros((n, t_max, FEATURE_DIM), dtype=torch.float32)
@@ -169,21 +177,32 @@ class SSMAdapter:
 
         probs_np = probs.cpu().numpy().astype(np.float32)
         wdl_np = wdl.cpu().numpy().astype(np.float32)
-
-        policy_out = np.zeros((len(boards), POLICY_SIZE), dtype=np.float32)
-        promo_out = np.ones((len(boards), 4), dtype=np.float32)
+        # 按输入顺序展开去重
+        out_p = np.zeros((len(boards), probs_np.shape[1]), dtype=np.float32)
+        out_w = np.zeros((len(boards), 3), dtype=np.float32)
         row_of = {key: i for i, key in enumerate(order)}
         for i, b in enumerate(boards):
             key = (b.root().fen(), tuple(b.move_stack))
             row = row_of[key]
-            self._fill_4096(b, probs_np[row], policy_out[i], promo_out[i])
+            out_p[i] = probs_np[row]
+            out_w[i] = wdl_np[row]
+        return out_p, out_w
+
+    # ---- 旧 evaluator 接口 ----
+
+    def evaluate_batch(self, boards: list[chess.Board]):
+        t0 = time.time()
+        probs_np, wdl_np = self.infer_probs(boards)
+
+        policy_out = np.zeros((len(boards), POLICY_SIZE), dtype=np.float32)
+        promo_out = np.ones((len(boards), 4), dtype=np.float32)
+        for i, b in enumerate(boards):
+            self._fill_4096(b, probs_np[i], policy_out[i], promo_out[i])
 
         self.last_eval_seconds = time.time() - t0
-        self.last_replayed_positions = sum(lengths)
         if self.debug:
-            print(f"info string eval_batch: {len(boards)} boards ({len(order)} uniq), "
-                  f"{sum(lengths)} replayed positions, {self.last_eval_seconds:.3f}s",
-                  file=sys.stderr, flush=True)
+            print(f"info string eval_batch: {len(boards)} boards, "
+                  f"{self.last_eval_seconds:.3f}s", file=sys.stderr, flush=True)
         return policy_out, promo_out, wdl_np
 
     @staticmethod
@@ -207,6 +226,55 @@ class SSMAdapter:
                     promo[PROMO_TO_IDX[piece]] = p / total
 
 
+# ------------------------------------------------------- 远程推理客户端
+
+class RemoteAdapter:
+    """走 Unix socket 连接 ssm_infer_server 的 evaluate_batch 实现（纯 CPU 客户端）。
+
+    请求: 4B 小端长度 + JSON {"items": [{"fen": 根FEN, "moves": [uci...]}, ...]}
+    响应: n*(1936+3) 个 float32（每行 1936 维 masked softmax 概率 + 3 维 wdl）
+    """
+
+    def __init__(self, sock_path: str = DEFAULT_SOCK, timeout: float = 600.0):
+        import socket
+        self.sock_path = sock_path
+        self.timeout = timeout
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(timeout)
+        self.sock.connect(sock_path)
+        self.last_eval_seconds = 0.0
+        self.last_replayed_positions = 0
+        self.step = -1
+
+    def evaluate_batch(self, boards: list[chess.Board]):
+        import json
+        import socket as _socket
+        t0 = time.time()
+        items = [{"fen": b.root().fen(), "moves": [m.uci() for m in b.move_stack]}
+                 for b in boards]
+        payload = json.dumps({"items": items}).encode()
+        try:
+            self.sock.sendall(len(payload).to_bytes(4, "little") + payload)
+            need = len(boards) * (NUM_SSM_ACTIONS + 3) * 4
+            buf = b""
+            while len(buf) < need:
+                chunk = self.sock.recv(min(1 << 20, need - len(buf)))
+                if not chunk:
+                    raise RuntimeError("ssm_infer_server 连接被关闭")
+                buf += chunk
+        except (ConnectionError, _socket.timeout, RuntimeError):
+            self.sock.close()
+            raise
+        arr = np.frombuffer(buf, dtype=np.float32).reshape(len(boards), -1)
+        probs_np, wdl_np = arr[:, :NUM_SSM_ACTIONS], arr[:, NUM_SSM_ACTIONS:]
+        policy_out = np.zeros((len(boards), POLICY_SIZE), dtype=np.float32)
+        promo_out = np.ones((len(boards), 4), dtype=np.float32)
+        for i, b in enumerate(boards):
+            SSMAdapter._fill_4096(b, probs_np[i], policy_out[i], promo_out[i])
+        self.last_eval_seconds = time.time() - t0
+        return policy_out, promo_out, wdl_np.copy()
+
+
 # ---------------------------------------------------------------- UCI 循环
 
 class UciLoop:
@@ -221,16 +289,22 @@ class UciLoop:
         if self.adapter is None:
             sims = int(os.environ.get("UNICHESS_MCTS", "400"))
             batch = int(os.environ.get("UNICHESS_MCTS_BATCH", "64"))
-            self.adapter = SSMAdapter(
-                self.args.ckpt, device=self.args.device,
-                tc_bucket=self.args.tc_bucket, elo=self.args.elo,
-                debug=self.args.debug)
+            if self.args.remote:
+                sock = os.environ.get("UNICHESS_SSM_SOCK", DEFAULT_SOCK)
+                self.adapter = RemoteAdapter(sock)
+                dev = f"remote:{sock}"
+            else:
+                self.adapter = SSMAdapter(
+                    self.args.ckpt, device=self.args.device,
+                    tc_bucket=self.args.tc_bucket, elo=self.args.elo,
+                    debug=self.args.debug)
+                dev = self.args.device
             self.mcts = MCTS(
                 self.adapter.evaluate_batch,
                 MCTSConfig(simulations=sims, batch_size=batch, temperature=0.0),
                 tablebase=None)  # SSM 侧无 Syzygy，与旧引擎 UNICHESS_SYZYGY="" 同口径
             print(f"info string loaded step={self.adapter.step} "
-                  f"sims={sims} device={self.args.device}", file=sys.stderr, flush=True)
+                  f"sims={sims} device={dev}", file=sys.stderr, flush=True)
 
     def _position(self, parts: list[str]) -> None:
         if len(parts) < 2:
@@ -302,6 +376,8 @@ def main() -> int:
     ap.add_argument("--tc-bucket", type=int, default=2, help="推理固定时间控制桶（默认 RAPID）")
     ap.add_argument("--elo", type=float, default=2567.5, help="推理固定 Elo（默认 P99 上限，标准化后约 +2.33σ）")
     ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--remote", action="store_true",
+                    help="走 ssm_infer_server（Unix socket）推理，本进程不占 GPU")
     return UciLoop(ap.parse_args()).run()
 
 

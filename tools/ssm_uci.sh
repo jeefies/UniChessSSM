@@ -8,6 +8,8 @@
 #   UNICHESS_MCTS_BATCH 推理批量（默认 64；多进程 arena 共享 16GB GPU 时防 OOM）
 #                       只影响 virtual loss 收集粒度，不影响固定 sims 口径
 #   UNICHESS_ROOT      旧项目路径（只读引用其 search/mcts.py 与 core/，默认 /home/jeefy/UniChess）
+#   UNICHESS_SSM_REMOTE=1  走 ssm_infer_server 远程推理（多进程 arena 推荐；
+#                          socket 由 UNICHESS_SSM_SOCK 指定，默认 /tmp/unichess-ssm-infer.sock）
 cd "$(dirname "$0")/.."
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate unichess
@@ -16,6 +18,11 @@ export PYTHONPATH="$PWD:${UNICHESS_ROOT:-/home/jeefy/UniChess}:${PYTHONPATH}"
 # 多进程 arena 共享单卡时减少碎片浪费（实测 4 worker 下防 OOM）
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
+REMOTE_ARGS=()
+if [ "${UNICHESS_SSM_REMOTE:-0}" = "1" ]; then
+  REMOTE_ARGS=(--remote)
+fi
+
 exec python tools/ssm_uci.py \
   --ckpt "${UNICHESS_SSM_CKPT:-runs/stage_a_20260915/best.pt}" \
-  --device "${UNICHESS_SSM_DEVICE:-cuda}" "$@"
+  --device "${UNICHESS_SSM_DEVICE:-cuda}" "${REMOTE_ARGS[@]}" "$@"
