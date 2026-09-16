@@ -65,9 +65,13 @@ def b2_manual_tree() -> None:
     mcts = MCTS(lambda boards: (_ for _ in ()).throw(AssertionError("不应调网络")),
                 cfg)
 
+    # 真实搜索里下探先加 virtual loss、回传时抵消；手工复现这一约定
+    vl = cfg.virtual_loss
+
     # 两层：父节点一条边；叶子（父方走完后的子节点，行棋方将被将死）v=-1
     parent = Node()
     parent.expand([chess.Move.from_uci("e2e4")], np.array([1.0], dtype=np.float32))
+    parent.VL[0] += vl
     mcts._backup([(parent, 0)], -1.0)
     print(f"  单边缘回传 v=-1: parent.W={parent.W.tolist()} (期望 [+1]，父方视角必胜)")
     assert parent.W[0] == 1.0 and parent.N[0] == 1
@@ -78,6 +82,8 @@ def b2_manual_tree() -> None:
     mid = Node()
     mid.expand([chess.Move.from_uci("d7d5")], np.array([1.0], dtype=np.float32))
     root.children[0] = mid
+    root.VL[0] += vl
+    mid.VL[0] += vl
     mcts._backup([(root, 0), (mid, 0)], -1.0)
     print(f"  三层回传 v=-1: mid.W={mid.W.tolist()} (期望 [+1])  "
           f"root.W={root.W.tolist()} (期望 [-1]，根方视角必负)")
@@ -89,6 +95,7 @@ def b2_manual_tree() -> None:
     # 反向：叶子行棋方 v=+1（必胜）→ 父边缘 W=-1
     parent2 = Node()
     parent2.expand([chess.Move.from_uci("g1f3")], np.array([1.0], dtype=np.float32))
+    parent2.VL[0] += vl
     mcts._backup([(parent2, 0)], +1.0)
     print(f"  单边缘回传 v=+1: parent.W={parent2.W.tolist()} (期望 [-1])")
     assert parent2.W[0] == -1.0
