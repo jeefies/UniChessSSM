@@ -27,6 +27,10 @@ OUT=${OUT:-$RUNS/arena_selfplay_mcts_vs_$MODE.json}
 
 cd /home/jeefy/UniChess   # arena.py 的 sys.path 相对路径依赖这里
 
+# GPU 可能与 stateseq_heldout_eval.py 等任务共享：expandable_segments 减少碎片浪费
+# （OOM 实测 reserved-unallocated 达 3.25 GiB）
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 PY=/home/jeefy/miniconda3/envs/unichess/bin/python
 server_up() {
   [ -S "$SOCK" ] && "$PY" -c "import socket; s=socket.socket(socket.AF_UNIX); s.connect('$SOCK'); s.close()" 2>/dev/null
