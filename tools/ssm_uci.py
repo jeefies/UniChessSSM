@@ -25,6 +25,13 @@
 搜索直接复用旧项目 search/mcts.py（只读 sys.path 引用），sims 从环境变量
 UNICHESS_MCTS 读取（默认 400），与旧引擎同口径。
 
+归因对照开关（默认关闭，不改变现状；两者独立、可叠加）：
+  - UNICHESS_PURE_POLICY=1：不搜索。go 时用适配器评估根局面（完整历史递推），
+    直接选合法着中 policy 概率最高者返回（升变按旧口径 policy[idx]*promo[pi]）。
+  - UNICHESS_NEUTRAL_WDL=1：照常 MCTS 搜索，但 evaluate_batch 返回的 wdl 改为
+    均匀 (1/3,1/3,1/3)（Q=W-L=0，非终局叶值中性）；终局真值仍由 mcts.py 规则判定，
+    只改适配器返回值，不动 mcts.py。
+
 多进程 arena（4 worker × 双方引擎）共享单卡时，每个引擎进程都要各自做一次 Mamba-2
 triton kernel autotune（首 trunk 调用 ~4.2s，并发互相踩踏可到 ~18s），会超出
 python-chess 的 play 超时（10s + movetime）。因此 UCI 引擎支持 --remote 模式：
@@ -286,6 +293,8 @@ class UciLoop:
         self.mcts: MCTS | None = None
         self.board = chess.Board()
         self.move_time = 0.0
+        self.pure_policy = os.environ.get("UNICHESS_PURE_POLICY", "0") == "1"
+        self.neutral_wdl = os.environ.get("UNICHESS_NEUTRAL_WDL", "0") == "1"
 
     def _ensure(self) -> None:
         if self.adapter is None:
@@ -301,12 +310,45 @@ class UciLoop:
                     tc_bucket=self.args.tc_bucket, elo=self.args.elo,
                     debug=self.args.debug)
                 dev = self.args.device
+            eval_fn = self.adapter.evaluate_batch
+            if self.neutral_wdl:
+                # 屏蔽 value：非终局叶值中性（Q=0），终局真值仍由 mcts 规则判定
+                def _neutral_eval(boards, _fn=eval_fn):
+                    policy_out, promo_out, _wdl = _fn(boards)
+                    n = len(boards)
+                    wdl = np.full((n, 3), 1.0 / 3.0, dtype=np.float32)
+                    return policy_out, promo_out, wdl
+                eval_fn = _neutral_eval
             self.mcts = MCTS(
-                self.adapter.evaluate_batch,
+                eval_fn,
                 MCTSConfig(simulations=sims, batch_size=batch, temperature=0.0),
                 tablebase=None)  # SSM 侧无 Syzygy，与旧引擎 UNICHESS_SYZYGY="" 同口径
             print(f"info string loaded step={self.adapter.step} "
-                  f"sims={sims} device={dev}", file=sys.stderr, flush=True)
+                  f"sims={sims} device={dev} "
+                  f"pure_policy={int(self.pure_policy)} "
+                  f"neutral_wdl={int(self.neutral_wdl)}",
+                  file=sys.stderr, flush=True)
+
+    def _pure_policy_move(self) -> chess.Move:
+        """不搜索：根局面一次评估，选合法着中 policy 概率最高者。
+
+        概率口径与 mcts 先验一致：普通着 policy[orient(from)*64+orient(to)]，
+        升变着 policy[idx]*promo[PROMO_TO_IDX[piece]]。
+        """
+        policy_out, promo_out, _wdl = self.adapter.evaluate_batch(
+            [self.board.copy(stack=True)])
+        policy, promo = policy_out[0], promo_out[0]
+        turn = self.board.turn
+        best_mv, best_p = None, -1.0
+        for mv in self.board.legal_moves:
+            om = orient_move(mv, turn)
+            p = float(policy[om.from_square * 64 + om.to_square])
+            if mv.promotion is not None:
+                p *= float(promo[PROMO_TO_IDX[mv.promotion]])
+            if p > best_p:
+                best_p, best_mv = p, mv
+        assert best_mv is not None
+        return best_mv
 
     def _position(self, parts: list[str]) -> None:
         if len(parts) < 2:
@@ -333,7 +375,10 @@ class UciLoop:
             print("bestmove 0000", flush=True)
             return
         t0 = time.time()
-        mv, _ = self.mcts.best_move(self.board.copy(stack=True))
+        if self.pure_policy:
+            mv = self._pure_policy_move()
+        else:
+            mv, _ = self.mcts.best_move(self.board.copy(stack=True))
         dt = time.time() - t0
         self.move_time += dt
         # UCI info：用一次轻量根评估输出可读分值（复用 adapter 缓存无，直接省略显式 cp 也行）
