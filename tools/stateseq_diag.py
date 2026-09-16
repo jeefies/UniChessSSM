@@ -363,16 +363,27 @@ def find_legal_move(board, action: int):
 
 def action_correspondence(model, ds, batches, stored_x, stored_h, device: str,
                           n_samples: int = 100, seed: int = D_SEED) -> dict:
-    """g 头动作对应性：同一 h_{t-1} 下，正确配对 (Δ̂_a,Δ_a)/(Δ̂_b,Δ_b) vs 交换配对的误差。
+    """g 头动作对应性（严格对齐版）。
 
-    局面由 python-chess 重放得到（Python 侧特征提取 = stateseq.features.encode，非 C++ 构建器）。
+    训练语义（model.forward_train）：Δ̂_t = g(h_{t-1}, a_t)，目标 sg(x_t − x_{t-1})。
+    即 g 的条件量是"目标局面 B_t 之前的隐状态 h_{t-1}"，动作槽填的是 **B_t 上实际要走/可走**
+    的着法（批内 feats[t] = encode(B_t) 为走子前局面）。
+
+    本测试对采样局面 B_t（重放到走子前）报告四组量：
+    1. 编码一致性探针：同一下标 t，批内 x_t vs 重放 encode(B_t)+E，报 ‖·‖ 差（验证旁路编码
+       与数据管线一致：occurrence/半回合钟/行棋方/特征序）。
+    2. 动作敏感性：同一 h 下两合法着 a,b 的 ‖g(h,a)−g(h,b)‖²/d（不依赖任何后继编码）。
+    3. 训练语义配对：err_correct = mse(g(h_{t-1}, a_t), x_t−x_{t-1})（目标取自批内 latent，
+       不经旁路编码）vs err_swapped = mse(g(h_{t-1}, b), x_t−x_{t-1})。
+    4. 后继局面变体（自然动力学口径）：g(h_t, a) vs E(encode(B_a))−x_t，仅供参考——
+       g 未按此口径训练（动作槽在训练里是"目标局面上的着法"而非"源局面走子"）。
     """
     import chess
     from stateseq.data.sequences import _board_key
     from stateseq.features import encode
 
     rng = np.random.default_rng(seed)
-    # 候选 (batch_i, row, 有效长度)
+    # 候选 (batch_i, row, 有效长度)；t∈[1, ln−1]：需 h[t−1]、x[t] 与 actions[t]
     cands = []
     for bi, (items, _metas, batch, valid) in enumerate(batches):
         lens = valid.sum(1).cpu().numpy()
@@ -382,10 +393,13 @@ def action_correspondence(model, ds, batches, stored_x, stored_h, device: str,
     if not cands:
         return {"skipped": "val 子集中无可采样局面"}
 
-    feats_a: list = []
-    feats_b: list = []
-    x_prev_rows: list = []
-    h_prev_rows: list = []
+    feats_bt: list = []   # encode(B_t)（走子前，探针用）
+    feats_ba: list = []   # encode(B_a)，a = 实走着 actions[t]
+    feats_bb: list = []   # encode(B_b)，b = 随机其他合法着
+    h_train_rows: list = []   # stored_h[t-1]（训练语义条件量）
+    xp_train_rows: list = []  # stored_x[t-1]
+    xt_rows: list = []        # stored_x[t]（= x(B_t)，训练语义目标侧）
+    h_cur_rows: list = []     # stored_h[t]（后继变体条件量）
     act_a: list = []
     act_b: list = []
     made = 0
@@ -409,7 +423,8 @@ def action_correspondence(model, ds, batches, stored_x, stored_h, device: str,
             board.push(mv)
         if not ok:
             continue
-        occ[_board_key(board)] = occ.get(_board_key(board), 0) + 1
+        # board 现为 B_t（走子前）；其 occurrence = 此前出现次数（与 replay_game 同语义，不递增）
+        feats_bt.append(encode(board, occurrence=occ.get(_board_key(board), 0)))
         a = int(actions[t])
         legal = list(board.legal_moves)
         others = [m for m in legal if move_to_action(m) != a]
@@ -419,43 +434,85 @@ def action_correspondence(model, ds, batches, stored_x, stored_h, device: str,
         if mv_a is None:
             continue
         mv_b = others[int(rng.integers(len(others)))]
-        for mv, sink in ((mv_a, feats_a), (mv_b, feats_b)):
+        for mv, sink in ((mv_a, feats_ba), (mv_b, feats_bb)):
             bb = board.copy()
             bb.push(mv)
             sink.append(encode(bb, occurrence=occ.get(_board_key(bb), 0)))
-        h_prev_rows.append(stored_h[bi][row, t - 1].numpy())
-        x_prev_rows.append(stored_x[bi][row, t - 1].numpy())
+        h_train_rows.append(stored_h[bi][row, t - 1].numpy())
+        xp_train_rows.append(stored_x[bi][row, t - 1].numpy())
+        xt_rows.append(stored_x[bi][row, t].numpy())
+        h_cur_rows.append(stored_h[bi][row, t].numpy())
         act_a.append(a)
         act_b.append(move_to_action(mv_b))
         made += 1
     if made < 10:
         return {"skipped": f"可用样本过少（{made}）"}
 
-    H = torch.tensor(np.stack(h_prev_rows), device=device)            # (N,512)
-    XP = torch.tensor(np.stack(x_prev_rows), device=device)           # (N,512)
-    Xa = torch.tensor(np.stack(feats_a), device=device)
-    Xb = torch.tensor(np.stack(feats_b), device=device)
+    def to_gpu(rows):
+        return torch.tensor(np.stack(rows), device=device)
+
+    Htr = to_gpu(h_train_rows)                      # (N,512) h_{t-1}
+    Xp = to_gpu(xp_train_rows)                      # (N,512) x_{t-1}
+    Xt = to_gpu(xt_rows)                            # (N,512) x_t
+    Hcu = to_gpu(h_cur_rows)                        # (N,512) h_t
+    BT = to_gpu(feats_bt)
+    XA = to_gpu(feats_ba)
+    XB = to_gpu(feats_bb)
     Aa = torch.tensor(np.array(act_a), dtype=torch.long, device=device)
     Ab = torch.tensor(np.array(act_b), dtype=torch.long, device=device)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        xa = model.encode(Xa).float()
-        xb = model.encode(Xb).float()
-        dha = model.g(H, Aa).float()
-        dhb = model.g(H, Ab).float()
-    delta_a = xa - XP
-    delta_b = xb - XP
+        x_bt = model.encode(BT).float()             # 探针：重放编码的 x(B_t)
+        xa = model.encode(XA).float()
+        xb = model.encode(XB).float()
+        dha_tr = model.g(Htr, Aa).float()           # 训练语义：g(h_{t-1}, a_t)
+        dhb_tr = model.g(Htr, Ab).float()
+        dha_cu = model.g(Hcu, Aa).float()           # 后继变体：g(h_t, a)
+        dhb_cu = model.g(Hcu, Ab).float()
 
     def mse(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         return (x - y).pow(2).sum(-1) / x.shape[-1]                   # (N,)
 
-    err_correct = 0.5 * (mse(dha, delta_a) + mse(dhb, delta_b))
-    err_swapped = 0.5 * (mse(dha, delta_b) + mse(dhb, delta_a))
-    return {
-        "n_pairs": made,
-        "err_correct_mean": float(err_correct.mean()),
-        "err_swapped_mean": float(err_swapped.mean()),
-        "correct_less_than_swapped_frac": float((err_correct < err_swapped).float().mean()),
-    }
+    def stats(v: torch.Tensor) -> dict:
+        return {"mean": float(v.mean()), "p50": float(v.median()),
+                "p95": float(v.quantile(0.95))}
+
+    # 1) 编码一致性探针
+    probe_l2 = (x_bt - Xt).norm(dim=-1)
+    probe_rel = probe_l2 / Xt.norm(dim=-1).clamp(min=1e-8)
+    probe = {"n": made,
+             "l2_abs_mean": float(probe_l2.mean()), "l2_abs_max": float(probe_l2.max()),
+             "l2_rel_mean": float(probe_rel.mean()), "l2_rel_max": float(probe_rel.max())}
+
+    # 2) 动作敏感性（同一条件量、两合法着）
+    sep_tr = (dha_tr - dhb_tr).pow(2).sum(-1) / dha_tr.shape[-1]
+    pooled = torch.cat([dha_tr, dhb_tr])
+    dh_disp = (pooled - pooled.mean(0)).pow(2).sum(-1) / pooled.shape[-1]
+    sensitivity = {"n": made, "gap_between_actions": stats(sep_tr),
+                   "dh_spread_across_positions": stats(dh_disp)}
+
+    # 3) 训练语义配对（目标 = 批内 x_t − x_{t-1}，不经旁路编码）
+    target_tr = Xt - Xp
+    err_c_tr = mse(dha_tr, target_tr)
+    err_s_tr = mse(dhb_tr, target_tr)
+    trained = {"n_pairs": made,
+               "err_correct_mean": float(err_c_tr.mean()), "err_correct_p50": float(err_c_tr.median()),
+               "err_swapped_mean": float(err_s_tr.mean()), "err_swapped_p50": float(err_s_tr.median()),
+               "correct_less_than_swapped_frac": float((err_c_tr < err_s_tr).float().mean())}
+
+    # 4) 后继局面变体（g 未按此口径训练，仅供参考）
+    ta = xa - Xt                                   # Δ_a = x(B_a) − x(B_t)
+    tb = xb - Xt
+    err_c_cu = 0.5 * (mse(dha_cu, ta) + mse(dhb_cu, tb))
+    err_s_cu = 0.5 * (mse(dha_cu, tb) + mse(dhb_cu, ta))
+    successor = {"n_pairs": made,
+                 "err_correct_mean": float(err_c_cu.mean()),
+                 "err_swapped_mean": float(err_s_cu.mean()),
+                 "correct_less_than_swapped_frac": float((err_c_cu < err_s_cu).float().mean())}
+
+    return {"encode_probe": probe, "action_sensitivity": sensitivity,
+            "trained_pairing": trained, "successor_variant": successor,
+            "note": ("训练语义：Δ̂_t = g(h_{t-1}, a_t) 对齐 x_t−x_{t-1}，动作槽 = 目标局面 B_t 上的着法。"
+                     "err 对照：dyn mse≈0.10（同分布训练口径）、delta_energy≈0.39（预测 0 的误差）。")}
 
 
 # ---------------------------------------------------------------- 报告
@@ -594,9 +651,36 @@ def build_markdown(report: dict) -> str:
     if "skipped" in d:
         w(f"- 跳过：{d['skipped']}")
     else:
-        w(f"- {d['n_pairs']} 对（a=实走着，b=随机其他合法着；正确配对 vs 交换配对）：")
-        w(f"  - err_correct = {fmt(d['err_correct_mean'])}，err_swapped = {fmt(d['err_swapped_mean'])}")
-        w(f"  - correct<swapped 比例 = {fmt(d['correct_less_than_swapped_frac'], 3)}")
+        pr = d["encode_probe"]
+        w(f"### 编码一致性探针（批内 x_t vs 重放 encode(B_t)+E，n={pr['n']}）")
+        w("")
+        w(f"- ‖Δx‖₂ mean = {fmt(pr['l2_abs_mean'], 4)}（max {fmt(pr['l2_abs_max'], 4)}）；"
+          f"相对差 mean = {fmt(pr['l2_rel_mean'], 5)}（max {fmt(pr['l2_rel_max'], 5)}）"
+          f"——应为 bf16 数值噪声量级，否则旁路编码与数据管线不一致")
+        w("")
+        se = d["action_sensitivity"]
+        g1, g2 = se["gap_between_actions"], se["dh_spread_across_positions"]
+        w("### 动作敏感性（同一 h 下两合法着 a,b）")
+        w("")
+        w(f"- ‖g(h,a)−g(h,b)‖²/d：mean {fmt(g1['mean'])} / P50 {fmt(g1['p50'])} / P95 {fmt(g1['p95'])}")
+        w(f"- 对照 Δ̂ 跨局面散布 ‖Δ̂−meanΔ̂‖²/d：mean {fmt(g2['mean'])} / P50 {fmt(g2['p50'])} / "
+          f"P95 {fmt(g2['p95'])}")
+        w("")
+        tp = d["trained_pairing"]
+        w("### 训练语义配对（g(h_{t-1}, a_t) vs x_t−x_{t-1}，目标取批内 latent）")
+        w("")
+        w(f"- err_correct = {fmt(tp['err_correct_mean'])}（P50 {fmt(tp['err_correct_p50'])}），"
+          f"err_swapped = {fmt(tp['err_swapped_mean'])}（P50 {fmt(tp['err_swapped_p50'])}）")
+        w(f"- correct<swapped 比例 = {fmt(tp['correct_less_than_swapped_frac'], 3)}"
+          f"（n={tp['n_pairs']} 对；对照 dyn mse≈0.10 / delta_energy≈0.39）")
+        w("")
+        sv = d["successor_variant"]
+        w("### 后继局面变体（g(h_t, a) vs x(B_a)−x_t；g 未按此口径训练，仅供参考）")
+        w("")
+        w(f"- err_correct = {fmt(sv['err_correct_mean'])}，err_swapped = {fmt(sv['err_swapped_mean'])}，"
+          f"correct<swapped 比例 = {fmt(sv['correct_less_than_swapped_frac'], 3)}")
+        w("")
+        w(f"> {d.get('note', '')}")
     w("")
     if best:
         w(f"## best.pt 对照（step {best['step']}）")
