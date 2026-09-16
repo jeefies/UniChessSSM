@@ -32,7 +32,7 @@ import chess  # noqa: E402
 from stateseq.actions import FROM_ACTION, move_to_action  # noqa: E402
 
 from core.encoding import orient_move, unorient_move  # noqa: E402  旧项目只读引用
-from core.moves import PROMO_PIECES, move_to_index  # noqa: E402
+from core.moves import PROMO_PIECES, PROMO_TO_IDX, index_to_move, move_to_index  # noqa: E402
 
 
 def random_position(rng: np.random.Generator, max_plies: int = 120) -> chess.Board:
@@ -65,11 +65,12 @@ def test_a_roundtrip(n_positions: int, seed: int) -> None:
             if promo != expect_promo:
                 bad += 1
                 continue
-            # 4096 索引（orient 坐标系）-> 走法 -> unorient 回到原着
+            # 4096 索引 + 升变下标（旧 promo 头口径）-> 走法 -> unorient 回到原着。
+            # 注意升后走后走法动作（promo=None），升变棋子由 promo 头下标补回。
             om = orient_move(mv, b.turn)
             idx = om.from_square * 64 + om.to_square
-            frm2, to2 = divmod(idx, 64)
-            if unorient_move(chess.Move(frm2, to2, promotion=promo), b.turn) != mv:
+            promo_idx = None if mv.promotion is None else PROMO_TO_IDX[mv.promotion]
+            if unorient_move(index_to_move(idx, promo_idx), b.turn) != mv:
                 bad += 1
                 continue
             # 同 (from,to) 的合法着（升变四件套）必须全部映射到同一 4096 索引，
