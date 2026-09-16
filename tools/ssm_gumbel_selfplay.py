@@ -24,6 +24,7 @@ from stateseq.conditions import TimeControlBucket
 from stateseq.features import encode
 from stateseq.gumbel import Node, order_halving, export_pi_prime, C_VISIT, C_SCALE, N_SIMS, M0, TERM_CODES
 from stateseq.data.gshards import V3ShardWriter, encode_v3_pipol, META_V3_DTYPE
+from stateseq.model_r import clone_cache
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -111,13 +112,13 @@ class SearchTree:
                 legal.append(a)
         return legal
 
-    def _do_model_step(self, features: np.ndarray, legal_actions: list[int], cache) -> tuple[np.ndarray, float, np.ndarray]:
+    def _do_model_step(self, features: np.ndarray, legal_actions: list[int], cache) -> tuple[np.ndarray, float, np.ndarray, object]:
         logits_np, wdl_np, mlh_np, x_np, cache_new = self.model.step(
             features, int(self.cfg.tc_bucket), self.cfg.elo,
             1 if self.board.turn == chess.WHITE else 0, cache
         )
         q = float(wdl_np[0] - wdl_np[2])
-        return logits_np, q, x_np, cache_new
+        return logits_np, q, x_np, cache_new, cache_new
 
     def _expand(self, parent_node: Node, action: int, work_cache) -> Node | None:
         """从 parent_node 沿 action 扩展子节点（使用 work_cache，不修改 root_cache）。"""
@@ -149,17 +150,8 @@ class SearchTree:
         node = Node(legal=np.array(legal_actions, dtype=np.int64),
                     logits=logits_full[legal_actions], q=q, depth=0)
 
-        work_cache = self.model.seq.initial_cache(1, device=self.cfg.device, dtype=torch.float32)
-        # 用一次模型步进把 work_cache 推进到当前局面（与 root_cache 同位置）
-        _, _, _, _, work_cache = self.model.step(
-            torch.from_numpy(features).float().unsqueeze(0).to(self.cfg.device),
-            torch.tensor([int(self.cfg.tc_bucket)], dtype=torch.long, device=self.cfg.device),
-            torch.tensor([self.cfg.elo], dtype=torch.float32, device=self.cfg.device),
-            torch.tensor([1 if self.board.turn == chess.WHITE else 0], dtype=torch.long, device=self.cfg.device),
-            work_cache
-        )
-
         def _expand_fn(parent_node, action):
+            work_cache = clone_cache(self.root_cache)
             return self._expand(parent_node, action, work_cache)
 
         res = order_halving(node, _expand_fn, n_sims=self.cfg.n_sims,
@@ -201,6 +193,14 @@ class SearchTree:
 
 # ------------------------- 生成主循环 -------------------------
 
+def _compute_pipol_byte_offsets(per_ply_actions: list[np.ndarray]) -> np.ndarray:
+    """计算 pipol 变长目标的字节偏移表（含末尾哨兵）。"""
+    off = [0]
+    for acts in per_ply_actions:
+        off.append(off[-1] + 2 + len(acts) * 4)
+    return np.array(off, dtype=np.int32)
+
+
 def generate(cfg: SelfPlayConfig) -> None:
     rng = np.random.default_rng(cfg.seed)
     writer = V3ShardWriter(cfg.out_dir, cfg.tag)
@@ -226,7 +226,7 @@ def generate(cfg: SelfPlayConfig) -> None:
         meta["termination_reason"] = term_reason
         meta["is_truncated"] = 1 if is_truncated else 0
         pipol = encode_v3_pipol(tree.pipol_actions, tree.pipol_probs)
-        poff = np.array([0] + [len(a) for a in tree.pipol_actions], dtype=np.int32)
+        poff = _compute_pipol_byte_offsets(tree.pipol_actions)
         writer.add(meta, np.array(tree.actions, dtype=np.uint16), pipol, poff)
         games_done += 1
 
