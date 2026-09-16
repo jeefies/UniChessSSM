@@ -29,6 +29,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", default=os.path.join(HERE, "runs", "stage_a_20260915"))
     ap.add_argument("--out", default=None)
+    ap.add_argument("--title", default="Stage A 训练全景")
     args = ap.parse_args()
     out = args.out or os.path.join(args.run, "metrics.png")
 
@@ -102,12 +103,14 @@ def main() -> None:
     ax.legend()
     ax.grid(alpha=0.3)
 
-    last = train[-1]
+    vlast = val[-1] if val else {}
     fig.suptitle(
-        f"Stage A  mid-training check @ step {last['step']}  |  "
-        f"policy CE {last['loss_policy']:.3f}  value CE {last['loss_value']:.3f}  "
-        f"recon {last['loss_recon']:.4f}  dyn_rel {last['dyn_rel_err']:.3f}  "
-        f"pos/s {last['pos_per_s']:.0f}"
+        f"{args.title} @ step {train[-1]['step']}/37758（1 epoch 完成）  |  "
+        f"final val: policy CE {vlast.get('val_loss_policy', float('nan')):.3f}  "
+        f"value CE {vlast.get('val_loss_value', float('nan')):.3f}  "
+        f"recon {vlast.get('val_loss_recon', float('nan')):.4f}  "
+        f"dyn {vlast.get('val_loss_dyn', float('nan')):.3f}  "
+        f"pos/s {train[-1]['pos_per_s']:.0f}"
     )
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(out, dpi=110)
