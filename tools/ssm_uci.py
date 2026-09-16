@@ -80,8 +80,10 @@ class SSMAdapter:
     """SeqModel -> 旧 MCTS evaluator 三元组的适配器。"""
 
     def __init__(self, ckpt_path: str, device: str = "cuda",
-                 tc_bucket: int = 2, elo: float = 2567.5, debug: bool = False):
+                 tc_bucket: int = 2, elo: float = 2567.5, debug: bool = False,
+                 amp: bool = True):
         self.device = torch.device(device)
+        self.amp = bool(amp)
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         self.model = SeqModel().to(self.device).eval()
         self.model.load_state_dict(ckpt["model"])
@@ -122,13 +124,13 @@ class SSMAdapter:
         tc = torch.full((n, t_max), self.tc_bucket, dtype=torch.long, device=device)
         elo = torch.full((n, t_max), self.elo_std, dtype=torch.float32, device=device)
         cond = self.model.cond(tc, elo, colors_pad.to(device))
-        with torch.autocast(device_type=device.type,
-                            dtype=torch.bfloat16 if device.type == "cuda" else torch.float32):
+        amp_dtype = torch.bfloat16 if (self.amp and device.type == "cuda") \
+            else torch.float32
+        with torch.autocast(device_type=device.type, dtype=amp_dtype):
             h = self.model.trunk(x + cond)                             # (N, T, 512)
         idx = torch.tensor([n_ - 1 for n_ in lengths], device=device)
         h_last = h[torch.arange(n, device=device), idx]                # (N, 512)
-        with torch.autocast(device_type=device.type,
-                            dtype=torch.bfloat16 if device.type == "cuda" else torch.float32):
+        with torch.autocast(device_type=device.type, dtype=amp_dtype):
             policy_logits, wdl_logits, _ = self.model.f(h_last)
         return policy_logits.float(), wdl_logits.float()
 

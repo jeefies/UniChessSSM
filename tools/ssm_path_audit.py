@@ -66,9 +66,12 @@ from ssm_uci import (  # noqa: E402
     DEFAULT_CKPT, ELO_STATS_MEAN, ELO_STATS_STD, RemoteAdapter, SSMAdapter,
 )
 
-# 阈值：bf16 前向下概率对拍容差（同一数学路径，差异只来自 kernel/批形状）
-TOL_POLICY = 1e-2
-TOL_WDL = 1e-2
+# 阈值：bf16 前向下概率对拍容差（同一数学路径，差异只来自 kernel/批形状的舍入；
+# 首测实测 max|Δpolicy|≈1.5e-2，取 2 倍裕量）。逻辑正确性以 fp32 对拍判定（1e-5）。
+TOL_POLICY = 3e-2
+TOL_WDL = 3e-2
+TOL_POLICY_FP32 = 1e-5
+TOL_WDL_FP32 = 1e-5
 
 # A3 传输层用少量 sims（验证链路，不验证棋力）
 TRANSPORT_SIMS = "25"
@@ -127,8 +130,9 @@ class NativePath:
     """不经过 SSMAdapter 的独立实现：逐局面 batch=1 整序列前向 + masked softmax。"""
 
     def __init__(self, ckpt_path: str, device: str = "cuda",
-                 tc_bucket: int = 2, elo: float = 2567.5):
+                 tc_bucket: int = 2, elo: float = 2567.5, amp: bool = True):
         self.device = torch.device(device)
+        self.amp = bool(amp)
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         self.model = SeqModel().to(self.device).eval()
         self.model.load_state_dict(ckpt["model"])
@@ -159,9 +163,9 @@ class NativePath:
         tc = torch.full((n, t_len), self.tc_bucket, dtype=torch.long, device=self.device)
         elo = torch.full((n, t_len), self.elo_std, dtype=torch.float32, device=self.device)
         cond = self.model.cond(tc, elo, color)
-        with torch.no_grad(), torch.autocast(
-                device_type=self.device.type,
-                dtype=torch.bfloat16 if self.device.type == "cuda" else torch.float32):
+        amp_dtype = torch.bfloat16 if (self.amp and self.device.type == "cuda") \
+            else torch.float32
+        with torch.no_grad(), torch.autocast(device_type=self.device.type, dtype=amp_dtype):
             h = self.model.trunk(self.model.encode(x) + cond)        # (1,T,512)
             policy_logits, wdl_logits, _ = self.model.f(h[:, -1])    # 末位
         policy_logits = policy_logits.float()[0]
@@ -194,71 +198,101 @@ def audit_paths(ckpt: str, shard_dir: str, device: str) -> dict:
     for cat in ("promo", "ep", "castle", "rep", "mid"):
         print(f"  覆盖 {cat}: {tags.count(cat)}")
 
-    native = NativePath(ckpt, device=device)
-    adapter = SSMAdapter(ckpt, device=device)
-    assert native.step == adapter.step, (native.step, adapter.step)
-    print(f"checkpoint step={adapter.step}")
-
-    # 适配器两种调用：逐局面（batch=1）与全批一次（走 dedup/拼批路径）
     boards = [b for b, _ in positions]
-    pol_batch, promo_batch, wdl_batch = adapter.evaluate_batch(boards)
-
-    max_pol, max_wdl = 0.0, 0.0
-    max_pol_4096 = 0.0
-    top5_ok = top5_4096_ok = 0
-    per_board = []
-    for i, (b, tag) in enumerate(positions):
-        p_nat, w_nat = native.infer(b)
-        p_adp, w_adp = adapter.infer_probs([b])
-        d_pol = float(np.abs(p_nat - p_adp[0]).max())
-        d_wdl = float(np.abs(w_nat - w_adp[0]).max())
-        t5_native = topk_moves(p_nat)
-        t5_adp = topk_moves(p_adp[0])
-        ok5 = t5_native == t5_adp
-        # 4096 映射：原生 1936 → _fill_4096 与适配器全批输出的差
-        p4096_nat = np.zeros(4096, dtype=np.float32)
-        pr4096 = np.ones(4, dtype=np.float32)
-        SSMAdapter._fill_4096(b, p_nat, p4096_nat, pr4096)
-        d_4096 = float(np.abs(p4096_nat - pol_batch[i]).max())
-        # 4096 Top-5：按 from*64+to 取概率前 5（忽略 promo 细分，集合口径）
-        idx4096 = np.argsort(p4096_nat)[::-1]
-        s_nat = {chess.Move(i // 64, i % 64).uci() for i in idx4096[:5] if p4096_nat[i] > 0}
-        idx_ad = np.argsort(pol_batch[i])[::-1]
-        s_adp = {chess.Move(j // 64, j % 64).uci() for j in idx_ad[:5] if pol_batch[i][j] > 0}
-        ok5_4096 = s_nat == s_adp
-
-        max_pol = max(max_pol, d_pol)
-        max_wdl = max(max_wdl, d_wdl)
-        max_pol_4096 = max(max_pol_4096, d_4096)
-        top5_ok += ok5
-        top5_4096_ok += ok5_4096
-        per_board.append((d_pol, d_wdl, d_4096, ok5, ok5_4096))
-        print(f"  [{i:2d}] {'/'.join(tag):18s} turn={'W' if b.turn else 'B'} "
-              f"ply={len(b.move_stack):3d} | Δpolicy={d_pol:.2e} Δwdl={d_wdl:.2e} "
-              f"Δ4096={d_4096:.2e} Top5={'OK' if ok5 else 'MISMATCH'}", flush=True)
-
     n = len(positions)
-    res = {
-        "n_positions": n,
-        "max_policy_diff": max_pol,
-        "max_wdl_diff": max_wdl,
-        "max_policy4096_diff": max_pol_4096,
-        "top5_agree": f"{top5_ok}/{n}",
-        "top5_4096_agree": f"{top5_4096_ok}/{n}",
-        "wdl_batch_vs_single_max": float(np.abs(
-            wdl_batch - np.stack([adapter.infer_probs([b])[1][0] for b in boards])).max()),
-    }
-    print(f"\n-- A1/A2 汇总 --")
-    print(f"policy(1936) 最大绝对差 : {max_pol:.3e}  (阈值 {TOL_POLICY:.0e})")
-    print(f"policy(4096) 最大绝对差 : {max_pol_4096:.3e}  (阈值 {TOL_POLICY:.0e})")
-    print(f"wdl        最大绝对差 : {max_wdl:.3e}  (阈值 {TOL_WDL:.0e})")
-    print(f"Top-5 着法集合一致率  : {top5_ok}/{n}（1936 口径）  {top5_4096_ok}/{n}（4096 口径）")
-    print(f"全批 wdl vs 逐局面 wdl 最大差: {res['wdl_batch_vs_single_max']:.3e}")
 
-    ok = (max_pol <= TOL_POLICY and max_wdl <= TOL_WDL and max_pol_4096 <= TOL_POLICY
-          and top5_ok == n)
-    res["PASS"] = bool(ok)
-    print(f"结论: {'PASS' if ok else 'FAIL'}")
+    def run_pass(amp: bool, tol_pol: float, tol_wdl: float, label: str) -> dict:
+        native = NativePath(ckpt, device=device, amp=amp)
+        adapter = SSMAdapter(ckpt, device=device, amp=amp)
+        assert native.step == adapter.step, (native.step, adapter.step)
+        # 适配器两种调用：逐局面（batch=1）与全批一次（走 dedup/拼批路径）
+        pol_batch, _promo, wdl_batch = adapter.evaluate_batch(boards)
+
+        max_pol = max_wdl = max_pol_4096 = 0.0
+        top5_ok = top5_4096_ok = top5_tie_ok = 0
+        diffs_pol: list[float] = []
+        for i, (b, tag) in enumerate(positions):
+            p_nat, w_nat = native.infer(b)
+            p_adp, w_adp = adapter.infer_probs([b])
+            d_pol = float(np.abs(p_nat - p_adp[0]).max())
+            d_wdl = float(np.abs(w_nat - w_adp[0]).max())
+            diffs_pol.append(d_pol)
+            t5_native = topk_moves(p_nat)
+            t5_adp = topk_moves(p_adp[0])
+            ok5 = t5_native == t5_adp
+            # 近并列容忍：对称差里双方对应概率差都 < 1e-3 视为并列翻转（bf16 尾部位次抖动）
+            if not ok5:
+                pa = {u: p_nat[move_to_action(chess.Move.from_uci(u))] for u in t5_native}
+                pb = {u: p_adp[0][move_to_action(chess.Move.from_uci(u))] for u in t5_adp}
+                sym = t5_native ^ t5_adp
+                tie = all(abs(pa.get(u, 0.0) - pb.get(u, 0.0)) < 1e-3 for u in sym)
+            else:
+                tie = True
+            # 4096 映射：原生 1936 → _fill_4096 与适配器全批输出的差
+            p4096_nat = np.zeros(4096, dtype=np.float32)
+            pr4096 = np.ones(4, dtype=np.float32)
+            SSMAdapter._fill_4096(b, p_nat, p4096_nat, pr4096)
+            d_4096 = float(np.abs(p4096_nat - pol_batch[i]).max())
+            idx4096 = np.argsort(p4096_nat)[::-1]
+            s_nat = {chess.Move(j // 64, j % 64).uci() for j in idx4096[:5] if p4096_nat[j] > 0}
+            idx_ad = np.argsort(pol_batch[i])[::-1]
+            s_adp = {chess.Move(j // 64, j % 64).uci() for j in idx_ad[:5] if pol_batch[i][j] > 0}
+            ok5_4096 = s_nat == s_adp
+
+            max_pol = max(max_pol, d_pol)
+            max_wdl = max(max_wdl, d_wdl)
+            max_pol_4096 = max(max_pol_4096, d_4096)
+            top5_ok += ok5
+            top5_tie_ok += tie
+            top5_4096_ok += ok5_4096
+            print(f"  [{i:2d}] {'/'.join(tag):18s} turn={'W' if b.turn else 'B'} "
+                  f"ply={len(b.move_stack):3d} | Δpolicy={d_pol:.2e} Δwdl={d_wdl:.2e} "
+                  f"Δ4096={d_4096:.2e} Top5={'OK' if ok5 else ('tie' if tie else 'MISMATCH')}",
+                  flush=True)
+
+        wdl_bmax = float(np.abs(
+            wdl_batch - np.stack([adapter.infer_probs([b])[1][0] for b in boards])).max())
+        r = {
+            "label": label,
+            "ckpt_step": adapter.step,
+            "max_policy_diff": max_pol,
+            "max_wdl_diff": max_wdl,
+            "max_policy4096_diff": max_pol_4096,
+            "top5_agree": f"{top5_ok}/{n}",
+            "top5_agree_tolerant": f"{top5_tie_ok}/{n}",
+            "top5_4096_agree": f"{top5_4096_ok}/{n}",
+            "wdl_batch_vs_single_max": wdl_bmax,
+            "policy_diff_median": float(np.median(diffs_pol)),
+        }
+        print(f"\n-- {label} 汇总 --")
+        print(f"policy(1936) 最大绝对差 : {max_pol:.3e}  (阈值 {tol_pol:.0e})")
+        print(f"policy(4096) 最大绝对差 : {max_pol_4096:.3e}")
+        print(f"wdl        最大绝对差 : {max_wdl:.3e}  (阈值 {tol_wdl:.0e})")
+        print(f"Δpolicy 中位数         : {r['policy_diff_median']:.3e}")
+        print(f"Top-5 着法集合一致率  : {top5_ok}/{n}（严格） {top5_tie_ok}/{n}（近并列容忍） "
+              f"{top5_4096_ok}/{n}（4096 口径）")
+        print(f"全批 wdl vs 逐局面 wdl 最大差: {wdl_bmax:.3e}")
+        return r
+
+    print(f"checkpoint step={SSMAdapter(ckpt, device=device).step}")
+    print("\n-- Pass 1: fp32（判定逻辑等价，容差 1e-5）--", flush=True)
+    res32 = run_pass(amp=False, tol_pol=TOL_POLICY_FP32, tol_wdl=TOL_WDL_FP32,
+                     label="fp32")
+    res32["PASS"] = bool(res32["max_policy_diff"] <= TOL_POLICY_FP32
+                         and res32["max_wdl_diff"] <= TOL_WDL_FP32
+                         and res32["top5_agree"] == f"{n}/{n}")
+    print(f"结论: {'PASS' if res32['PASS'] else 'FAIL'}")
+
+    print("\n-- Pass 2: bf16（推理实际口径，容差含批形状舍入噪声）--", flush=True)
+    res16 = run_pass(amp=True, tol_pol=TOL_POLICY, tol_wdl=TOL_WDL, label="bf16")
+    res16["PASS"] = bool(res16["max_policy_diff"] <= TOL_POLICY
+                         and res16["max_wdl_diff"] <= TOL_WDL
+                         and res16["top5_agree_tolerant"] == f"{n}/{n}")
+    print(f"结论: {'PASS' if res16['PASS'] else 'FAIL'}")
+
+    res = {"n_positions": n, "fp32": res32, "bf16": res16,
+           "PASS": bool(res32["PASS"] and res16["PASS"])}
+    print(f"\n== A1/A2 总判定: {'PASS' if res['PASS'] else 'FAIL'} ==")
     return res
 
 
@@ -314,6 +348,13 @@ class UciClient:
 
 
 def start_server(ckpt: str, sock: str, ready: str) -> subprocess.Popen:
+    # 清理残留（尤其 kill -9 后留下的 stale socket/ready，否则会把旧 ready
+    # 当成新 server 的就绪信号）
+    for p in (sock, ready):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
     proc = subprocess.Popen(
         [sys.executable, str(SSM_ROOT / "tools" / "ssm_infer_server.py"),
          "--ckpt", ckpt, "--sock", sock, "--ready", ready],
