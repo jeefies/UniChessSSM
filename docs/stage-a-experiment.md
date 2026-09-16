@@ -283,7 +283,11 @@ flowchart TD
 
 ---
 
-## 8. 训练现状与曲线（step ~22,650 / 37,758，2026-09-15 晚）
+## 8. 训练现状与曲线
+
+**已完成（2026-09-16 05:34 TRAIN_DONE，37,758/37,758 步 = 1 epoch 全部跑完）**。最终验证指标（@37,758）：policy CE **1.864** / value CE 0.767 / recon CE 0.0053（全盘 acc 95.7%）/ dyn mse 0.099 / mlh 18.1。最终曲线见 `runs/stage_a_20260915/metrics_final.png`。
+
+### 训练中期快照（step ~22,650，2026-09-15 晚）
 
 ![Stage A 训练曲线 @ step 22650](figures/stage_a_metrics_step22500.png)
 
@@ -308,7 +312,21 @@ flowchart TD
 
 ---
 
-## 9. 监控与告警口径（§11 + §10.2）
+## 9. 训练完成诊断（2026-09-16，tools/stateseq_diag.py 离线评估，runs/stage_a_20260915/diag_37000.md）
+
+在固定验证子集（seed 777、256 局、16,936 局面，与训练时验证同口径）+ 2,048 局训练子集上：
+
+**Value**：WDL 先验 CE 0.833 → 模型 0.754，**value_gain = 0.067 nats**（降幅 8%）——超过常数基线但信号弱，性质是"单局 WDL 标签信噪比低"而非实现问题（和棋率 3.85% 经原始 PGN 对照确认是 Lichess 超快棋池真实分布，非解析 bug）。预测分布未塌缩（pW P95≈0.79）、校准良好（0.93 置信 bin 命中率 0.99）；3×3 表有弱区分度（胜局 pW 0.539 vs 先验 0.484）；价值信息集中在近终局（d=1–10 CE 0.606，开局 0.808、远终局 0.829 接近先验）。
+
+**Policy**：Top-1 44.5% / Top-3 71.6%（合法着掩码后、剔除 1.0% 单合法着局面后 43.9%）；开局 50.8% > 中残局 ~41%；Elo 高档略高。
+
+**Dyn 与 latent**：dyn mse 0.099 vs delta_energy 0.393（正确掩码口径 rel = 0.25；训练日志记录的 0.49 是未加 pos_mask 的口径偏差，见 design-deviations §3）；latent 跨局面方差 0.712±0.122/维（均匀，无死维），‖x‖₂ 恒定是 RMSNorm 的数学性质非坍缩。
+
+**g 动作对应性（曾误判后修正）**：初版块 D 有整 ply 错位（h/x 取 t−1、后继取 B_t），噪声淹没信号；修正后 err_correct 0.097 ≈ 训练口径 dyn mse，且 74% 样本对正确配对（err_correct 0.097 < err_swapped 0.116）→ **g 确实利用动作信息**；按未训练过的自然后继口径 g(h_t,a)→x(B_a)−x_t 也有 81% 对正确，动作敏感性部分可迁移。动作间 Δ̂ 间隙 mean 0.025（跨局面散布 0.30），动作路径活跃。
+
+**检查点**：latest.pt = step 37,000；best.pt（val policy 最优）= step 37,758，两者指标几乎一致。
+
+## 10. 监控与告警口径（§11 + §10.2）
 
 每 50 步记录（`metrics.jsonl`）：五损失、recon 双口径（CE + whole-board acc）、dyn rel err、分模块 grad norm、pos/s、data_wait。告警规则：
 
