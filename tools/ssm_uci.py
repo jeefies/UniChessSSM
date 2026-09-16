@@ -220,13 +220,14 @@ class UciLoop:
     def _ensure(self) -> None:
         if self.adapter is None:
             sims = int(os.environ.get("UNICHESS_MCTS", "400"))
+            batch = int(os.environ.get("UNICHESS_MCTS_BATCH", "64"))
             self.adapter = SSMAdapter(
                 self.args.ckpt, device=self.args.device,
                 tc_bucket=self.args.tc_bucket, elo=self.args.elo,
                 debug=self.args.debug)
             self.mcts = MCTS(
                 self.adapter.evaluate_batch,
-                MCTSConfig(simulations=sims, batch_size=128, temperature=0.0),
+                MCTSConfig(simulations=sims, batch_size=batch, temperature=0.0),
                 tablebase=None)  # SSM 侧无 Syzygy，与旧引擎 UNICHESS_SYZYGY="" 同口径
             print(f"info string loaded step={self.adapter.step} "
                   f"sims={sims} device={self.args.device}", file=sys.stderr, flush=True)
