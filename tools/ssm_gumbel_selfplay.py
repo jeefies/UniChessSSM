@@ -118,7 +118,7 @@ class SearchTree:
             1 if self.board.turn == chess.WHITE else 0, cache
         )
         q = float(wdl_np[0] - wdl_np[2])
-        return logits_np, q, x_np, mlh_np, cache_new, cache_new
+        return logits_np, q, x_np, mlh_np, cache_new
 
     def _expand(self, parent_node: Node, action: int, work_cache) -> Node | None:
         """从 parent_node 沿 action 扩展子节点（使用 work_cache，不修改 root_cache）。"""
