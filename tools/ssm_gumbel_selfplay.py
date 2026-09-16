@@ -112,19 +112,19 @@ class SearchTree:
                 legal.append(a)
         return legal
 
-    def _do_model_step(self, features: np.ndarray, legal_actions: list[int], cache) -> tuple[np.ndarray, float, np.ndarray, object]:
+    def _do_model_step(self, features: np.ndarray, legal_actions: list[int], cache) -> tuple[np.ndarray, float, np.ndarray, np.ndarray, object]:
         logits_np, wdl_np, mlh_np, x_np, cache_new = self.model.step(
             features, int(self.cfg.tc_bucket), self.cfg.elo,
             1 if self.board.turn == chess.WHITE else 0, cache
         )
         q = float(wdl_np[0] - wdl_np[2])
-        return logits_np, q, x_np, cache_new, cache_new
+        return logits_np, q, x_np, mlh_np, cache_new, cache_new
 
     def _expand(self, parent_node: Node, action: int, work_cache) -> Node | None:
         """从 parent_node 沿 action 扩展子节点（使用 work_cache，不修改 root_cache）。"""
         features = self._encode()
         legal_actions = self._legal_actions()
-        logits_np, q, x_np, _ = self._do_model_step(features, legal_actions, work_cache)
+        logits_np, q, x_np, mlh_np, _ = self._do_model_step(features, legal_actions, work_cache)
         logits_full = np.full(1936, -3e4, dtype=np.float32)
         logits_full[legal_actions] = logits_np[legal_actions]
         child_legal = np.array(legal_actions, dtype=np.int64)
@@ -142,7 +142,7 @@ class SearchTree:
         if not legal_actions:
             return False
 
-        logits_np, q, x_np, cache_new = self._do_model_step(features, legal_actions, self.root_cache)
+        logits_np, q, x_np, mlh_np, cache_new = self._do_model_step(features, legal_actions, self.root_cache)
         self.root_cache = cache_new
         logits_full = np.full(1936, -3e4, dtype=np.float32)
         logits_full[legal_actions] = logits_np[legal_actions]
