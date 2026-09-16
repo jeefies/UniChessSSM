@@ -66,8 +66,10 @@ UniChessSSM/
 │   ├── ssm_infer_server.py    # 单进程 GPU 推理服务器（Unix socket；多进程 arena 必用，见下）
 │   ├── ssm_uci.sh        # UCI 引擎启动器（conda/PYTHONPATH；UNICHESS_SSM_REMOTE=1 走 server）
 │   ├── ssm_uci_test.py   # 映射自测 a/b/c（动作往返/双引擎冒烟/orient 核对，跑 arena 前必过）
+│   ├── ssm_path_audit.py     # 推理链路端到端对拍（原生 vs 适配器 vs server 传输层，双客户端交错 + kill 重启）
+│   ├── ssm_wdl_sign_audit.py # WDL→Q 符号/回传取负/终局真值审计 + arena 终局可审计性检查
 │   ├── run_arena_smoke.sh / run_arena.sh  # Stage A vs 旧 small champion 同口径 arena（自动起/停推理服务器）
-├── tests/               # 阶段 0 七项验收单测（unittest，全部通过）
+├── tests/               # 阶段 0 七项验收单测 + test_g_alignment.py（g 动作对齐断言，unittest，全部通过）
 ├── data/  runs/         # 运行时产物（gitignore；常驻水位 ≤10 GB，临时 ≤50 GB）
 └── docs/                # 权威设计文档 v2.0 / design-deviations.md / stage-a-experiment.md（审查报告）/ figures/
 ```
