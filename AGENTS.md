@@ -61,7 +61,12 @@ UniChessSSM/
 │   ├── stateseq_download.py    # 双路径下载看门狗（低速自动重启/路径休眠防 429）
 │   ├── stateseq_build_shards.py # .pgn.zst 前缀流 → 动作列表分片
 │   ├── stateseq_throughput.py  # GPU/加载器吞吐探测
-│   └── stateseq_smoke.py       # 阶段 0 冒烟
+│   ├── stateseq_smoke.py       # 阶段 0 冒烟
+│   ├── ssm_uci.py        # Stage A UCI 引擎（旧 MCTS evaluator 口径：4096 policy/promo/wdl；--remote 纯 CPU 客户端）
+│   ├── ssm_infer_server.py    # 单进程 GPU 推理服务器（Unix socket；多进程 arena 必用，见下）
+│   ├── ssm_uci.sh        # UCI 引擎启动器（conda/PYTHONPATH；UNICHESS_SSM_REMOTE=1 走 server）
+│   ├── ssm_uci_test.py   # 映射自测 a/b/c（动作往返/双引擎冒烟/orient 核对，跑 arena 前必过）
+│   ├── run_arena_smoke.sh / run_arena.sh  # Stage A vs 旧 small champion 同口径 arena（自动起/停推理服务器）
 ├── tests/               # 阶段 0 七项验收单测（unittest，全部通过）
 ├── data/  runs/         # 运行时产物（gitignore；常驻水位 ≤10 GB，临时 ≤50 GB）
 └── docs/                # 权威设计文档 v2.0 / design-deviations.md / stage-a-experiment.md（审查报告）/ figures/
@@ -89,3 +94,15 @@ AUTOLOOP.md / HANDOFF.md 交接笔记），2026-09-15 由旧 Windows 目录迁�
 - **判定权威**：走法合法性、重复/终局判定一律以规则引擎（python-chess）为准，网络特征不作判定依据。
 - 代码注释与文档用中文；git 提交信息用中文。
 - git 提交节奏：每个里程碑完成后 commit + push（用户已授权此节奏）。
+
+## 6. UCI/arena 经验（2026-09-16 踩坑记录）
+
+- **Mamba-2 trunk 首调用 ~4.2s/进程**（triton kernel autotune，无法磁盘预热）；多进程并发
+  autotune 互相踩踏可到 ~18s。python-chess `SimpleEngine` 的 play 超时为
+  `popen_uci(timeout=10) + movetime`，即 arena 默认口径下每步只有 ~11s。**多进程 arena
+  必须走 `ssm_infer_server` 单 GPU 进程 + `ssm_uci.sh`（UNICHESS_SSM_REMOTE=1）纯 CPU
+  客户端**（`run_arena*.sh` 已封装自动起/停与就绪等待）。
+- 与旧项目同口径对打：双方 `UNICHESS_MCTS=400`，旧引擎 `UNICHESS_SYZYGY=""` 关桌库，
+  arena 用旧项目 `eval/arena.py`（只读运行，cwd 必须在 /home/jeefy/UniChess）。
+- 旧项目 `/home/jeefy/UniChess` 全程只读：只 sys.path 引用其 `search/mcts.py`、`core/`、
+  `engine/`，以及读取 small-champion 权重与开局库。
