@@ -184,7 +184,7 @@ class SearchTree:
             return 1, TERM_CODES.index("stalemate"), False
         if self.board.is_fifty_moves():
             return 1, TERM_CODES.index("fifty_move"), False
-        if self.board.is_threefold_repetition():
+        if self.board.is_repetition(3):
             return 1, TERM_CODES.index("threefold"), False
         if self.board.is_insufficient_material():
             return 1, TERM_CODES.index("insufficient_material"), False
