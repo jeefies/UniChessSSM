@@ -184,10 +184,13 @@ def b3_terminal_ground_truth(ckpt: str, device: str, sims: int) -> dict:
             child = board.copy(stack=True)
             child.push_uci(want_mv)
             really_mate = child.is_checkmate()
-            ok = (mv.uci() == want_mv and really_mate
-                  and rv > 0.9)
+            # 必胜分支口径：杀着边缘的 Q 应 ≈ +1（其全部子模拟都是终局将死，
+            # 回传恒 +1）；根整体 Q 允许因其他分支走网络评估而 < 1。
+            mate_i = list(root.moves).index(child.move)
+            q_mate = float(root.q()[mate_i])
+            ok = (mv.uci() == want_mv and really_mate and q_mate > 0.99)
             print(f"  {name}: bestmove={mv.uci()} (期望 {want_mv}) 杀着真将死: {really_mate} "
-                  f"root_value={rv:+.3f} (期望 ≈+1) {'OK' if ok else 'FAIL'}")
+                  f"杀着边缘 Q={q_mate:+.3f} (期望 ≈+1) 根 Q={rv:+.3f} {'OK' if ok else 'FAIL'}")
             got_v = rv
         res[name] = {"bestmove_or_value": want_mv or got_v, "PASS": bool(ok)}
         assert ok, name
