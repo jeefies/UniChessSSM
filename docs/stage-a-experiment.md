@@ -285,7 +285,9 @@ flowchart TD
 
 ## 8. 训练现状与曲线
 
-**已完成（2026-09-16 05:34 TRAIN_DONE，37,758/37,758 步 = 1 epoch 全部跑完）**。最终验证指标（@37,758）：policy CE **1.864** / value CE 0.767 / recon CE 0.0053（全盘 acc 95.7%）/ dyn mse 0.099 / mlh 18.1。最终曲线见 `runs/stage_a_20260915/metrics_final.png`。
+**已完成（2026-09-16 05:34 TRAIN_DONE，37,758/37,758 步 = 1 epoch 全部跑完）**。最终验证指标（@37,758）：policy CE **1.864** / value CE 0.767 / recon CE 0.0053（全盘 acc 95.7%）/ dyn mse 0.099 / mlh 18.1。
+
+![Stage A 训练全景（最终）](figures/stage_a_metrics_final.png)
 
 ### 训练中期快照（step ~22,650，2026-09-15 晚）
 
