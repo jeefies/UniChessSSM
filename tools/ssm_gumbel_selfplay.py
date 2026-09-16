@@ -242,6 +242,8 @@ def main() -> None:
     ap.add_argument("--tag", default="stage_b")
     ap.add_argument("--games", type=int, default=2000)
     ap.add_argument("--concurrency", type=int, default=128)
+    ap.add_argument("--n_sims", type=int, default=64)
+    ap.add_argument("--m0", type=int, default=16)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -251,6 +253,8 @@ def main() -> None:
         tag=args.tag,
         num_games=args.games,
         concurrency=args.concurrency,
+        n_sims=args.n_sims,
+        m0=args.m0,
         seed=args.seed,
     )
     generate(cfg)
