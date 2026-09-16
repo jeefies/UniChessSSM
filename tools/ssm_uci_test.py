@@ -121,32 +121,32 @@ def test_bc(adapter, old_evaluate_batch, fens: list[str]) -> None:
           f"合法着质量={legal_mass:.6f}  norm_err={norm_err:.2e}")
     assert n_nan == 0 and wdl_sum_err < 1e-5 and norm_err < 1e-4
 
-    # orient 核对：黑方局面，旧 net 在 board 上的策略 ≈ 旧 net 在 mirror(board) 上
-    # 的策略做 square_mirror 置换；即 p_b[idx(orient mv)] == p_w[idx(mv_w)]，其中
-    # mv_w 是 mirror 棋盘上对应的白方走法。这验证 orient 方向约定（c 块），
-    # 同时打印旧 net 与 SSM adapter 的策略重叠度作参考（不要求一致）。
+    # orient 核对：旧 net 对黑方走子局面 b 的输入平面 = orient(b) = b.mirror()
+    # 的平面（core/encoding.orient 源码口径），而 mirror 后的棋盘恰是白方走子、
+    # orient 恒等——所以旧 net 在 b 上与在 b.mirror() 上**输入完全相同**，
+    # 原始 4096 策略向量应当几乎逐元素相等（差异仅 fp16 推理噪声与同 move 数
+    # 桶）。这同时锁定 mirror 方向：相等意味着 b 的输出按「mirror 坐标系」解释、
+    # mb 的按「白方绝对坐标」解释，二者同一坐标系，对应走法差一次 mirror
+    # 即 orient_move 的口径。再打印 SSM adapter 与旧 net 的策略重叠度（仅参考）。
     overlaps, perm_err = [], []
     for i, b in enumerate(boards):
         if b.turn != chess.BLACK:
             continue
         mb = b.mirror()
-        # 旧 net 在黑方原始棋盘与镜像白方棋盘上的策略
+        # 旧 net 在黑方原始棋盘与镜像白方棋盘上的策略（输入平面相同，应几乎相等）
         po_b = pol_o[i]
         po_w = old_evaluate_batch([mb])[0][0]
-        perm = np.zeros_like(po_w)
-        for idx in np.flatnonzero(po_w > 0):
-            f0, t0 = divmod(idx, 64)
-            perm[chess.square_mirror(f0) * 64 + chess.square_mirror(t0)] = po_w[idx]
-        if po_b.sum() > 0:
-            perm_err.append(float(np.abs(po_b - perm / max(perm.sum(), 1e-9)).max()))
+        if po_b.sum() > 0 and po_w.sum() > 0:
+            perm_err.append(float(np.abs(po_b / po_b.sum() - po_w / po_w.sum()).max()))
         # SSM vs 旧 net 重叠（仅参考，不同模型不必接近）
         if pol_a[i].sum() > 0:
             a_top = set(np.argsort(-pol_a[i])[:5].tolist())
             o_top = set(np.argsort(-po_b)[:5].tolist())
             overlaps.append(len(a_top & o_top) / 5)
-    print(f"[c] orient 置换一致性: 最大偏差 {max(perm_err):.4f}（越小越一致，n={len(perm_err)}）")
+    print(f"[c] 黑方 board 与 mirror(board) 策略逐元素最大偏差 {max(perm_err):.2e}"
+          f"（应≈fp16 噪声，n={len(perm_err)}）")
     print(f"    SSM vs 旧 net top-5 策略重叠（仅参考）: {np.mean(overlaps):.2f}")
-    assert perm_err and max(perm_err) < 0.35, "orient 方向与旧 encoding 不一致"
+    assert perm_err and max(perm_err) < 2e-2, "orient 方向与旧 encoding 不一致"
 
 
 def main() -> int:
