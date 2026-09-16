@@ -111,12 +111,16 @@ def main() -> None:
     w(f"- policy：Top-1 {policy['overall']['top1']:.4f} / Top-3 {policy['overall']['top3']:.4f}"
       f"（{policy['overall']['n']} 局面）")
     b = dyn_latent
-    w(f"- dyn：mse {b['dyn_mse']:.4f} / energy {b['delta_energy']:.4f} / rel {b['dyn_rel_global']:.4f}")
+    w(f"- dyn：mse {b['dyn_mse_masked_mean']:.4f} / energy {b['delta_energy_E_norm2_over_d']:.4f} / rel {b['dyn_rel_err_global']:.4f}")
+    w(f"- latent 跨局面方差/维：{b['latent_cross_position_var_per_dim']['mean']:.4f}"
+      f"±{b['latent_cross_position_var_per_dim']['std']:.4f}")
     w(f"- recon 全盘 acc：{sanity.get('val_recon_whole_board_acc', float('nan')):.4f}")
     w("")
     w("分桶 value CE（按距终局 d）：")
-    for row in v["by_dist"]["rows"]:
-        w(f"- d={row['label']}：n={row['n']}，模型 CE {row['model_ce']:.4f}，先验 {row['prior_ce']:.4f}")
+    for row in v["buckets_by_dist_to_end"]:
+        if row["n"] == 0:
+            continue
+        w(f"- d={row['bucket']}：n={row['n']}，模型 CE {row['model_ce']:.4f}，先验 {row['prior_ce']:.4f}")
     with open(base + ".md", "w", encoding="utf-8") as fh:
         fh.write("\n".join(L) + "\n")
     print("\n".join(L), flush=True)
