@@ -32,6 +32,7 @@ cd /home/jeefy/UniChess   # arena.py 的 sys.path 相对路径依赖这里
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 PY=/home/jeefy/miniconda3/envs/unichess/bin/python
+STARTED=0   # 只有本脚本自己启动的 server 才在退出时回收（共享实例不动）
 server_up() {
   [ -S "$SOCK" ] && "$PY" -c "import socket; s=socket.socket(socket.AF_UNIX); s.connect('$SOCK'); s.close()" 2>/dev/null
 }
@@ -41,12 +42,15 @@ if ! server_up; then
       --ckpt "$SSM/runs/stage_a_20260915/best.pt" --sock "$SOCK" --ready "$READY" \
       > "$RUNS/infer_server.log" 2>&1 &
   echo $! > "$PIDFILE"
+  STARTED=1
   for _ in $(seq 1 120); do [ -f "$READY" ] && break; sleep 1; done
   if [ ! -f "$READY" ]; then echo "infer server 启动超时，见 $RUNS/infer_server.log"; exit 1; fi
 fi
 cleanup() {
-  [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null
-  rm -f "$SOCK" "$READY" "$PIDFILE"
+  if [ "$STARTED" = "1" ]; then
+    [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null
+    rm -f "$SOCK" "$READY" "$PIDFILE"
+  fi
 }
 trap cleanup EXIT
 
