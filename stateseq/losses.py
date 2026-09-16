@@ -47,6 +47,15 @@ def policy_loss(logits: torch.Tensor, target_action: torch.Tensor, weights: torc
     return (ce * w).sum() / w.sum().clamp(min=1e-8)
 
 
+def policy_soft_loss(logits: torch.Tensor, target_probs: torch.Tensor, weights: torch.Tensor,
+                     pos_mask: torch.Tensor | None = None, eps: float = 1e-8) -> torch.Tensor:
+    """软目标 CE：−Σ π′(a)·log p(a)；非法位置已由外部填 −3e4，此处只做稳定求和。"""
+    log_p = F.log_softmax(logits, dim=-1)
+    ce = -(target_probs * log_p).sum(dim=-1)
+    w = _mask(weights.reshape(-1).float(), pos_mask.reshape(-1) if pos_mask is not None else None)
+    return (ce * w).sum() / w.sum().clamp(min=1e-8)
+
+
 def value_loss(wdl_logits: torch.Tensor, result: torch.Tensor,
                pos_mask: torch.Tensor | None = None) -> torch.Tensor:
     """result: 0 胜 / 1 和 / 2 负（对行棋方归一）。"""

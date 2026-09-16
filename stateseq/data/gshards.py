@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import struct
 import tempfile
 import zlib
 
@@ -41,6 +42,35 @@ META_V2_DTYPE = np.dtype([
     ("elo_missing", np.uint8),
     ("elo_mean", np.float32),
     ("local_idx", np.uint32),
+])
+
+# v3 扩展 meta：v2 的 16B + 16B 扩展
+# 扩展部分：u32 gen_id / u32 ckpt_step / u8 termination_reason / u8 is_truncated
+#          / u8 start_type / u8 flags / u32 pad
+META_V3_EXT_DTYPE = np.dtype([
+    ("gen_id", np.uint32),
+    ("ckpt_step", np.uint32),
+    ("termination_reason", np.uint8),
+    ("is_truncated", np.uint8),
+    ("start_type", np.uint8),
+    ("flags", np.uint8),
+    ("pad", np.uint32),
+])
+
+META_V3_DTYPE = np.dtype([
+    ("n_plies", np.uint16),
+    ("tc_bucket", np.uint8),
+    ("result", np.uint8),
+    ("elo_missing", np.uint8),
+    ("elo_mean", np.float16),
+    ("game_key", "U16"),
+    ("gen_id", np.uint32),
+    ("ckpt_step", np.uint32),
+    ("termination_reason", np.uint8),
+    ("is_truncated", np.uint8),
+    ("start_type", np.uint8),
+    ("flags", np.uint8),
+    ("pad", np.uint32),
 ])
 
 
@@ -196,3 +226,184 @@ class ShardReader:
         start = int(self.offsets[shard][local])
         n = int(rec["n_plies"])
         return rec, np.asarray(self.pools[shard][start:start + n])
+
+
+# ------------------------- v3 分片（Stage B 自对弈） -------------------------
+
+class V3ShardWriter:
+    """v3 分片写入器：支持变长 pipol 目标 + 终局元数据扩展。"""
+
+    def __init__(self, out_dir: str, tag: str, shard_size: int = GAMES_PER_SHARD):
+        self.out_dir = out_dir
+        self.tag = tag
+        self.shard_size = shard_size
+        os.makedirs(out_dir, exist_ok=True)
+        self._metas: list[np.ndarray] = []
+        self._action_chunks: list[np.ndarray] = []
+        self._pipol_chunks: list[bytes] = []
+        self._pipol_offsets: list[np.ndarray] = []
+        self.shard_files: list[str] = []
+        self.games = 0
+        self.steps = 0
+
+    def add(self, meta: np.ndarray, actions: np.ndarray, pipol: bytes, pipol_offset: np.ndarray) -> None:
+        self._metas.append(meta)
+        self._action_chunks.append(actions)
+        self._pipol_chunks.append(pipol)
+        self._pipol_offsets.append(pipol_offset)
+        self.games += 1
+        self.steps += int(meta["n_plies"])
+        if len(self._metas) >= self.shard_size:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._metas:
+            return
+        idx = len(self.shard_files)
+        metas = np.stack(self._metas)
+        pool = np.concatenate(self._action_chunks)
+        offsets = np.zeros(len(metas) + 1, dtype=np.int64)
+        np.cumsum(metas["n_plies"], out=offsets[1:])
+        # pipol 偏移：每局一个 (n_plies+1,) 的 int32 段
+        pipol_offsets = np.zeros(len(metas) + 1, dtype=np.int64)
+        for i, poff in enumerate(self._pipol_offsets):
+            pipol_offsets[i + 1] = pipol_offsets[i] + poff[-1]
+        pipol_blob = b"".join(self._pipol_chunks)
+
+        base = os.path.join(self.out_dir, f"shard-{self.tag}-{idx:05d}")
+        fd, tmp = tempfile.mkstemp(dir=self.out_dir, suffix=".tmp")
+        os.close(fd)
+        pool.tofile(tmp)
+        os.replace(tmp, base + ".actions.bin")
+        fd, tmp = tempfile.mkstemp(dir=self.out_dir, suffix=".tmp")
+        os.close(fd)
+        with open(tmp, "wb") as fh:
+            np.savez(fh, metas=metas, offsets=offsets)
+        os.replace(tmp, base + ".meta.npz")
+        # pipol 变长目标
+        fd, tmp = tempfile.mkstemp(dir=self.out_dir, suffix=".tmp")
+        os.close(fd)
+        pipol_offsets.tofile(tmp)
+        os.replace(tmp, base + ".pipol.offsets.bin")
+        fd, tmp = tempfile.mkstemp(dir=self.out_dir, suffix=".tmp")
+        os.close(fd)
+        with open(tmp, "wb") as fh:
+            fh.write(pipol_blob)
+        os.replace(tmp, base + ".pipol.bin")
+        self.shard_files.append(base)
+        self._metas, self._action_chunks, self._pipol_chunks, self._pipol_offsets = [], [], [], []
+
+
+class V3ShardReader:
+    """v3 分片读取器：读取动作序列 + 变长 pipol 目标。"""
+
+    def __init__(self, shard_dir: str):
+        with open(os.path.join(shard_dir, "manifest.json"), encoding="utf-8") as fh:
+            self.manifest = json.load(fh)
+        self.metas: list[np.ndarray] = []
+        self.offsets: list[np.ndarray] = []
+        self.pools: list[np.memmap] = []
+        self.pipol_offsets: list[np.memmap] = []
+        self.pipol_blobs: list[bytes] = []
+        is_val_parts: list[np.ndarray] = []
+        for name in self.manifest["shards"]:
+            base = os.path.join(shard_dir, name)
+            npz = np.load(base + ".meta.npz")
+            meta = npz["metas"]
+            self.offsets.append(npz["offsets"])
+            keys = meta["game_key"] if "game_key" in meta.dtype.names else []
+            is_val_parts.append(np.array([is_val_key(str(k)) for k in keys]))
+            self.metas.append(meta)
+            self.pools.append(np.memmap(base + ".actions.bin", dtype=np.uint16, mode="r"))
+            if os.path.exists(base + ".pipol.bin"):
+                self.pipol_offsets.append(np.fromfile(base + ".pipol.offsets.bin", dtype=np.int64))
+                with open(base + ".pipol.bin", "rb") as fh:
+                    self.pipol_blobs.append(fh.read())
+            else:
+                self.pipol_offsets.append(None)
+                self.pipol_blobs.append(None)
+        self.meta_all = np.concatenate(self.metas)
+        self.is_val_arr = np.concatenate(is_val_parts)
+        counts = [len(m) for m in self.metas]
+        self.shard_of = np.repeat(np.arange(len(counts)), counts)
+        self._cumcounts = np.concatenate([[0], np.cumsum(counts)])
+
+    def game(self, global_index: int) -> dict:
+        """→ {meta, actions, pipol_actions, pipol_probs}。"""
+        shard = int(self.shard_of[global_index])
+        local = global_index - int(self._cumcounts[shard])
+        rec = self.metas[shard][local]
+        start = int(self.offsets[shard][local])
+        n = int(rec["n_plies"])
+        actions = np.asarray(self.pools[shard][start:start + n])
+        pipol_actions = None
+        pipol_probs = None
+        if self.pipol_blobs[shard] is not None:
+            poff = self.pipol_offsets[shard]
+            blob = self.pipol_blobs[shard]
+            s = int(poff[local])
+            e = int(poff[local + 1])
+            chunk = blob[s:e]
+            # 解析变长记录：每 ply = u16 legal_count + legal_count × (u16 action_id + f16 prob)
+            pipol_actions = []
+            pipol_probs = []
+            offset = 0
+            for _ in range(n):
+                if offset + 2 > len(chunk):
+                    break
+                legal_count = struct.unpack_from("<H", chunk, offset)[0]
+                offset += 2
+                ply_actions = []
+                ply_probs = []
+                for _ in range(legal_count):
+                    if offset + 4 > len(chunk):
+                        break
+                    action_id = struct.unpack_from("<H", chunk, offset)[0]
+                    prob = struct.unpack_from("<e", chunk, offset + 2)[0]
+                    ply_actions.append(action_id)
+                    ply_probs.append(float(prob))
+                    offset += 4
+                pipol_actions.append(np.array(ply_actions, dtype=np.uint16))
+                pipol_probs.append(np.array(ply_probs, dtype=np.float32))
+        return {
+            "meta": rec,
+            "actions": actions,
+            "pipol_actions": pipol_actions,
+            "pipol_probs": pipol_probs,
+        }
+
+
+def encode_v3_pipol(per_ply_actions: list[np.ndarray], per_ply_probs: list[np.ndarray]) -> bytes:
+    """把每 ply 的 (legal_actions, probs) 编码为 v3 pipol 二进制。"""
+    buf = bytearray()
+    for acts, probs in zip(per_ply_actions, per_ply_probs):
+        buf += struct.pack("<H", len(acts))
+        for a, p in zip(acts, probs):
+            buf += struct.pack("<He", int(a), float(p))
+    return bytes(buf)
+
+
+def decode_v3_pipol(blob: bytes, n_plies: int) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """从 v3 pipol 二进制解码。"""
+    actions_list = []
+    probs_list = []
+    offset = 0
+    for _ in range(n_plies):
+        if offset + 2 > len(blob):
+            break
+        legal_count = struct.unpack_from("<H", blob, offset)[0]
+        offset += 2
+        acts = []
+        probs = []
+        for _ in range(legal_count):
+            if offset + 4 > len(blob):
+                break
+            a = struct.unpack_from("<H", blob, offset)[0]
+            p = struct.unpack_from("<e", blob, offset + 2)[0]
+            acts.append(a)
+            probs.append(p)
+            offset += 4
+        actions_list.append(np.array(acts, dtype=np.uint16))
+        probs_list.append(np.array(probs, dtype=np.float32))
+    return actions_list, probs_list
+
