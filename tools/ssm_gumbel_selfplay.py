@@ -69,6 +69,7 @@ class SelfPlayConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     elo: float = 2567.5
     tc_bucket: TimeControlBucket = TimeControlBucket.RAPID
+    gumbel_g: float = 1.0  # Gumbel 噪声尺度；评测/换代 arena 用 g=0
 
 
 def _board_key(board: chess.Board) -> str:
@@ -297,7 +298,7 @@ class GameState:
                     "n_terminal": 0, "sims_used": 0}
 
         m0 = min(cfg.m0, len(root.legal))
-        cands = gumbel_topm(root, m0=m0, rng=self.rng, g=1.0)
+        cands = gumbel_topm(root, m0=m0, rng=self.rng, g=self.cfg.gumbel_g)
         m = len(cands)
         rounds = _n_rounds(m)
         surv = [_Candidate(action=a, noise=ns) for a, ns in cands]
@@ -589,7 +590,8 @@ def run_workers(args: argparse.Namespace) -> None:
                "--games", str(n_games), "--concurrency", str(args.concurrency),
                "--n_sims", str(args.n_sims), "--m0", str(args.m0),
                "--seed", str(int(worker_seeds[i].generate_state(1)[0])),
-               "--gen_id", str(args.gen_id), "--ckpt_step", str(args.ckpt_step)]
+               "--gen_id", str(args.gen_id), "--ckpt_step", str(args.ckpt_step),
+               "--g", str(args.g)]
         log_path = os.path.join(wdir, "worker.log")
         log_fh = open(log_path, "w", encoding="utf-8")
         proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT,
@@ -629,6 +631,8 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=1,
                     help="并行 OS 进程数（跨核；每进程独立 CUDA context）。>1 时委派给 run_workers。")
     ap.add_argument("--ckpt_step", type=int, default=0)
+    ap.add_argument("--g", type=float, default=1.0,
+                    help="Gumbel 噪声尺度；1.0 训练/生成，0.0 评测/换代 arena")
     args = ap.parse_args()
 
     if args.workers > 1:
@@ -646,6 +650,7 @@ def main() -> None:
         seed=args.seed,
         gen_id=args.gen_id,
         ckpt_step=args.ckpt_step,
+        gumbel_g=args.g,
     )
     generate(cfg)
 
