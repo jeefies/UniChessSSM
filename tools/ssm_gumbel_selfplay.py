@@ -428,7 +428,9 @@ class Driver:
         per_item = split_cache(cache_new, len(reqs))
         return [(logits[i], wdl[i], mlh[i], x[i], per_item[i]) for i in range(len(reqs))]
 
-    def run(self) -> None:
+    def run(self, progress_every: int = 20) -> None:
+        t0 = time.time()
+        last_reported = 0
         for i in range(self.cfg.concurrency):
             self._start_slot(i)
         while any(s is not None for s in self.slots):
@@ -442,6 +444,11 @@ class Driver:
                 except StopIteration:
                     self._finish_game(s["game"])
                     self._start_slot(i)
+            if self.games_done - last_reported >= progress_every:
+                last_reported = self.games_done
+                elapsed = time.time() - t0
+                print(f"[{elapsed:7.1f}s] 已完成 {self.games_done}/{self.cfg.num_games} 局，"
+                      f"batch={len(active)}，{self.games_done / max(elapsed, 1e-6):.3f} games/s")
 
 
 # ------------------------- 生成主循环 -------------------------
