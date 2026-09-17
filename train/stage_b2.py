@@ -28,7 +28,7 @@ sys.path.insert(0, HERE)
 
 from stateseq import losses  # noqa: E402
 from stateseq.data.dataset import SequenceDataset  # noqa: E402
-from stateseq.data.gshards import V3ShardReader  # noqa: E402
+from stateseq.data.dataset_selfplay import B2_T_MAX, SelfPlayDataset  # noqa: E402
 from stateseq.model import SeqModel, count_parameters  # noqa: E402
 
 _STOP = False
@@ -78,6 +78,8 @@ def main() -> None:
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--limit-games", type=int, default=0)
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--w-selfplay", type=float, default=0.85, help="来源权重（§2.6 锁定 0.85）")
+    ap.add_argument("--w-human", type=float, default=0.10, help="来源权重（§2.6 锁定 0.10；谜题 0.05 plumbing 未接入，暂不参与）")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -85,19 +87,22 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    # 数据源
-    human_ds = SequenceDataset(args.data, workers=args.workers)
-    try:
-        sp_ds = SequenceDataset(args.selfplay, workers=args.workers)
-    except Exception:
-        sp_ds = None
+    # 数据源：完整 300 ply（§2.6 不得静默继承 Stage A 的 T_MAX=200）
+    human_ds = SequenceDataset(args.data, workers=args.workers, t_max=B2_T_MAX)
+    sp_ds = SelfPlayDataset(args.selfplay, workers=args.workers, t_max=B2_T_MAX)
+    if not sp_ds.train_indices:
+        raise RuntimeError(f"自对弈分片 {args.selfplay} 无可训练局——Stage B2 的核心监督来源缺失，"
+                           f"不应静默退化为纯人类数据训练，请检查生成产物")
 
     eff_batch = args.microbatch * args.accum
-    buffer_games = len(human_ds.train_indices) + (len(sp_ds.train_indices) if sp_ds else 0)
+    # §2.6 遍历预算以自对弈 replay buffer 局数为准（不含人类语料——人类库固定且远大于
+    # buffer，混入会使预算恒被 2000 步上限吃满，失去"控制对陈旧搜索目标过拟合遍数"的本意）。
+    buffer_games = len(sp_ds.train_indices)
     steps_total = min(3 * buffer_games // eff_batch, 2000)
     warmup = min(200, int(steps_total * 0.1)) if args.warmup == 0 else args.warmup
-    print(f"训练局数 human={len(human_ds.train_indices)} selfplay={len(sp_ds.train_indices) if sp_ds else 0}；"
-          f"有效 batch {eff_batch}；总步数 {steps_total}；warmup {warmup}", flush=True)
+    print(f"训练局数 human={len(human_ds.train_indices)} selfplay={len(sp_ds.train_indices)}；"
+          f"有效 batch {eff_batch}；总步数 {steps_total}；warmup {warmup}；"
+          f"来源权重 selfplay={args.w_selfplay} human={args.w_human}", flush=True)
 
     model = SeqModel(dropout=0.1).to(device)
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
@@ -115,7 +120,9 @@ def main() -> None:
         return 0.1 + 0.45 * (1 + math.cos(math.pi * min(t, 1.0)))
 
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
-    weights = losses.LossWeights()
+    # §3 锁定：损失权重（来源内）pol 1.0 / val 1.0 / recon 0.1 / dyn 0.5 / mlh 0.1。
+    # losses.LossWeights 默认 w_v=0.8 是 Stage A 遗留值，Stage B 显式改为 1.0。
+    weights = losses.LossWeights(w_v=1.0)
 
     start_step = 0
     best_val = float("inf")
@@ -147,54 +154,67 @@ def main() -> None:
                                            valid_mask=vb["valid"])
             for k, v in m.items():
                 if k.startswith("loss_") or k in ("recon_whole_board_acc", "dyn_rel_err"):
-                    agg.setdefault(k, []).append(v)
+                    agg.setdefault(f"human_{k}", []).append(v)
+        for vb in sp_ds.val_batch(args.val_batches, args.microbatch, device):
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                _, m = model.forward_train(vb["batch"], weights, step=0, total_steps=steps_total,
+                                           valid_mask=vb["valid"],
+                                           policy_soft_target=vb["policy_soft_target"],
+                                           mlh_valid_mask=vb["mlh_valid"])
+            for k, v in m.items():
+                if k.startswith("loss_") or k in ("recon_whole_board_acc", "dyn_rel_err"):
+                    agg.setdefault(f"selfplay_{k}", []).append(v)
         model.train()
-        return {f"val_{k}": float(np.mean(v)) for k, v in agg.items()}
-
-    def soft_ce_from_pipol(logits: torch.Tensor, pipol_actions: torch.Tensor, pipol_probs: torch.Tensor,
-                           valid: torch.Tensor, elo_w: torch.Tensor) -> torch.Tensor:
-        """从 v3 pipol 重建 soft target 并计算软 CE。"""
-        b, t = logits.shape[:2]
-        target = torch.zeros_like(logits)
-        for i in range(b):
-            for j in range(t):
-                if not valid[i, j]:
-                    continue
-                acts = pipol_actions[i, j]
-                probs = pipol_probs[i, j]
-                if len(acts) == 0:
-                    continue
-                target[i, j, acts] = probs.to(target.device)
-        log_p = torch.log_softmax(logits, dim=-1)
-        ce = -(target * log_p).sum(dim=-1)
-        w = elo_w.unsqueeze(1).expand_as(ce) * valid.float()
-        return (ce * w).sum() / w.sum().clamp(min=1e-8)
+        # §2.6：每代以自对弈 held-out policy CE 选当代表——val_loss_policy 取自对弈口径。
+        out = {f"val_{k}": float(np.mean(v)) for k, v in agg.items()}
+        if "val_selfplay_loss_policy" in out:
+            out["val_loss_policy"] = out["val_selfplay_loss_policy"]
+        return out
 
     model.train()
     t0 = time.time()
     pos_seen = 0
     pending_metrics: dict[str, float] = {}
-    batch_iter = None
+    human_iter = None
+    sp_iter = None
 
     for step in range(start_step, steps_total):
         opt.zero_grad(set_to_none=True)
         data_wait = 0.0
         for _ in range(args.accum):
             t_data = time.time()
-            if batch_iter is None:
-                batch_iter = iter(human_ds.epoch_batches(args.microbatch, device, shuffle=True))
+            if human_iter is None:
+                human_iter = iter(human_ds.epoch_batches(args.microbatch, device, shuffle=True))
             try:
-                item = next(batch_iter)
+                h_item = next(human_iter)
             except StopIteration:
-                batch_iter = iter(human_ds.epoch_batches(args.microbatch, device, shuffle=True))
-                item = next(batch_iter)
+                human_iter = iter(human_ds.epoch_batches(args.microbatch, device, shuffle=True))
+                h_item = next(human_iter)
+            if sp_iter is None:
+                sp_iter = iter(sp_ds.epoch_batches(args.microbatch, device, shuffle=True))
+            try:
+                sp_item = next(sp_iter)
+            except StopIteration:
+                sp_iter = iter(sp_ds.epoch_batches(args.microbatch, device, shuffle=True))
+                sp_item = next(sp_iter)
             data_wait += time.time() - t_data
+
+            # 按来源分别归约损失，再显式加权求和（§2.6；不是按样本条数占比）。
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                total, m = model.forward_train(item["batch"], weights, step, steps_total,
-                                               valid_mask=item["valid"])
+                total_h, m_h = model.forward_train(h_item["batch"], weights, step, steps_total,
+                                                   valid_mask=h_item["valid"])
+                total_sp, m_sp = model.forward_train(sp_item["batch"], weights, step, steps_total,
+                                                     valid_mask=sp_item["valid"],
+                                                     policy_soft_target=sp_item["policy_soft_target"],
+                                                     mlh_valid_mask=sp_item["mlh_valid"])
+                total = args.w_selfplay * total_sp + args.w_human * total_h
             (total / args.accum).backward()
-            pos_seen += int(item["valid"].sum())
-            pending_metrics = m
+            pos_seen += int(h_item["valid"].sum()) + int(sp_item["valid"].sum())
+            pending_metrics = {
+                "loss_total": float(total.detach()),
+                **{f"human_{k}": v for k, v in m_h.items()},
+                **{f"selfplay_{k}": v for k, v in m_sp.items()},
+            }
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         sched.step()
@@ -209,7 +229,9 @@ def main() -> None:
             mfh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             mfh.flush()
             print(f"step {step+1}/{steps_total} loss {pending_metrics['loss_total']:.4f} "
-                  f"pol {pending_metrics['loss_policy']:.3f} val {pending_metrics['loss_value']:.3f} "
+                  f"sp_pol {pending_metrics['selfplay_loss_policy']:.3f} "
+                  f"sp_val {pending_metrics['selfplay_loss_value']:.3f} "
+                  f"human_pol {pending_metrics['human_loss_policy']:.3f} "
                   f"pos/s {rec['pos_per_s']:.0f} data_wait {data_wait*1000:.0f}ms", flush=True)
             t0, pos_seen = time.time(), 0
 
@@ -241,8 +263,7 @@ def main() -> None:
             break
 
     human_ds.close()
-    if sp_ds:
-        sp_ds.close()
+    sp_ds.close()
     mfh.close()
     print("TRAIN_DONE", flush=True)
 

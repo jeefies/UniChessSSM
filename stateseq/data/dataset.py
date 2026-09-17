@@ -20,13 +20,22 @@ from .gshards import ShardReader
 from .sequences import T_MAX, _board_key
 
 
-def replay_game(actions: np.ndarray, meta: np.ndarray) -> dict[str, np.ndarray]:
+def replay_game(actions: np.ndarray, meta: np.ndarray, t_max: int = T_MAX,
+                pipol_actions: list | None = None,
+                pipol_probs: list | None = None) -> dict[str, np.ndarray]:
     """动作 id 序列 → 逐步张量（含断言：动作必须在合法着集合内，规则引擎权威）。
-    序列截断到 T_MAX=200（设计文档 T≤200，§7.3）。"""
+
+    序列截断到 t_max（Stage A 用默认 T_MAX=200，§7.3；Stage B 自对弈需完整 300 ply，
+    §2.6：不得静默继承 Stage A 的 200 截断）。pipol_actions/pipol_probs 提供时（Stage B
+    自对弈 v3 分片的 π′ 软目标）同步截断并原样透传，供上层构建软 CE 目标张量。
+    """
     import chess  # 延迟导入：worker 进程内初始化
 
-    if len(actions) > T_MAX:
-        actions = actions[:T_MAX]
+    if len(actions) > t_max:
+        actions = actions[:t_max]
+        if pipol_actions is not None:
+            pipol_actions = pipol_actions[:t_max]
+            pipol_probs = pipol_probs[:t_max]
     board = chess.Board()
     n = len(actions)
     feats = np.zeros((n, FEATURE_DIM), dtype=np.float32)
@@ -57,10 +66,10 @@ def replay_game(actions: np.ndarray, meta: np.ndarray) -> dict[str, np.ndarray]:
         masks[t] = mask
         # result 为白视角（0 胜/1 和/2 负）；走子方归一：白走步取原值，黑走步翻转
         results[t] = result if board.turn == chess.WHITE else (2 - result)
-        moves_left[t] = min(n - t, T_MAX)
+        moves_left[t] = min(n - t, t_max)
         color[t] = 1 if board.turn == chess.WHITE else 0
         board.push(played)
-    return {
+    out = {
         "features": feats,
         "legal_mask": masks,
         "actions": actions.astype(np.int64),
@@ -68,22 +77,28 @@ def replay_game(actions: np.ndarray, meta: np.ndarray) -> dict[str, np.ndarray]:
         "moves_left": moves_left,
         "color": color,
     }
+    if pipol_actions is not None:
+        out["pipol_actions"] = pipol_actions
+        out["pipol_probs"] = pipol_probs
+    return out
 
 
 _reader: ShardReader | None = None
 _elo_stats: dict | None = None
+_t_max: int = T_MAX
 
 
-def _worker_init(shard_dir: str) -> None:
-    global _reader, _elo_stats
+def _worker_init(shard_dir: str, t_max: int = T_MAX) -> None:
+    global _reader, _elo_stats, _t_max
     _reader = ShardReader(shard_dir)
     _elo_stats = _reader.manifest.get("elo_stats", {})
+    _t_max = t_max
 
 
 def _worker_build(index: int) -> tuple[int, dict[str, np.ndarray], float, float, int]:
     assert _reader is not None and _elo_stats is not None
     meta, actions = _reader.game(index)
-    data = replay_game(actions, meta)
+    data = replay_game(actions, meta, t_max=_t_max)
     elo = float(meta["elo_mean"])
     if int(meta["elo_missing"]):
         w, elo_std = 1.0, 0.0
@@ -97,13 +112,13 @@ def _worker_build(index: int) -> tuple[int, dict[str, np.ndarray], float, float,
 class SequenceDataset:
     """整序列数据集：采样局 → 多进程重放 → 拼 TrainBatch（按长度排序减少填充）。"""
 
-    def __init__(self, shard_dir: str, workers: int = 12, seed: int = 20260915):
+    def __init__(self, shard_dir: str, workers: int = 12, seed: int = 20260915, t_max: int = T_MAX):
         self.reader = ShardReader(shard_dir)
         self.n_games = len(self.reader.meta_all)
         self.lengths = self.reader.meta_all["n_plies"].astype(np.int64)
         self.workers = workers
         self.seed = seed
-        self.pool = mp.Pool(workers, initializer=_worker_init, initargs=(shard_dir,))
+        self.pool = mp.Pool(workers, initializer=_worker_init, initargs=(shard_dir, t_max))
         self.val_indices = [i for i in range(self.n_games) if bool(self.reader.is_val_arr[i])]
         self.train_indices = [i for i in range(self.n_games) if not bool(self.reader.is_val_arr[i])]
         if not self.val_indices:  # 小样本兜底：尾部 1% 作 val

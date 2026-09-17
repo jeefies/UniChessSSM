@@ -42,7 +42,7 @@ from stateseq.gumbel import (
     select_action,
     sigma,
 )
-from stateseq.data.gshards import META_V3_DTYPE, V3ShardWriter, encode_v3_pipol
+from stateseq.data.gshards import META_V3_DTYPE, V3ShardWriter, encode_v3_pipol, make_game_key
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -400,6 +400,7 @@ class Driver:
         meta["result"] = result
         meta["elo_missing"] = 0
         meta["elo_mean"] = self.cfg.elo
+        meta["game_key"] = make_game_key(f"selfplay_gen{self.cfg.gen_id}", game.game_idx)
         meta["gen_id"] = self.cfg.gen_id
         meta["ckpt_step"] = self.cfg.ckpt_step
         meta["termination_reason"] = term_reason

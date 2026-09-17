@@ -6,7 +6,9 @@ SSM=/home/jeefy/UniChessSSM
 RUNS=$SSM/runs/stage_b_smoke
 PY=${PYTHON:-/home/jeefy/miniconda3/envs/unichess/bin/python}
 GAMES=${GAMES:-1000}
-CONCURRENCY=${CONCURRENCY:-1}
+CONCURRENCY=${CONCURRENCY:-16}
+N_SIMS=${N_SIMS:-32}
+M0=${M0:-8}
 CKPT=${CKPT:-runs/stage_a_20260915/best.pt}
 TAG=smoke
 
@@ -24,6 +26,8 @@ PYTHONUNBUFFERED=1 "$PY" tools/ssm_gumbel_selfplay.py \
   --tag "$TAG" \
   --games "$GAMES" \
   --concurrency "$CONCURRENCY" \
+  --n_sims "$N_SIMS" \
+  --m0 "$M0" \
   --seed 42 \
   >> "$RUNS/generate.log" 2>&1
 
@@ -42,7 +46,6 @@ PYTHONUNBUFFERED=1 "$PY" train/stage_b2.py \
   --out "$RUNS/train_smoke" \
   --ckpt "$CKPT" \
   --microbatch 32 --accum 16 --workers 12 \
-  --steps 20 \
   >> "$RUNS/generate.log" 2>&1
 
 status=$?
