@@ -49,9 +49,9 @@ def policy_loss(logits: torch.Tensor, target_action: torch.Tensor, weights: torc
 
 def policy_soft_loss(logits: torch.Tensor, target_probs: torch.Tensor, weights: torch.Tensor,
                      pos_mask: torch.Tensor | None = None, eps: float = 1e-8) -> torch.Tensor:
-    """软目标 CE：−Σ π′(a)·log p(a)；非法位置已由外部填 −3e4，此处只做稳定求和。"""
+    """软目标 CE：−Σ π′(a)·log p(a)；非法位置目标概率为 0，此处只做稳定求和。"""
     log_p = F.log_softmax(logits, dim=-1)
-    ce = -(target_probs * log_p).sum(dim=-1)
+    ce = -(target_probs * log_p).sum(dim=-1).reshape(-1)  # (B,T) -> (B*T,)，对齐 policy_loss 的展平口径
     w = _mask(weights.reshape(-1).float(), pos_mask.reshape(-1) if pos_mask is not None else None)
     return (ce * w).sum() / w.sum().clamp(min=1e-8)
 
