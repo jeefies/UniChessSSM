@@ -198,12 +198,8 @@ class RecursiveDepthAndSignTest(unittest.TestCase):
         # 旧实现每次模拟都新建一个从未复用的深度2叶子：64 次模拟 ~= 2(child) + 64(fresh leaf) 个节点。
         # 新实现每条候选链共享持久子树，触达终局后不再新建节点：至多 2 * _CHAIN_DEPTH_CUTOFF 个。
         self.assertLessEqual(res["n_nodes"], 2 * _CHAIN_DEPTH_CUTOFF)
-        # 至少真正探到了 2 层以上（否则退化为旧的固定深度）。
-        deepest = 0
-        node = root
-        while node.children:
-            node = next(iter(node.children.values()))
-            deepest = max(deepest, node.depth)
+        # 至少真正探到了 2 层以上（否则退化为旧的固定深度）；tree 含 root 本身，故用全体节点的最大 depth。
+        deepest = max(node.depth for node in res["tree"])
         self.assertGreaterEqual(deepest, 3)
 
     def test_root_perspective_sign_correct(self):
