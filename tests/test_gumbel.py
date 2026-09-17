@@ -61,6 +61,29 @@ def _expand_depth2(root, action):
     return child
 
 
+_CHAIN_DEPTH_CUTOFF = 5
+
+
+def _expand_chain(node, action):
+    """单分支变长链 stub：每层恰有 1 个合法着，直到 depth=_CHAIN_DEPTH_CUTOFF 才终局。
+
+    终局 q 由链首动作（node.path[0]，根展开时即 action 本身）决定，构造成奇数深度
+    （根视角 = (-1)^depth * 终局 q），用于端到端验证：
+    (a) 递归下探真的随同一候选的模拟预算变深（而不是恒定 2 层）；
+    (b) 根节点 completedQ 符号正确——链 0 终局 q=-1.0 应让根视角变为 +1.0（更优），
+        链 1 终局 q=+1.0 应让根视角变为 -1.0（更差）；旧符号 bug 会使二者颠倒。
+    """
+    depth = node.depth + 1
+    chain_id = node.path[0] if node.path else action
+    path = node.path + (action,)
+    if depth >= _CHAIN_DEPTH_CUTOFF:
+        terminal_q = -1.0 if chain_id == 0 else 1.0
+        return Node(legal=np.array([], dtype=np.int64), logits=np.array([], dtype=np.float32),
+                    q=terminal_q, terminal=True, depth=depth, path=path)
+    return Node(legal=np.array([100 + depth], dtype=np.int64), logits=np.array([0.0], dtype=np.float32),
+                q=0.0, depth=depth, path=path)
+
+
 # ------------------------- A#2 Gumbel 正确性 -------------------------
 
 class GumbelCorrectnessTest(unittest.TestCase):
@@ -162,6 +185,38 @@ class BudgetBoundaryTest(unittest.TestCase):
         res = order_halving(root, _expand_stub, n_sims=10, m0=16, g=0.0, seed=4)
         self.assertTrue(res["budget_check"])
         self.assertEqual(res["sims_used"], 10)
+
+
+# ------------------------- A#2 补充：递归深化 + 端到端符号回归 -------------------------
+
+class RecursiveDepthAndSignTest(unittest.TestCase):
+    """回归测试：修复前 do_sim() 固定 2 层深度、非终局分支回传值少取负一次。"""
+
+    def test_depth_grows_with_budget(self):
+        root = _make_node([0, 1], [0.0, 0.0], q=0.0)
+        res = order_halving(root, _expand_chain, n_sims=64, m0=2, g=0.0, seed=0)
+        # 旧实现每次模拟都新建一个从未复用的深度2叶子：64 次模拟 ~= 2(child) + 64(fresh leaf) 个节点。
+        # 新实现每条候选链共享持久子树，触达终局后不再新建节点：至多 2 * _CHAIN_DEPTH_CUTOFF 个。
+        self.assertLessEqual(res["n_nodes"], 2 * _CHAIN_DEPTH_CUTOFF)
+        # 至少真正探到了 2 层以上（否则退化为旧的固定深度）。
+        deepest = 0
+        node = root
+        while node.children:
+            node = next(iter(node.children.values()))
+            deepest = max(deepest, node.depth)
+        self.assertGreaterEqual(deepest, 3)
+
+    def test_root_perspective_sign_correct(self):
+        """链 0（终局 q=-1 在奇数深度）应被判定优于链 1（终局 q=+1），根选择应为动作 0。
+
+        旧符号 bug 下非终局分支的回传值方向相反，会使根节点误选动作 1。
+        """
+        root = _make_node([0, 1], [0.0, 0.0], q=0.0)
+        res = order_halving(root, _expand_chain, n_sims=64, m0=2, g=0.0, seed=1)
+        self.assertEqual(res["action"], 0)
+        cq = completed_q(root, res["qmin"], res["qmax"])
+        self.assertGreater(cq[0], 0.0)
+        self.assertLess(cq[1], 0.0)
 
 
 # ------------------------- A#5 g=0 确定性 -------------------------
