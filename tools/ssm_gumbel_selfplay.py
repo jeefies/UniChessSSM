@@ -18,6 +18,7 @@ import chess
 import numpy as np
 import torch
 
+sys.stdout.reconfigure(line_buffering=True)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from stateseq.conditions import TimeControlBucket
