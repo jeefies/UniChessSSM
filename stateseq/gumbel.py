@@ -78,6 +78,7 @@ class Node:
     n: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
     q_sum: np.ndarray = field(default_factory=lambda: np.zeros(0, np.float32))
     root_key: int = 0                      # 本搜索内的根分组键（用于跨局拼批）
+    children: dict = field(default_factory=dict)  # action_id(int) -> Node，跨模拟持久化子树（递归变深必需）
 
     @property
     def is_terminal(self) -> bool:
@@ -263,8 +264,41 @@ def order_halving(
             qmax = q
         q_seen.append(q)
 
-    def do_sim(c: _Candidate) -> float:
-        """对候选 c 做 1 次模拟：返回该动作在**根行棋方视角**的价值。"""
+    def _simulate(node: Node) -> float:
+        """递归下探一次模拟：返回该节点**自身行棋方视角**的价值。
+
+        非根节点确定性选择（select_action）挑一个动作；若该动作对应子节点尚未展开，
+        expand 一次作为本次模拟的新叶子；否则递归深入已存在的子节点——这样树深度随同一
+        候选获得的模拟预算自然增长（而不是每次模拟都固定只探两层，review 修正）。
+        每一层的回传都恰好取负一次（父子行棋方相邻取负，零和），使得任意深度的叶子
+        价值经过奇数次/偶数次取负后，最终仍严格等于"该层节点自身视角"——这是修正前
+        do_sim() 的符号 bug（非终局分支曾少取负一次，导致根节点 Q 符号系统性反转）。
+        """
+        nonlocal n_nodes, n_terminal
+        if node.is_terminal:
+            return float(node.q)
+        a = select_action(node, qmin, qmax, c_visit, c_scale)
+        edge_idx = int(np.flatnonzero(node.legal == a)[0])
+        key = int(a)
+        child = node.children.get(key)
+        if child is None:
+            child = expand(node, a)
+            if child is None:
+                raise ValueError(f"expand 返回 None：动作 {a} 无法展开")
+            node.children[key] = child
+            n_nodes += 1
+            tree.append(child)
+            if child.is_terminal:
+                n_terminal += 1
+            maybe_extend(child.q)
+            val = -float(child.q)
+        else:
+            val = -_simulate(child)
+        node.record_child(edge_idx, val)
+        return val
+
+    def do_sim_root(c: _Candidate) -> None:
+        """对候选 c 做 1 次模拟并记账到根（根视角价值）。"""
         nonlocal n_nodes, n_terminal
         if c.child is None:
             c.child = expand(root, c.action)
@@ -275,22 +309,11 @@ def order_halving(
             if c.child.is_terminal:
                 n_terminal += 1
             maybe_extend(c.child.q)
-        if c.child.is_terminal:
-            return -float(c.child.q)          # 终局：根视角价值 = −子视角
-        a2 = select_action(c.child, qmin, qmax, c_visit, c_scale)
-        leaf = expand(c.child, a2)
-        n_nodes += 1
-        tree.append(leaf)
-        if leaf.is_terminal:
-            n_terminal += 1
-        maybe_extend(leaf.q)
-        child_val = -float(leaf.q)            # 子节点 c.child 的行棋方视角
-        c.child.record_child(int(np.flatnonzero(c.child.legal == a2)[0]), child_val)
-        return child_val
-
-    def do_sim_root(c: _Candidate) -> None:
-        """对候选 c 做 1 次模拟并记账到根（根视角价值 = 子节点价值取负）。"""
-        val = do_sim(c)
+            val = -float(c.child.q)
+        elif c.child.is_terminal:
+            val = -float(c.child.q)
+        else:
+            val = -_simulate(c.child)
         idx = int(np.flatnonzero(root.legal == c.action)[0])
         root.record_child(idx, val)
 
