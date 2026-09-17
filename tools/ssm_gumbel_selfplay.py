@@ -84,6 +84,18 @@ def _legal_actions_of(board: chess.Board) -> list[int]:
     return legal
 
 
+def _resolve_move(action: int, board: chess.Board) -> chess.Move | None:
+    """从 action id 还原合法着（逐 board.legal_moves 匹配，补齐 promotion/EP/易位旗标）。
+
+    action_to_move 对升后（Queen）返回 promotion=None，board.push 不会自动补旗标，
+    兵停留在 8 排导致棋盘悄然损坏——这是 504/1000 局数据完整性事故的根因（2026-09-17）。
+    """
+    for m in board.legal_moves:
+        if move_to_action(m) == action:
+            return m
+    return None
+
+
 # ------------------------- 模型封装（批量前向） -------------------------
 
 class ModelWrapper:
@@ -214,7 +226,7 @@ class GameState:
         self.pipol_actions.append(ids.astype(np.uint16))
         self.pipol_probs.append(probs.astype(np.float32))
 
-        move = action_to_move(chosen)
+        move = _resolve_move(chosen, self.board)
         if move is None:
             return False
         self.board.push(move)
@@ -227,7 +239,7 @@ class GameState:
         cache = self.root_cache
         occ = dict(self.occurrence)
         for a in node.path:
-            move = action_to_move(a)
+            move = _resolve_move(a, board)
             board.push(move)
             key = _board_key(board)
             feats = encode(board, occurrence=occ.get(key, 0))
@@ -235,7 +247,7 @@ class GameState:
             color = 1 if board.turn == chess.WHITE else 0
             _, _, _, _, cache = yield (feats, int(self.cfg.tc_bucket), self.cfg.elo, color, cache)
 
-        move = action_to_move(action)
+        move = _resolve_move(action, board)
         board.push(move)
         terminal_by_rule = board.is_game_over(claim_draw=True)
         legal_actions = [] if terminal_by_rule else _legal_actions_of(board)
