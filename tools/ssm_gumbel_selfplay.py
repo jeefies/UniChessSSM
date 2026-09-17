@@ -14,6 +14,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -496,6 +498,111 @@ def generate(cfg: SelfPlayConfig) -> dict:
     return stats
 
 
+# ------------------------- 多进程编排：跨核并行（CPU 侧才是当前瓶颈） -------------------------
+#
+# 单进程内的 Driver 只把"同一进程内并发局"的模型前向拼批，跨局树逻辑（棋盘复制/路径重算/
+# 合法着生成）仍是单进程单核 Python，GPU 因而长期低利用率（实测 17%）而 CPU 只用满 1/20 核。
+# 这里改为起 N 个独立 OS 进程（各自独立 CUDA context，避免 CUDA fork 后不安全的问题），
+# 每个进程内部仍用上面的单进程 Driver 逻辑，各分到 games/N 局、独立 tag 与解耦的随机种子；
+# 全部结束后把各进程产出的分片文件搬回顶层目录并合并 manifest。
+
+def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: float) -> dict:
+    combined_shards: list[str] = []
+    total_games = total_steps = total_skipped = 0
+    total_plies = total_nodes = total_terminal = total_sims = 0
+    term_counts = [0] * len(TERM_CODES)
+    truncated_games = 0
+    last_cfg: dict = {}
+
+    for wd in worker_dirs:
+        mpath = os.path.join(wd, "manifest.json")
+        with open(mpath, encoding="utf-8") as fh:
+            wm = json.load(fh)
+        for shard in wm.get("shards", []):
+            for ext in (".actions.bin", ".meta.npz", ".pipol.bin", ".pipol.offsets.bin"):
+                src = os.path.join(wd, shard + ext)
+                if os.path.exists(src):
+                    shutil.move(src, os.path.join(out_dir, shard + ext))
+            combined_shards.append(shard)
+        total_games += wm.get("games", 0)
+        total_steps += wm.get("steps", 0)
+        total_skipped += wm.get("skipped", 0)
+        gen = wm.get("gen", {})
+        total_plies += gen.get("plies", 0)
+        total_nodes += gen.get("avg_search_nodes_per_ply", 0.0) * gen.get("plies", 0)
+        total_sims += gen.get("avg_sims_per_ply", 0.0) * gen.get("plies", 0)
+        for k, v in gen.get("termination_reason_counts", {}).items():
+            term_counts[TERM_CODES.index(k)] += v
+        truncated_games += round(gen.get("truncated_rate", 0.0) * gen.get("games", 0))
+        last_cfg = {k: gen.get(k) for k in ("n_sims", "m0", "gen_id", "ckpt_step") if k in gen}
+        shutil.rmtree(wd, ignore_errors=True)
+
+    stats = {
+        "games": total_games,
+        "plies": total_plies,
+        "elapsed_s": wall_elapsed,
+        "games_per_s": total_games / max(wall_elapsed, 1e-6),
+        "plies_per_s": total_plies / max(wall_elapsed, 1e-6),
+        "avg_search_nodes_per_ply": total_nodes / max(total_plies, 1),
+        "avg_sims_per_ply": total_sims / max(total_plies, 1),
+        "termination_reason_counts": dict(zip(TERM_CODES, term_counts)),
+        "truncated_rate": truncated_games / max(total_games, 1),
+        "workers": len(worker_dirs),
+        **last_cfg,
+    }
+    manifest = {"shards": combined_shards, "months": [], "games": total_games,
+                "steps": total_steps, "skipped": total_skipped, "gen": stats}
+    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, ensure_ascii=False, indent=1)
+    return stats
+
+
+def run_workers(args: argparse.Namespace) -> None:
+    n = args.workers
+    seed_seq = np.random.SeedSequence(args.seed)
+    worker_seeds = seed_seq.spawn(n)
+    base, rem = divmod(args.games, n)
+    counts = [base + (1 if i < rem else 0) for i in range(n)]
+
+    os.makedirs(args.out, exist_ok=True)
+    worker_dirs = [os.path.join(args.out, f"_w{i}") for i in range(n)]
+    procs = []
+    t0 = time.time()
+    for i, (wdir, n_games) in enumerate(zip(worker_dirs, counts)):
+        if n_games == 0:
+            continue
+        os.makedirs(wdir, exist_ok=True)
+        cmd = [sys.executable, os.path.abspath(__file__),
+               "--ckpt", args.ckpt, "--out", wdir, "--tag", f"{args.tag}-w{i}",
+               "--games", str(n_games), "--concurrency", str(args.concurrency),
+               "--n_sims", str(args.n_sims), "--m0", str(args.m0),
+               "--seed", str(int(worker_seeds[i].generate_state(1)[0])),
+               "--gen_id", str(args.gen_id), "--ckpt_step", str(args.ckpt_step)]
+        log_path = os.path.join(wdir, "worker.log")
+        log_fh = open(log_path, "w", encoding="utf-8")
+        proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT,
+                                env={**os.environ, "PYTHONUNBUFFERED": "1"})
+        procs.append((proc, log_fh, wdir))
+        print(f"[worker {i}] 启动 pid={proc.pid} games={n_games}", flush=True)
+
+    failed = []
+    for i, (proc, log_fh, wdir) in enumerate(procs):
+        rc = proc.wait()
+        log_fh.close()
+        print(f"[worker {i}] 退出码 {rc}", flush=True)
+        if rc != 0:
+            failed.append((i, wdir))
+    if failed:
+        raise RuntimeError(f"worker 进程失败：{failed}；查看各自 worker.log 排查后重试，"
+                           f"不合并已产出的部分分片（避免正式数据混入未验证的失败批次）")
+
+    elapsed = time.time() - t0
+    stats = _merge_worker_outputs(args.out, [wd for _, _, wd in procs], elapsed)
+    print(f"[全部 worker 完成] {n} 进程，{stats['games']} 局，{elapsed:.1f}s，"
+          f"{stats['games_per_s']:.3f} games/s，{stats['plies_per_s']:.2f} plies/s，"
+          f"封顶率 {stats['truncated_rate']:.1%}", flush=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
@@ -507,8 +614,14 @@ def main() -> None:
     ap.add_argument("--m0", type=int, default=16)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--gen_id", type=int, default=1)
+    ap.add_argument("--workers", type=int, default=1,
+                    help="并行 OS 进程数（跨核；每进程独立 CUDA context）。>1 时委派给 run_workers。")
     ap.add_argument("--ckpt_step", type=int, default=0)
     args = ap.parse_args()
+
+    if args.workers > 1:
+        run_workers(args)
+        return
 
     cfg = SelfPlayConfig(
         ckpt=args.ckpt,
