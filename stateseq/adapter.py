@@ -1,0 +1,108 @@
+"""统一模型适配器（review 2026-09-18 §7：修复组件 A）。
+
+负责：
+1. Elo 标准化：所有入口用同一 (elo-mean)/std 变换
+2. WDL logits → 概率 → Q：`softmax(wdl_logits)[0]-softmax(wdl_logits)[2]`
+3. 终局真值：`board.outcome(claim_draw=True)` 直接产 q=+1/0/-1，不走网络
+
+所有生成器、arena、评估脚本统一个个入口。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import chess
+import numpy as np
+import torch
+
+from .features import encode
+from .conditions import EloStandardizer, TimeControlBucket
+
+ELO_MEAN = 1656.1
+ELO_STD = 390.9
+
+
+def standardize_elo(elo: float | np.ndarray) -> float | np.ndarray:
+    """Elo → 标准化值：(elo - mean) / std。mean/std 来自 Stage A 人类数据。"""
+    return (np.asarray(elo, dtype=np.float64) - ELO_MEAN) / ELO_STD
+
+
+def wdl_logits_to_q(wdl_logits: np.ndarray) -> float:
+    """WDL logits → 价值标量 q = P(W) − P(L) ∈ [−1, 1]。"""
+    wdl = np.asarray(wdl_logits, dtype=np.float64)
+    wdl -= wdl.max()
+    probs = np.exp(wdl) / np.exp(wdl).sum()
+    return float(probs[0] - probs[2])
+
+
+def wdl_logits_to_probs(wdl_logits: np.ndarray) -> np.ndarray:
+    """WDL logits → 概率向量 [P(W), P(D), P(L)]。"""
+    wdl = np.asarray(wdl_logits, dtype=np.float64)
+    wdl -= wdl.max()
+    probs = np.exp(wdl) / np.exp(wdl).sum()
+    return probs.astype(np.float32)
+
+
+def get_terminal_q(board: chess.Board) -> float:
+    """终局真值：当前行棋方视角的 +1（本方胜）/ 0（和）/ −1（本方负）。
+    
+    将杀后当前行棋方是被将死者 → 返回 -1；对手视角取负即 +1。
+    逼和/五十步/重复/不足 → 和棋 0。
+    """
+    outcome = board.outcome(claim_draw=True)
+    if outcome is None:
+        return 0.0
+    if outcome.winner is None:
+        return 0.0
+    # outcome.winner 是胜方颜色
+    # 当前行棋方视角：若 board.turn == outcome.winner → +1，否则 −1
+    return 1.0 if board.turn == outcome.winner else -1.0
+
+
+def get_termination_reason(board: chess.Board, max_plies: int, ply: int) -> tuple[str, bool]:
+    """统一终止原因与截断标记。ply 从 0 开始计数。
+    
+    返回 (reason_str, is_truncated):
+      "checkmate" / "stalemate" / "fifty_move" / "threefold" / "insufficient_material" / "truncated"
+    """
+    if ply >= max_plies:
+        return "truncated", True
+    if board.is_checkmate():
+        return "checkmate", False
+    if board.is_stalemate():
+        return "stalemate", False
+    if board.is_fifty_moves():
+        return "fifty_move", False
+    if board.is_repetition(3):
+        return "threefold", False
+    if board.is_insufficient_material():
+        return "insufficient_material", False
+    return "unknown", False
+
+
+# 从分片读取时重构终止原因（不依赖 max_plies，用实际 n_plies 判断）
+def get_termination_reason_from_board(board: chess.Board) -> tuple[str, bool]:
+    outcome = board.outcome(claim_draw=True)
+    if outcome is None:
+        return "unknown", False
+    if outcome.termination == chess.Termination.CHECKMATE:
+        return "checkmate", False
+    if outcome.termination == chess.Termination.STALEMATE:
+        return "stalemate", False
+    if outcome.termination == chess.Termination.INSUFFICIENT_MATERIAL:
+        return "insufficient_material", False
+    if outcome.termination == chess.Termination.FIFTY_MOVES:
+        return "fifty_move", False
+    if outcome.termination == chess.Termination.THREEFOLD_REPETITION:
+        return "threefold", False
+    return "unknown", False
+
+
+def encode_board(board: chess.Board, occurrence: int = 0) -> np.ndarray:
+    """编码 785 维特征 + 标准化条件 + tc/color。返回 (feats, tc, elo_std, color)。"""
+    feats = encode(board, occurrence=occurrence)
+    tc = int(TimeControlBucket.RAPID)
+    elo_std = standardize_elo(2567.5)
+    color = 1 if board.turn == chess.WHITE else 0
+    return feats, tc, elo_std, color

@@ -39,7 +39,8 @@ def _worker_build(index: int, t_max: int = B2_T_MAX):
                        pipol_actions=g["pipol_actions"], pipol_probs=g["pipol_probs"])
     tc = int(meta["tc_bucket"])
     is_truncated = bool(meta["is_truncated"])
-    return index, data, tc, is_truncated
+    elo_mean = float(meta.get("elo_mean", 1500.0))
+    return index, data, tc, is_truncated, elo_mean
 
 
 class SelfPlayDataset:
@@ -83,7 +84,9 @@ class SelfPlayDataset:
             np.arange(t)[None, :] < np.asarray([len(it[1]["actions"]) for it in items])[:, None]
         )
         elo_w = torch.ones(b, dtype=torch.float32)  # 自对弈条件固定（Elo 2567.5），无需 D9 加权
-        elo_std = torch.zeros(b, dtype=torch.float32)
+        from ..adapter import standardize_elo
+        elo_arr = np.array([it[4] for it in items], dtype=np.float64)
+        elo_std = torch.tensor(standardize_elo(elo_arr).astype(np.float32))
         tc = torch.tensor([it[2] for it in items], dtype=torch.long)
 
         # π′ 软目标：稠密 (B, T, NUM_ACTIONS)，非法/填充位置为 0

@@ -30,6 +30,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from stateseq.actions import action_to_move, move_to_action
 from stateseq.conditions import TimeControlBucket
 from stateseq.features import encode
+from stateseq.adapter import (
+    encode_board, standardize_elo, wdl_logits_to_q, get_terminal_q, get_termination_reason,
+)
 from stateseq.gumbel import (
     C_SCALE,
     C_VISIT,
@@ -204,11 +207,12 @@ class GameState:
         if not legal_actions:
             return False
         color = 1 if self.board.turn == chess.WHITE else 0
+        feats_root, tc_root, elo_root, _ = encode_board(self.board, occ_root)
         logits_np, wdl_np, mlh_np, x_np, cache_new = yield (
-            features, int(self.cfg.tc_bucket), self.cfg.elo, color, self.root_cache)
+            feats_root, int(tc_root), float(elo_root), color, self.root_cache)
         self.root_cache = cache_new
         self._update_occurrence()
-        q = float(wdl_np[0] - wdl_np[2])
+        q = wdl_logits_to_q(wdl_np)
         legal_arr = np.array(legal_actions, dtype=np.int64)
         logits_full = np.full(1936, -3e4, dtype=np.float32)
         logits_full[legal_arr] = logits_np[legal_arr]
@@ -243,25 +247,28 @@ class GameState:
             move = _resolve_move(a, board)
             board.push(move)
             key = _board_key(board)
-            feats = encode(board, occurrence=occ.get(key, 0))
             occ[key] = occ.get(key, 0) + 1
             color = 1 if board.turn == chess.WHITE else 0
-            _, _, _, _, cache = yield (feats, int(self.cfg.tc_bucket), self.cfg.elo, color, cache)
+            feats, tc_val, elo_std, _ = encode_board(board, occ.get(_board_key(board), 0))
+            _, _, _, _, cache = yield (feats, int(tc_val), float(elo_std), color, cache)
 
         move = _resolve_move(action, board)
         board.push(move)
         terminal_by_rule = board.is_game_over(claim_draw=True)
         legal_actions = [] if terminal_by_rule else _legal_actions_of(board)
         key = _board_key(board)
-        feats = encode(board, occurrence=occ.get(key, 0))
+        occ[key] = occ.get(key, 0) + 1
         color = 1 if board.turn == chess.WHITE else 0
-        logits_np, wdl_np, mlh_np, x_np, _ = yield (
-            feats, int(self.cfg.tc_bucket), self.cfg.elo, color, cache)
-        q = float(wdl_np[0] - wdl_np[2])
         new_path = node.path + (action,)
         if terminal_by_rule or not legal_actions:
+            q_term = get_terminal_q(board)
             return Node(legal=np.array([], dtype=np.int64), logits=np.array([], dtype=np.float32),
-                        q=q, depth=node.depth + 1, path=new_path)
+                        q=q_term, depth=node.depth + 1, path=new_path, terminal=True)
+
+        feats, tc_val, elo_std, _ = encode_board(board, occ.get(_board_key(board), 0))
+        logits_np, wdl_np, mlh_np, x_np, _ = yield (
+            feats, int(tc_val), float(elo_std), color, cache)
+        q = wdl_logits_to_q(wdl_np)
         legal_arr = np.array(legal_actions, dtype=np.int64)
         logits_full = np.full(1936, -3e4, dtype=np.float32)
         logits_full[legal_arr] = logits_np[legal_arr]
