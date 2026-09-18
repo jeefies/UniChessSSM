@@ -87,11 +87,18 @@ class SeqModel(nn.Module):
         h = self.trunk(x + cond)                                          # (B, T, 512)
         policy_logits, wdl_logits, mlh = self.f(h)
 
+        # Apply legal mask to policy logits before loss
+        if hasattr(batch, 'legal_mask') and batch.legal_mask is not None:
+            from .heads import apply_legal_mask
+            policy_logits_masked = apply_legal_mask(policy_logits, batch.legal_mask)
+        else:
+            policy_logits_masked = policy_logits
+
         if policy_soft_target is not None:
-            l_pol = losses.policy_soft_loss(policy_logits, policy_soft_target,
+            l_pol = losses.policy_soft_loss(policy_logits_masked, policy_soft_target,
                                             batch.elo_weight.unsqueeze(1).expand(bsz, seqlen), valid_mask)
         else:
-            l_pol = losses.policy_loss(policy_logits, batch.actions,
+            l_pol = losses.policy_loss(policy_logits_masked, batch.actions,
                                        batch.elo_weight.unsqueeze(1).expand(bsz, seqlen), valid_mask)
         l_val = losses.value_loss(wdl_logits, batch.results, valid_mask)
         l_mlh = losses.mlh_loss(mlh, batch.moves_left, mlh_valid_mask if mlh_valid_mask is not None else valid_mask)
@@ -100,7 +107,8 @@ class SeqModel(nn.Module):
         l_rec, diag_rec = losses.recon_loss(d_out, batch.features, valid_mask)
 
         # g 动力学：t≥1（t=0 无 x_{-1}，不入 L_dyn）；valid 取 t≥1 段
-        delta_hat = self.g(h[:, :-1], batch.actions[:, 1:])  # (h_{t-1}, a_t)
+        # actions[t-1] 从 B_t 推进到 B_{t+1}，配 h_{t-1} 预测 x_t - x_{t-1}
+        delta_hat = self.g(h[:, :-1], batch.actions[:, :-1])  # (h_{t-1}, a_{t-1})
         dyn_mask = valid_mask[:, 1:] if valid_mask is not None else None
         l_dyn, diag_dyn = losses.dyn_loss(delta_hat, x[:, 1:], x[:, :-1], dyn_mask)
 

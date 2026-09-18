@@ -122,7 +122,8 @@ def main() -> None:
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
     # §3 锁定：损失权重（来源内）pol 1.0 / val 1.0 / recon 0.1 / dyn 0.5 / mlh 0.1。
     # losses.LossWeights 默认 w_v=0.8 是 Stage A 遗留值，Stage B 显式改为 1.0。
-    weights = losses.LossWeights(w_v=1.0)
+    # recon 固定 0.1，禁用 Stage A 的 1.0→0.1 退火（§2.6）。
+    weights = losses.LossWeights(w_v=1.0, w_r_start=0.1, w_r_end=0.1)
 
     start_step = 0
     best_val = float("inf")
@@ -265,6 +266,13 @@ def main() -> None:
     human_ds.close()
     sp_ds.close()
     mfh.close()
+    # Always save full checkpoint at end (short runs may never hit save_every)
+    save_atomic({
+        "model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
+        "step": step, "args": vars(args), "best_val": best_val,
+        "rng_cpu": torch.get_rng_state(), "rng_gpu": torch.cuda.get_rng_state() if torch.cuda.is_available() else torch.tensor([]),
+    }, latest)
+    print(f"训练结束：保存 latest.pt @ step {step+1}", flush=True)
     print("TRAIN_DONE", flush=True)
 
 
