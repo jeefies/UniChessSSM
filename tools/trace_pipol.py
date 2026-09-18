@@ -354,7 +354,7 @@ def main():
                 "sigma_vs_logit_ratio": abs(sig_search.max()) / max(abs(logits_masked.max()), 1e-10),
                 "pi_prime_entropy": round(float(entropy_search), 6),
                 "pi_prime_max_prob": round(max_prob_search, 6),
-                "pi_entropy": -np.sum(pi_raw * np.log(np.maximum(pi_raw, 1e-10))),
+                "pi_entropy": round(float(-np.sum(pi_raw * np.log(np.maximum(pi_raw, 1e-10)))), 6),
                 "kl_pi_prime_vs_pi": round(float(kl_div), 6),
                 "selected_action": int(result["action"]),
                 "n_sims_used": result["sims_used"],
