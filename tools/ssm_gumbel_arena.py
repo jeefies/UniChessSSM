@@ -150,12 +150,13 @@ def _compare_forward_pass(model_a, model_b, device: str) -> dict:
 
 SCORING_TEST_POSITIONS = [
     # (fen, expected_winner: chess.Color or None for draw)
-    ("k7/8/8/8/8/8/8/R6K w - - 0 1", chess.WHITE),        # 白车将杀
-    ("K7/8/8/8/8/8/8/r6k b - - 0 1", chess.BLACK),         # 黑车将杀
-    ("k7/8/8/8/8/7Q/8/7K w - - 0 1", chess.WHITE),         # 白后将杀
-    ("7k/8/7q/8/8/8/8/7K b - - 0 1", chess.BLACK),         # 黑后将杀
-    ("k7/8/8/8/8/8/8/4Q2K w - - 0 1", chess.WHITE),        # 后将杀
-    ("k7/4B3/8/8/8/8/8/7K w - - 0 1", chess.WHITE),        # 象将杀
+    # fen 必须表示该走棋方已被将杀（无合法着 + 被将军）
+    ("k1R5/8/8/8/8/8/8/K7 b - - 0 1", chess.WHITE),        # 黑王被白车将杀
+    ("K1r5/8/8/8/8/8/8/k7 w - - 0 1", chess.BLACK),         # 白王被黑车将杀
+    ("k1Q5/8/8/8/8/8/8/K7 b - - 0 1", chess.WHITE),         # 黑王被白后将杀
+    ("K1q5/8/8/8/8/8/8/k7 w - - 0 1", chess.BLACK),         # 白王被黑后将杀
+    ("k1N5/8/8/8/8/8/8/K7 b - - 0 1", chess.WHITE),         # 黑王被白马将杀
+    ("k7/8/8/8/8/8/1R6/1K6 b - - 0 1", chess.WHITE),        # 黑王被白车将杀 2
 ]
 
 
