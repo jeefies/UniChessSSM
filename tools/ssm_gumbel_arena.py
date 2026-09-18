@@ -116,7 +116,9 @@ def _model_id(state_dict: dict) -> str:
     buf = bytearray()
     for k in keys[:4]:
         t = state_dict[k]
-        buf.extend(t.flatten()[:16].view(np.uint8).tobytes())
+        # 取前 16 个 fp32 值 → 64 字节 → SHA-256
+        head = t.flatten()[:16].detach().cpu().numpy().astype(np.float32).view(np.uint8).tobytes()
+        buf.extend(head)
     return hashlib.sha256(buf).hexdigest()[:16]
 
 
