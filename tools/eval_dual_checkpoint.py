@@ -24,6 +24,7 @@ from stateseq.model import SeqModel
 from stateseq.features import encode
 from stateseq.actions import move_to_action
 from stateseq.conditions import TimeControlBucket
+from stateseq.adapter import standardize_elo, wdl_logits_to_q, wdl_logits_to_probs, encode_board
 
 DEVICE = "cuda"
 
@@ -84,12 +85,12 @@ def evaluate(shard_dir, ckpt_path, label_str):
 
         for ply in range(n_plies):
             action_id = int(actions[ply])
-            feats = encode(board, occurrence=0)
+            feats, tc_val, elo_std, color = encode_board(board, occurrence=0)
 
             f_t = torch.from_numpy(feats).float().unsqueeze(0).to(DEVICE)
-            tc_t = torch.tensor([int(TimeControlBucket.RAPID)], dtype=torch.long, device=DEVICE)
-            elo_t = torch.tensor([2567.5], dtype=torch.float32, device=DEVICE)
-            color_t = torch.tensor([1 if board.turn == chess.WHITE else 0], dtype=torch.long, device=DEVICE)
+            tc_t = torch.tensor([int(tc_val)], dtype=torch.long, device=DEVICE)
+            elo_t = torch.tensor([float(elo_std)], dtype=torch.float32, device=DEVICE)
+            color_t = torch.tensor([color], dtype=torch.long, device=DEVICE)
 
             with torch.no_grad():
                 logits, wdl, mlh, x, cache_new = model.step(f_t, tc_t, elo_t, color_t, cache)
@@ -108,15 +109,17 @@ def evaluate(shard_dir, ckpt_path, label_str):
             action_prob = probs[action_id]
             policy_ce_sum += -np.log(max(action_prob, 1e-10))
 
-            # Value CE: softmax(WDL raw logits) -> prob of true class
-            wdl_logits_safe = wdl_np - wdl_np.max()
-            wdl_probs = np.exp(wdl_logits_safe, dtype=np.float64)
-            wdl_probs /= wdl_probs.sum()
-            value_ce_sum += -np.log(max(wdl_probs[result], 1e-10))
+            # Value CE: flip result for black-to-move
+            turn = board.turn
+            result_turn = result if turn == chess.WHITE else (2 if result == 0 else 0 if result == 2 else 1)
+            wdl_probs = wdl_logits_to_probs(wdl_np)
+            value_ce_sum += -np.log(max(wdl_probs[result_turn], 1e-10))
             wdl_prior_sum += wdl_probs
 
-            # Per-position label (same game result for every ply of this game)
-            wdl_label_pos_sum += game_label
+            # Per-position label from current player's perspective
+            label_turn = np.zeros(3, dtype=np.float64)
+            label_turn[result_turn] = 1.0
+            wdl_label_pos_sum += label_turn
 
             total_positions += 1
 
