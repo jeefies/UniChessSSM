@@ -421,9 +421,17 @@ def main():
         summary["search_trace"]["sigma_vs_logit_ratio"]["always_dominant"],
         len(search_records)))
 
+    class _NumpyEncoder(json.JSONEncoder):
+        def default(self, obj):
+            if isinstance(obj, (np.float32, np.float64)):
+                return float(obj)
+            if isinstance(obj, (np.int32, np.int64)):
+                return int(obj)
+            return super().default(obj)
+
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as fh:
-        json.dump(summary, fh, indent=1)
+        json.dump(summary, fh, indent=1, cls=_NumpyEncoder)
     print("Written to %s" % args.out)
     print("Positions: %d" % len(records))
     print("Entropy: mean=%.4f median=%.4f p25=%.4f p75=%.4f" % (
