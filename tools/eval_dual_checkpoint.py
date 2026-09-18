@@ -127,9 +127,10 @@ def evaluate(shard_dir, ckpt_path, label_str):
     policy_ce_avg = float(policy_ce_sum / max(total_positions, 1))
     value_ce_avg = float(value_ce_sum / max(total_positions, 1))
     wdl_prior_avg = wdl_prior_sum / max(total_positions, 1)
-    wdl_label_dist = wdl_label_sum / max(total_positions, 1)
+    # wdl_label_sum is per-game, divide by n (games) not total_positions
+    wdl_label_dist = wdl_label_sum / max(n, 1)
 
-    # Constant baseline: predict label distribution for every position
+    # Constant baseline: if we always predict P(W), P(D), P(L) from game result distribution
     const_dist = np.array([wdl_label_dist[0], wdl_label_dist[1], wdl_label_dist[2]], dtype=np.float64)
     const_ce = float(-np.sum(wdl_label_dist * np.log(np.maximum(const_dist, 1e-10))))
 
@@ -143,7 +144,7 @@ def evaluate(shard_dir, ckpt_path, label_str):
         "wdl_prior_mean": [round(float(wdl_prior_avg[0]), 6),
                            round(float(wdl_prior_avg[1]), 6),
                            round(float(wdl_prior_avg[2]), 6)],
-        "wdl_label_distribution": [round(float(wdl_label_dist[0]), 6),
+        "wdl_label_distribution_per_game": [round(float(wdl_label_dist[0]), 6),
                                    round(float(wdl_label_dist[1]), 6),
                                    round(float(wdl_label_dist[2]), 6)],
         "elapsed_s": round(elapsed, 1),
