@@ -49,22 +49,22 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ---- 开局库（ECO 经典变例，每对白/黑各一次） ----
 OPENINGS = [
-    "1. e4 e5 2. Nf3 Nc6 3. Bb5",                    # Ruy Lopez
-    "1. d4 d5 2. c4 e6",                              # Queen's Gambit Declined
-    "1. e4 c5 2. Nf3 d6 3. d4 cxd4 4. Nxd4 Nf6",     # Open Sicilian
-    "1. d4 Nf6 2. c4 g6 3. Nc3 Bg7",                  # King's Indian
-    "1. e4 e6 2. d4 d5",                               # French Defense
-    "1. d4 Nf6 2. c4 e6 3. Nf3 Bb4+",                 # Bogo-Indian
-    "1. e4 c6 2. d4 d5",                               # Caro-Kann
-    "1. c4 e5",                                        # English (Sicilian Reversed)
-    "1. Nf3 Nf6 2. c4 g6",                             # Reti/Robatsch
-    "1. d4 d5 2. c4 c6",                               # Slav Defense
-    "1. e4 d5 2. exd5 Qxd5 3. Nc3 Qa5",               # Scandinavian
-    "1. d4 Nf6 2. c4 c5",                              # Modern Benoni
-    "1. e4 e5 2. Nf3 Nf6",                             # Petrov Defense
-    "1. d4 e6 2. c4 Bb4+",                             # Keres Defense
-    "1. e4 e5 2. Nf3 Nc6 3. Bc4",                     # Italian Game
-    "1. d4 g6 2. c4 Bg7",                              # Modern Defense
+    "e4 e5 Nf3 Nc6 Bb5",                    # Ruy Lopez
+    "d4 d5 c4 e6",                              # Queen's Gambit Declined
+    "e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6",     # Open Sicilian
+    "d4 Nf6 c4 g6 Nc3 Bg7",                  # King's Indian
+    "e4 e6 d4 d5",                               # French Defense
+    "d4 Nf6 c4 e6 Nf3 Bb4+",                 # Bogo-Indian
+    "e4 c6 d4 d5",                               # Caro-Kann
+    "c4 e5",                                        # English (Sicilian Reversed)
+    "Nf3 Nf6 c4 g6",                             # Reti/Robatsch
+    "d4 d5 c4 c6",                               # Slav Defense
+    "e4 d5 exd5 Qxd5 Nc3 Qa5",               # Scandinavian
+    "d4 Nf6 c4 c5",                              # Modern Benoni
+    "e4 e5 Nf3 Nf6",                             # Petrov Defense
+    "d4 e6 c4 Bb4+",                             # Keres Defense
+    "e4 e5 Nf3 Nc6 Bc4",                     # Italian Game
+    "d4 g6 c4 Bg7",                              # Modern Defense
 ]
 
 
