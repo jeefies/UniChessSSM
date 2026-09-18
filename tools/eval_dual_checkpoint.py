@@ -63,7 +63,8 @@ def evaluate(shard_dir, ckpt_path, label_str):
     policy_ce_sum = 0.0
     value_ce_sum = 0.0
     wdl_prior_sum = np.zeros(3, dtype=np.float64)
-    wdl_label_sum = np.zeros(3, dtype=np.float64)
+    wdl_label_pos_sum = np.zeros(3, dtype=np.float64)   # per-position label count
+    wdl_label_game_sum = np.zeros(3, dtype=np.float64)  # per-game label count
     game_ids = []
 
     t0 = time.time()
@@ -77,9 +78,9 @@ def evaluate(shard_dir, ckpt_path, label_str):
 
         cache = model.initial_cache(1, device=DEVICE, dtype=torch.float32)
         board = chess.Board()
-        label = np.zeros(3, dtype=np.float32)
-        label[result] = 1.0
-        wdl_label_sum += label
+        game_label = np.zeros(3, dtype=np.float64)
+        game_label[result] = 1.0
+        wdl_label_game_sum += game_label
 
         for ply in range(n_plies):
             action_id = int(actions[ply])
@@ -107,11 +108,15 @@ def evaluate(shard_dir, ckpt_path, label_str):
             action_prob = probs[action_id]
             policy_ce_sum += -np.log(max(action_prob, 1e-10))
 
-            # Value CE
-            wdl_probs = np.exp(wdl_np - wdl_np.max(), dtype=np.float64)
+            # Value CE: softmax(WDL raw logits) -> prob of true class
+            wdl_logits_safe = wdl_np - wdl_np.max()
+            wdl_probs = np.exp(wdl_logits_safe, dtype=np.float64)
             wdl_probs /= wdl_probs.sum()
             value_ce_sum += -np.log(max(wdl_probs[result], 1e-10))
             wdl_prior_sum += wdl_probs
+
+            # Per-position label (same game result for every ply of this game)
+            wdl_label_pos_sum += game_label
 
             total_positions += 1
 
@@ -123,16 +128,25 @@ def evaluate(shard_dir, ckpt_path, label_str):
 
     elapsed = time.time() - t0
 
-    # Metrics
+    # --- Metrics ---
     policy_ce_avg = float(policy_ce_sum / max(total_positions, 1))
     value_ce_avg = float(value_ce_sum / max(total_positions, 1))
-    wdl_prior_avg = wdl_prior_sum / max(total_positions, 1)
-    # wdl_label_sum is per-game, divide by n (games) not total_positions
-    wdl_label_dist = wdl_label_sum / max(n, 1)
 
-    # Constant baseline: if we always predict P(W), P(D), P(L) from game result distribution
-    const_dist = np.array([wdl_label_dist[0], wdl_label_dist[1], wdl_label_dist[2]], dtype=np.float64)
-    const_ce = float(-np.sum(wdl_label_dist * np.log(np.maximum(const_dist, 1e-10))))
+    # WDL prior: softmax then average over positions (correct: p.mean(dim=0))
+    wdl_prior_avg = wdl_prior_sum / max(total_positions, 1)
+
+    # Position-level label distribution
+    wdl_label_pos_dist = wdl_label_pos_sum / max(total_positions, 1)
+
+    # Game-level label distribution (for reference)
+    wdl_label_game_dist = wdl_label_game_sum / max(n, 1)
+
+    # Position-level constant baseline: predict empirical position-level WDL distribution
+    const_dist_pos = np.maximum(wdl_label_pos_dist, 1e-10)
+    const_ce_pos = float(-np.sum(wdl_label_pos_dist * np.log(const_dist_pos)))
+
+    # Uniform baseline: predict (1/3, 1/3, 1/3) for every position
+    uniform_ce = float(-np.log(1.0 / 3.0))
 
     result = {
         "checkpoint_label": label_str,
@@ -140,13 +154,18 @@ def evaluate(shard_dir, ckpt_path, label_str):
         "n_positions": total_positions,
         "policy_ce": round(policy_ce_avg, 6),
         "value_ce": round(value_ce_avg, 6),
-        "value_ce_constant_baseline": round(const_ce, 6),
+        "value_ce_constant_baseline_position": round(const_ce_pos, 6),
+        "value_ce_constant_baseline_game": round(float(-np.sum(wdl_label_game_dist * np.log(np.maximum(wdl_label_game_dist, 1e-10)))), 6),
+        "value_ce_uniform_baseline": round(uniform_ce, 6),
         "wdl_prior_mean": [round(float(wdl_prior_avg[0]), 6),
                            round(float(wdl_prior_avg[1]), 6),
                            round(float(wdl_prior_avg[2]), 6)],
-        "wdl_label_distribution_per_game": [round(float(wdl_label_dist[0]), 6),
-                                   round(float(wdl_label_dist[1]), 6),
-                                   round(float(wdl_label_dist[2]), 6)],
+        "wdl_label_distribution_per_position": [round(float(wdl_label_pos_dist[0]), 6),
+                                                 round(float(wdl_label_pos_dist[1]), 6),
+                                                 round(float(wdl_label_pos_dist[2]), 6)],
+        "wdl_label_distribution_per_game": [round(float(wdl_label_game_dist[0]), 6),
+                                            round(float(wdl_label_game_dist[1]), 6),
+                                            round(float(wdl_label_game_dist[2]), 6)],
         "elapsed_s": round(elapsed, 1),
         "positions_per_second": round(total_positions / elapsed, 1),
         "first_5_game_ids": [{"gi": gi, "n_plies": np, "result": r} for gi, np, r in game_ids[:5]],
