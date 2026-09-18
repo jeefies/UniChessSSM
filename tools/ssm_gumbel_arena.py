@@ -148,28 +148,30 @@ def _compare_forward_pass(model_a, model_b, device: str) -> dict:
 
 # ---- 正向将杀测试 ----
 
-def _build_checkmate_board(winner: chess.Color) -> chess.Board:
-    """用 set_piece_at 构建确定将杀局面。"""
-    board = chess.Board()
-    board.clear()
+def _build_checkmate_fen(winner: chess.Color) -> str:
+    """返回一个已确定将杀或逼和的 FEN（经远程验证正确）。
+    
+    Rh8#: 黑王 a8, 白车 h8 (同8行), 白王 b6. 被远程验证。
+    白胜: k6R/8/1K6/8/8/8/8/8 b - - 0 1 → Outcome(winner=True)
+    黑胜: K6r/8/1k6/8/8/8/8/8 w - - 0 1 → Outcome(winner=False)
+    """
     if winner == chess.WHITE:
-        board.set_piece_at(chess.A8, chess.Piece(chess.KING, chess.BLACK))
-        board.set_piece_at(chess.B7, chess.Piece(chess.ROOK, chess.WHITE))
-        board.set_piece_at(chess.A6, chess.Piece(chess.KING, chess.WHITE))
-        board.turn = chess.BLACK
-    else:
-        board.set_piece_at(chess.A8, chess.Piece(chess.KING, chess.WHITE))
-        board.set_piece_at(chess.B7, chess.Piece(chess.ROOK, chess.BLACK))
-        board.set_piece_at(chess.A6, chess.Piece(chess.KING, chess.BLACK))
-        board.turn = chess.WHITE
-    return board
+        return "k6R/8/1K6/8/8/8/8/8 b - - 0 1"
+    return "K6r/8/1k6/8/8/8/8/8 w - - 0 1"
+
+
+def _build_stalemate_board() -> chess.Board:
+    """白王 g6, 白后 f7, 黑王 h8, 黑方走棋 — 逼和（非将军，无合法着）。
+    
+    被远程验证：f7→g7/h7, g6→g7, h8 无合法着。"""
+    return chess.Board("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1")
 
 
 def _run_scoring_test(out_dir: str) -> None:
-    """运行计分正向测试：用程序构建确定将杀位置，验证 arena 记分路径正确记录。
+    """运行计分正向测试：用已确定的终局局面验证 arena 记分函数。
 
     不依赖神经网络——直接用 chess.Board 构建终局局面后调用 _result_str 和 outcome 验证。
-    这测试的是 arena 的记分函数，不是搜索能力。
+    这测试的是 arena 的记分路径，不是搜索能力。
     """
     print("=== 计分正向测试 ===")
     os.makedirs(out_dir, exist_ok=True)
@@ -178,37 +180,20 @@ def _run_scoring_test(out_dir: str) -> None:
     failed = 0
 
     test_cases = [
-        ("white_rook_checkmate", _build_checkmate_board(chess.WHITE), chess.WHITE),
-        ("black_rook_checkmate", _build_checkmate_board(chess.BLACK), chess.BLACK),
+        # (name, board, expected_winner)
+        ("white_rook_checkmate",
+         chess.Board(_build_checkmate_fen(chess.WHITE)),
+         chess.WHITE),
+        ("black_rook_checkmate",
+         chess.Board(_build_checkmate_fen(chess.BLACK)),
+         chess.BLACK),
+        ("white_queen_checkmate",
+         chess.Board("k7/Q7/1K6/8/8/8/8/8 b - - 0 1"),
+         chess.WHITE),
+        ("stalemate",
+         _build_stalemate_board(),
+         None),
     ]
-
-    # steamroller 将杀：白后 + 白王 vs 黑王
-    sr = chess.Board()
-    sr.clear()
-    sr.set_piece_at(chess.A8, chess.Piece(chess.KING, chess.BLACK))
-    sr.set_piece_at(chess.A7, chess.Piece(chess.QUEEN, chess.WHITE))
-    sr.set_piece_at(chess.B6, chess.Piece(chess.KING, chess.WHITE))
-    sr.turn = chess.BLACK
-    test_cases.append(("white_queen_checkmate", sr, chess.WHITE))
-
-    # 象 + 王将杀（正确角）
-    bb = chess.Board()
-    bb.clear()
-    bb.set_piece_at(chess.A8, chess.Piece(chess.KING, chess.BLACK))
-    bb.set_piece_at(chess.C8, chess.Piece(chess.BISHOP, chess.WHITE))
-    bb.set_piece_at(chess.B7, chess.Piece(chess.KING, chess.BLACK))  # second piece blocks b8
-    bb.set_piece_at(chess.A6, chess.Piece(chess.KING, chess.WHITE))
-    bb.turn = chess.BLACK
-    test_cases.append(("white_bishop_checkmate", bb, chess.WHITE))
-
-    # 逼和：白方无合法着但未被将军
-    st = chess.Board()
-    st.clear()
-    st.set_piece_at(chess.H8, chess.Piece(chess.KING, chess.WHITE))
-    st.set_piece_at(chess.A1, chess.Piece(chess.QUEEN, chess.BLACK))
-    st.set_piece_at(chess.A2, chess.Piece(chess.KING, chess.BLACK))
-    st.turn = chess.WHITE
-    test_cases.append(("stalemate", st, None))
 
     for name, board, expected in test_cases:
         outcome = board.outcome(claim_draw=True)
