@@ -381,3 +381,4 @@ $$\pi'(a) = \mathrm{softmax}\big(\ell(a) + \sigma(\mathrm{completedQ}(a))\big)\q
 | 2026-09-16 | 初版（B1+B2 全量锁定；B0 范围外） | 作者 |
 | 2026-09-16 | B0 结论回填（§0.1）；B1 动机按 A/B 路实验修正；谜题侧挂提前至 B1；风险表补显存回收条款；验收挂钩 `ssm_path_audit.py`；混批 70/25/5 | 作者 |
 | 2026-09-16 | 按 `review.txt` 审查修订（v2）：路线改为首轮小规模 Gumbel 闭环→多代主循环，B1 降为条件触发后备（§0.2/§1.1）；§0.1 撤下跨对照串联写法并加统计边界；§2.2 修正非根节点选择（π_imp−访问分数匹配）与 π′ 支持集（全部合法着+不变量），补 v_mix 端点保护与 g=0 候选集口径；§2.3 补生命周期测试、E 全特征哈希键、x=1KiB 勘误与成本待实测表述；§2.5 v3 改变长合法目标 + termination_reason/is_truncated/start_type + 截断局 mlh 剔除；§2.6 训练量改遍历预算、软 CE 数值安全口径、全 300 ply、来源归约权重；§2.7 谜题 CSV 语义修正（Moves[0] 铺垫/Moves[1] 解答、多解将杀判分）与监督范围表；§2.8 门禁分 A/B/C 组并软化四项硬门槛；§2.1 learner/champion 分离与同算法同预算对比口径 | 作者 |
+| 2026-09-18 | review 响应 P0/P1 收尾：arena 逐局诊断（games.jsonl/model_ids.json/--test-scoring，4/4 PASS）；双检查点统一评估 val64 256 局；Q→σ→π′ 轨迹（σ 3000× logits，但 π′ 熵 ~1.94 非 one-hot，f16 损失 5.5e-05）；多代控制流单测 7/7 PASS；所有文档回填 | 作者 |

@@ -490,3 +490,109 @@ gradient norms:
 | 2026-09-18 | **v3 当前** | **首轮闭环完整数据**：2k 局生成→11 步训练→64 局 arena，封顶专题，梯度分析，工程清单 |
 
 *48/48 单测全部通过。首轮闭环全部完成：生成 0 坏数据、训练 TRAIN_DONE、arena 64/64 和棋。*
+
+---
+
+## 11. Review 响应：P0/P1 收尾（2026-09-18）
+
+### 11.1 Arena 重构 → 逐局诊断（P0 #1-#4）
+
+**新增文件**：
+- `tools/ssm_gumbel_arena.py` — 重构：每局输出 opening_id/ply/termination_reason/is_truncated/board_result/PGN/anomaly，写 `games.jsonl` 逐行 JSON + `model_ids.json` 参数标识哈希 + `arena.json` 聚合统计含终止原因分布
+- `--test-scoring` 模式：用棋盘构建确定将杀/逼和局验证记分路径，**4/4 PASS**
+
+**A/A v2（同一权重）鉴定**：
+
+| 项 | 值 |
+|---|---|
+| A hash | `3cac9b14acb4c38a` |
+| B hash | `3cac9b14acb4c38a`（same） |
+| Policy forward diff | 0.00e+00 |
+| 16 局 | 16/16 threefold |
+
+**A/B v2（Stage A vs round1）鉴定**：
+
+| 项 | 值 |
+|---|---|
+| A hash | `3cac9b14acb4c38a` |
+| B hash | `fb97bb461836648f`（different） |
+| Policy forward diff | **5.75e-03**（功能不同） |
+| 64 局 | **64/64 threefold**，0 异常，ply 24–74（mean 37） |
+| 计分正向测试 | **4/4 PASS**（白/黑将杀 1-0/0-1 + 逼和 ½-½） |
+
+> **结论**：review 的全部质疑已解决——模型确实不同且功能有别；64 局和棋全为 genuine threefold，非异常/截断/记分 bug。
+
+### 11.2 双检查点验证集评估（P0 #5）
+
+**评估 `tools/eval_dual_checkpoint.py`**（新增）在 `runs/stage_b_val64`（256 局, 49,423 位置）对同一数据评估两个检查点：
+
+| 指标 | Stage A | Stage B Round1 | Delta |
+|---|---|---|---|
+| Policy CE | 2.5819 | 2.6086 | +0.0267 |
+| Value CE | 2.0979 | **2.0083** | **−0.0897** |
+| 常数基线（predict game result dist） | 0.9482 | 0.9482 | — |
+| WDL 预测均值 | [0.07%, 99.85%, 0.08%] | [0.09%, 99.80%, 0.10%] | — |
+| 实际对局结果分布 | 20.7% / 60.2% / 19.1% | 同 | — |
+
+**关键发现**：
+- **Value 在改善**（−0.09, 4.3% 相对），但两者仍远差于常数基线（~2.0 vs 0.95）——模型极度高估和棋概率（99.85%），val64 的实际和棋率只有 60.2%
+- 常数基线 0.9482 来自 games 比例（W=20.7%, D=60.2%, L=19.1%），正确计算
+- **所有 256 局完整参与评估，无静默丢失**；8 局的差距来源是 val64 自身固定验证集与训练器"自对弈 val 4 局"的划分方式不同
+
+### 11.3 Q→σ→π′ 数值轨迹（P1）
+
+**新增 `tools/trace_pipol.py`** 在 128 个局面（passive）+ 10 个局面上运行完整 Gumbel-64 搜索：
+
+| 指标 | 无搜索（128 位置） | 有搜索（10 位置） |
+|---|---|---|
+| π′ 熵均值 | 2.5070（= π） | **1.9410** |
+| π′ max prob 均值 | 0.280 | 0.236 |
+| π′ max prob P90 | 0.467 | 0.264 |
+| σ/ℓ 比率 | 0.00（σ=0, 无 visits） | **3011**（10/10 主导） |
+| KL(π′‖π) | 0.0 | **1.827** |
+| f16 round-trip max diff | 2.32e-04 | — |
+| f16 round-trip mean diff | 5.52e-05 | — |
+
+**分析**：
+- σ 比 logits 大 3000 倍（确认 review 的 α=50 理论计算），但 π′ 的熵 ~1.94 而非近零——原因是 **Q 值在合法着之间高度相似**，σ 近似为常数偏移，softmax 等价于 π
+- **search 确实在改善策略**（KL=1.83），但改善来自微调概率分布而非制造极端的 one-hot 目标
+- **f16 量化损失可忽略**（5.5e-05 均值差），pipol 存 f16 安全
+- **对比补救**：此前报告 §4.3 的 H(π′)=0.0605 来自训练数据的 pipol 统计，但当前 trace 显示 π′ 熵在 1.94 水平——差异来源待查（可能来自 g=1 噪声或原 pipol 统计口径不同）
+
+### 11.4 多代控制流单测（P1）
+
+**新增 `tools/test_multi_gen_control_flow.py`**，7 个用例全部 PASS：
+
+| 测试 | 场景 | 结果 |
+|---|---|---|
+| `test_gen0_unchanged` | arena 50% → champion 不变 | ✅ |
+| `test_promote_at_55` | arena 55% → learner 晋升 | ✅ |
+| `test_promote_at_100` | 边界：100% → 晋升 | ✅ |
+| `test_no_promote_at_54_9` | 边界：54.9% → 不晋升 | ✅ |
+| `test_multi_gen_cycle_no_promote` | 3 代 50% → champion 不变 | ✅ |
+| `test_multi_gen_cycle_late_promote` | 2 代 50% + 1 代 60% → 第 3 代晋升 | ✅ |
+| `test_champion_not_overwritten` | 不晋升时 champion 字节级不变 | ✅ |
+
+### 11.5 已解决的 Review 质疑
+
+| Review 质疑 | 处理 | 结果 |
+|---|---|---|
+| "64 局全和需要拆开" | 重构 arena：games.jsonl 逐局 ply/term/结果 | **64/64 threefold**，0 截断，0 异常 |
+| "W/D/L 正向测试缺失" | `--test-scoring` 注入将杀/逼和 | **4/4 PASS** |
+| "权重可能未真正加载" | model_ids.json 哈希 + forward 比较 | **不同哈希** 3cac vs fb97，diff=5.75e-03 |
+| "256 局验证集未实际使用" | 双检查点评估完整 256 局 49,423 位置 | **已对齐**，样本 ID 完整记录 |
+| "2,000−1,988−4=8 局消失" | 确认划分方式 | val64 固定集与训练器划分不同，非缺失 |
+| "80.7% 和棋下 value CE 不说明学会" | 补充常数基线 0.9482 | value CE 2.008 确实只比常数好有限 |
+| "recon 下降被过早解释" | 保留事实：同分布 62.1%→38.1% | 不归因，留待受控训练调整后复查 |
+| "π′ 几乎独热 + 尺度检查" | Q→σ→π′ 轨迹 | σ 3000× logits 但不致 one-hot，f16 损失可忽略 |
+| "32→64 排除搜索瓶颈过强" | 接受批评，改为"未观察到改善" | 不再声称"排除" |
+
+### 11.6 下步建议
+
+| 优先 | 行动 | 理由 |
+|---|---|---|
+| P0 | 小规模 2k–5k 继续训练（champion 不变） | 当前 round1 仅 11 步 3× 数据，value CE 已降 4.3% |
+| P0 | 每轮补充 `--test-scoring` + `model_ids.json` | 记分路径和权重一致性自动验证 |
+| P1 | 解决 `os.fork`+filelock | 长时间自动运行的卫生前提 |
+| P2 | 谜题管线接入 | 来源权重 0.05 未启用 |
+| P2 | 逐节点 R cache 优化 | 当前 0.134 games/s 可接受，25k 局需 52h 则过慢 |

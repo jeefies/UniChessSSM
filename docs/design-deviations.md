@@ -26,3 +26,14 @@
 
 - value 诊断发现训练/验证和棋率仅 5.9%/3.9%，一度怀疑 PGN Result 解析错误；实测原始 PGN 前 10 万局标签和棋率 3.7%，v2 分片全量 result 分布（白胜 49.67% / 和 3.85% / 黑胜 46.47%）与之一致 → 低和棋率为 Lichess 超快棋池的真实分布，标签可信。
 - >200 ply 的局重放截断不影响"距真实终局步数"离线计算（分片 meta `n_plies` 为未截断总局数），但 moves_left 训练标签对这类局在 200 处饱和（已知设计，重放侧截断）。
+
+## 5. Arena 逐局诊断输出（2026-09-18，review.txt §2 响应）
+
+- **审查意见**：64/64 和棋未经终止原因分析，A/A 对称性不能发现"全记和"bug，权重加载未验证。
+- **实现变更**：
+  - `tools/ssm_gumbel_arena.py`：输出 games.jsonl（逐局 PGN/ply/termination/is_truncated/board_result/anomaly）+ model_ids.json（参数哈希 + 前向输出比较）+ `--test-scoring` 模式
+  - `tools/eval_dual_checkpoint.py`：新增双检查点统一验证集评估工具
+  - `tools/test_multi_gen_control_flow.py`：多代替代控制流单测
+  - `tools/trace_pipol.py`：Q→σ→π′ 数值轨迹审计工具
+- **更新后的 Arena 流程**：每局含诊断 → 逐行 JSON → 聚合统计写 arena.json → 联邦哈希验证 → 记分正向测试
+- **不涉及超参/规格改动，无需设计文档变更。**
