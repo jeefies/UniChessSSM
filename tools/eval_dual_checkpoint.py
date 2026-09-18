@@ -196,7 +196,7 @@ def main():
         res = evaluate(args.shard_dir, ckpt, label)
         results.append(res)
         print("  policy_ce=%.4f value_ce=%.4f const_baseline=%.4f pos=%d games=%d" % (
-            res["policy_ce"], res["value_ce"], res["value_ce_constant_baseline"],
+            res["policy_ce"], res["value_ce"], res["value_ce_constant_baseline_position"],
             res["n_positions"], res["n_games"]))
 
     # Difference
