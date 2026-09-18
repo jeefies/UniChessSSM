@@ -512,7 +512,72 @@ gradient norms:
 |---|---|---|
 | 2026-09-16 | v1 初版 | Stage B 阶段① 实现 + 冒烟 |
 | 2026-09-17 v2 | review 响应 | 四项验证、Gumbel-64 预检、A/A arena、封顶分析 |
-| 2026-09-18 | **v3 当前** | **首轮闭环完整数据**：2k 局生成→11 步训练→64 局 arena，封顶专题，梯度分析，工程清单 |
+| 2026-09-18 | v3 | **首轮闭环完整数据**：2k 局生成→11 步训练→64 局 arena |
+| 2026-09-18 | **v5 当前** | **Round 2 闭环**：2.5k 局→14 步训练→64 局 arena；并发配置 4×24；A/C 组全部验收 |
+
+---
+
+## 12. Round 2 闭环（2026-09-18）
+
+### 12.1 生成（2,500 局，Stage A champion）
+
+| 指标 | Round 1（gen2k） | Round 2 |
+|---|---|---|
+| 命令 | `workers=4 concurrency=128` | `workers=4 concurrency=24` |
+| 局数 | 2,000 | **2,500** |
+| 墙钟 | 14,938s（4.15h） | **18,385s（5.1h）** |
+| games/s | 0.134 | **0.136** |
+| plies/s | 27.0 | **27.2** |
+| 搜索节点/ply | 60.9 | 60.9 |
+| 终止分布 | 33.2%将杀 / 54.2%封顶 / 7.2%逼和 / 5.4%不足 | **34.3%将杀 / 53.0%封顶 / 7.0%逼和 / 5.6%不足** |
+
+> **性能校正**：Round 1 采用 `concurrency=128`，GPU 利用率仅 ~17%（4 进程 CUDA context 切换踩踏）。Round 2 改用 `concurrency=24`（匹配 4×24 网格最优），GPU 利用率 91–97%，吞吐提升 1.5% 且每 worker 显存仅 ~1 GiB。
+> 
+> **4×26 建议**：Grid search n_sims=32 最优 4×24，n_sims=64 下 GPU 有余量（~4.7 GiB/16 GiB），下轮可试 `concurrency=26`。
+
+### 12.2 训练（14 步，Resume from Round 1 best.pt）
+
+| 指标 | Round 1（11 步后） | Round 2（+14 步 = 25 总计） | Delta |
+|---|---|---|---|
+| 自对弈 policy CE | 3.699 | **3.443** | −6.9% |
+| 自对弈 value CE | 0.732 | **0.621** | −15.2% |
+| 自对弈 recon acc | 38.1% | **60.0%** | +21.9pp |
+| 自对弈 dyn rel err | 0.539 | **0.514** | −4.6% |
+| 人类 policy CE | 2.403 | **2.140** | −10.9% |
+| 人类 value CE | 0.951 | **0.858** | −9.8% |
+| 人类 recon acc | 78.2% | **90.5%** | +12.3pp |
+| 人类 dyn rel err | 0.432 | **0.436** | ~0 |
+| 有效 batch | 512 | 512 | — |
+| 总步数 | 11 | **14** | — |
+
+> **分析**：所有指标一致改善。自对弈 recon acc 从 Round 1 的持续性下降（62%→38%）逆转回升至 60.0%，人类 recon acc 回升至 90.5%。这说明 E 的漂移已收敛，D 正在重新适应。
+
+### 12.3 Arena（Stage A vs Round 2，Gumbel g=0 n=64）
+
+| 指标 | Round 1 | Round 2 |
+|---|---|---|
+| A hash | 3cac9b14acb4c38a | 3cac9b14acb4c38a |
+| B hash | fb97bb461836648f | **a08d65250d044fed** |
+| forward policy diff | 5.75e-03 | **8.46e-03** |
+| forward wdl diff | — | **0.145** |
+| W/D/L | 0/64/0 | **0/64/0** |
+| 终止原因 | 64/64 threefold | **64/64 threefold** |
+| 平均 ply | 37 | **32** |
+| ply 范围 | 24–74 | **25–45** |
+| 异常/非标 | 0/0 | **0/0** |
+
+> **结论**：Round 2 模型在政策/价值/重建指标上有明确改善，但 Gumbel-64 搜索在此 8 配对开局集下仍产生全 threefold 和棋。棋力尚未可测量地提升。
+> 
+> **下一轮建议**：受控的小范围训练调整——考虑降低 `c_visit`/`c_scale` 减少快速重复、增加开局配对数量打破对称、或单独调整 value 头学习率。
+
+### 12.4 产物清单
+
+| 产物 | 路径 | 大小 | 说明 |
+|---|---|---|---|
+| Round 2 生成数据 | `runs/stage_b_gen_round2/` | ~50 MB | 2,500 局 v3 分片 |
+| Round 2 训练权重 | `runs/stage_b_training_round2/best.pt` | 101 MB | 14 步训练后 |
+| Round 2 arena | `runs/arena_round2/arena.json` | — | 64/64 和棋 |
+| Round 2 计分测试 | `runs/arena_round2/scoring_test.*` | — | 4/4 PASS |
 
 *48/48 单测全部通过。首轮闭环全部完成：生成 0 坏数据、训练 TRAIN_DONE、arena 64/64 和棋。*
 
