@@ -148,54 +148,90 @@ def _compare_forward_pass(model_a, model_b, device: str) -> dict:
 
 # ---- 正向将杀测试 ----
 
-SCORING_TEST_POSITIONS = [
-    # (fen, expected_winner: chess.Color or None for draw)
-    # fen 必须表示该走棋方已被将杀（无合法着 + 被将军）
-    ("k1R5/8/8/8/8/8/8/K7 b - - 0 1", chess.WHITE),        # 黑王被白车将杀
-    ("K1r5/8/8/8/8/8/8/k7 w - - 0 1", chess.BLACK),         # 白王被黑车将杀
-    ("k1Q5/8/8/8/8/8/8/K7 b - - 0 1", chess.WHITE),         # 黑王被白后将杀
-    ("K1q5/8/8/8/8/8/8/k7 w - - 0 1", chess.BLACK),         # 白王被黑后将杀
-    ("k1N5/8/8/8/8/8/8/K7 b - - 0 1", chess.WHITE),         # 黑王被白马将杀
-    ("k7/8/8/8/8/8/1R6/1K6 b - - 0 1", chess.WHITE),        # 黑王被白车将杀 2
-]
+def _build_checkmate_board(winner: chess.Color) -> chess.Board:
+    """用 set_piece_at 构建确定将杀局面。"""
+    board = chess.Board()
+    board.clear()
+    if winner == chess.WHITE:
+        board.set_piece_at(chess.A8, chess.Piece(chess.KING, chess.BLACK))
+        board.set_piece_at(chess.B7, chess.Piece(chess.ROOK, chess.WHITE))
+        board.set_piece_at(chess.A6, chess.Piece(chess.KING, chess.WHITE))
+        board.turn = chess.BLACK
+    else:
+        board.set_piece_at(chess.A8, chess.Piece(chess.KING, chess.WHITE))
+        board.set_piece_at(chess.B7, chess.Piece(chess.ROOK, chess.BLACK))
+        board.set_piece_at(chess.A6, chess.Piece(chess.KING, chess.BLACK))
+        board.turn = chess.WHITE
+    return board
 
 
 def _run_scoring_test(out_dir: str) -> None:
-    """运行计分正向测试：注入强杀位置，验证 arena 记分路径正确记录。"""
+    """运行计分正向测试：用程序构建确定将杀位置，验证 arena 记分路径正确记录。
+
+    不依赖神经网络——直接用 chess.Board 构建终局局面后调用 _result_str 和 outcome 验证。
+    这测试的是 arena 的记分函数，不是搜索能力。
+    """
     print("=== 计分正向测试 ===")
     os.makedirs(out_dir, exist_ok=True)
     games_log = []
     passed = 0
     failed = 0
 
-    for i, (fen, expected) in enumerate(SCORING_TEST_POSITIONS):
-        board = chess.Board(fen)
-        outcome = board.outcome(claim_draw=True)
+    test_cases = [
+        ("white_rook_checkmate", _build_checkmate_board(chess.WHITE), chess.WHITE),
+        ("black_rook_checkmate", _build_checkmate_board(chess.BLACK), chess.BLACK),
+    ]
 
+    # steamroller 将杀：白后 + 白王 vs 黑王
+    sr = chess.Board()
+    sr.clear()
+    sr.set_piece_at(chess.A8, chess.Piece(chess.KING, chess.BLACK))
+    sr.set_piece_at(chess.A7, chess.Piece(chess.QUEEN, chess.WHITE))
+    sr.set_piece_at(chess.B6, chess.Piece(chess.KING, chess.WHITE))
+    sr.turn = chess.BLACK
+    test_cases.append(("white_queen_checkmate", sr, chess.WHITE))
+
+    # 象 + 王将杀（正确角）
+    bb = chess.Board()
+    bb.clear()
+    bb.set_piece_at(chess.A8, chess.Piece(chess.KING, chess.BLACK))
+    bb.set_piece_at(chess.C8, chess.Piece(chess.BISHOP, chess.WHITE))
+    bb.set_piece_at(chess.B7, chess.Piece(chess.KING, chess.BLACK))  # second piece blocks b8
+    bb.set_piece_at(chess.A6, chess.Piece(chess.KING, chess.WHITE))
+    bb.turn = chess.BLACK
+    test_cases.append(("white_bishop_checkmate", bb, chess.WHITE))
+
+    # 逼和：白方无合法着但未被将军
+    st = chess.Board()
+    st.clear()
+    st.set_piece_at(chess.H8, chess.Piece(chess.KING, chess.WHITE))
+    st.set_piece_at(chess.A1, chess.Piece(chess.QUEEN, chess.BLACK))
+    st.set_piece_at(chess.A2, chess.Piece(chess.KING, chess.BLACK))
+    st.turn = chess.WHITE
+    test_cases.append(("stalemate", st, None))
+
+    for name, board, expected in test_cases:
+        outcome = board.outcome(claim_draw=True)
         result_str = _result_str(board)
         winner = outcome.winner if outcome is not None else None
 
         if outcome is not None and outcome.winner == expected:
             status = "PASS"
             passed += 1
-        elif outcome is not None and outcome.winner is None:
-            status = "PASS" if expected is None else f"FAIL (expected {expected}, got draw)"
-            if status == "PASS":
-                passed += 1
-            else:
-                failed += 1
+        elif outcome is not None and outcome.winner is None and expected is None:
+            status = "PASS"
+            passed += 1
         else:
             status = f"FAIL (outcome={outcome}, expected winner={expected})"
             failed += 1
 
-        rec = {"test_idx": i, "fen": fen, "expected_winner": str(expected),
+        rec = {"test_idx": name, "fen": board.fen(), "expected_winner": str(expected),
                "result_str": result_str, "winner": str(winner) if winner is not None else None,
                "status": status}
         games_log.append(rec)
-        print(f"  [{status}] fen={fen}")
-        print(f"    result={result_str} winner={winner} expected={expected}")
+        print(f"  [{status}] {name}: result={result_str} winner={winner} expected={expected}")
 
-    manifest = {"test": "scoring_positive_test", "total": len(SCORING_TEST_POSITIONS),
+    manifest = {"test": "scoring_positive_test", "total": len(test_cases),
                 "passed": passed, "failed": failed,
                 "games": games_log}
     with open(os.path.join(out_dir, "scoring_test.json"), "w") as fh:
