@@ -37,3 +37,25 @@
   - `tools/trace_pipol.py`：Q→σ→π′ 数值轨迹审计工具
 - **更新后的 Arena 流程**：每局含诊断 → 逐行 JSON → 聚合统计写 arena.json → 联邦哈希验证 → 记分正向测试
 - **不涉及超参/规格改动，无需设计文档变更。**
+
+## 6. Review v3 修复（2026-09-18）
+
+### 6.1 模型适配器（`stateseq/adapter.py` 新建）
+统一 Elo 标准化、WDL logits→softmax 概率→Q、终局真值入口。所有生成/arena/评估调用此入口。
+
+### 6.2 Arena 重写
+旧 arena 的 `_expand_search` 仅做 1 层估值即撤回，不是递归搜索（review 归类为"不是设计的搜索"）。
+修复：arena 复用 `stateseq.gumbel.order_halving`（生产搜索后端），expand 函数只使用发起方模型。
+验证：A/A 从 threefold→checkmate 确认递归搜索生效；A/B 从 0/64/0→12/0/20（62.5%）揭示真实棋力差异。
+
+### 6.3 训练器修复
+- 合法掩码：`forward_train` 在 policy loss 前执行 `apply_legal_mask`
+- 重建权重：显式 `w_r_start=w_r_end=0.1`，禁用 Stage A 的退火继承
+- 检查点：短轮次强制保存完整 `latest.pt`（含 opt/sched）
+- dyn 时间索引：`actions[:,:-1]` 而非 `actions[:,1:]`
+
+### 6.4 评估脚本修复
+- `eval_dual_checkpoint.py`：标准化 Elo + 每 ply 按行棋方翻转 result
+- `dataset_selfplay.py`：`elo_std` 从存储的 `elo_mean` 标准化计算（非写死 0）
+
+**不涉及模型架构或超参变动。**

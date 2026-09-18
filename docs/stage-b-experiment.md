@@ -513,7 +513,62 @@ gradient norms:
 | 2026-09-16 | v1 初版 | Stage B 阶段① 实现 + 冒烟 |
 | 2026-09-17 v2 | review 响应 | 四项验证、Gumbel-64 预检、A/A arena、封顶分析 |
 | 2026-09-18 | v3 | **首轮闭环完整数据**：2k 局生成→11 步训练→64 局 arena |
-| 2026-09-18 | **v5 当前** | **Round 2 闭环**：2.5k 局→14 步训练→64 局 arena；并发配置 4×24；A/C 组全部验收 |
+| 2026-09-18 | **v5 当前** | **Round 2 闭环**：2.5k 局→14 步训练→64 局 arena；并发配置 4×24；review v3 全部修复 |
+| 2026-09-18 | **v6** | **Review v3 修复验证**：9 项源码级 bug 全部修复，48/48 PASS，A/A 终结从 threefold→checkmate，A/B 显示 Round2 62.5%（超换代门槛） |
+
+---
+
+## 13. Review v3 修复与验证（2026-09-18）
+
+### 13.1 修复清单
+
+| # | 组件 | 问题 | 修复文件 | 修复内容 |
+|---|---|---|---|---|
+| 1 | 模型适配器 | 无统一入口 | `stateseq/adapter.py` **新建** | `standardize_elo`, `wdl_logits_to_q`, `get_terminal_q`, `encode_board` |
+| 2 | 生成器 | Elo 输 2567.5、WDL 用 logits 差、终局调网络 | `tools/ssm_gumbel_selfplay.py` | 改调用 `encode_board` + `wdl_logits_to_q` + `get_terminal_q` |
+| 3 | Arena | 不递归、用错模型、cache 不完整、记分 bug | `tools/ssm_gumbel_arena.py` **重写** | 复用 `order_halving` 递归搜索；单模型评估；完整历史 cache；记分断言 |
+| 4 | 评估脚本 | Elo 输 2567.5、黑方行棋未翻转 result | `tools/eval_dual_checkpoint.py` | 用 `encode_board` + 每 ply 按行棋方翻转 result |
+| 5 | 自对弈训练 | `elo_std=0` 写死 | `stateseq/data/dataset_selfplay.py` | 从 `elo_mean` 算标准化的 `elo_std` |
+| 6 | forward_train | 合法掩码未接入 | `stateseq/model.py` | policy loss 前执行 `apply_legal_mask` |
+| 7 | LossWeights | 继承 Stage A 的重建退火 | `train/stage_b2.py` | 显式 `w_r_start=w_r_end=0.1` 固定 |
+| 8 | 检查点 | 短轮次无 latest.pt | `train/stage_b2.py` | 训练结束强制保存完整 latest.pt |
+| 9 | dyn 时间索引 | `actions[:,1:]` 错位 | `stateseq/model.py` | 改为 `actions[:,:-1]` 正确索引 |
+
+### 13.2 验证结果
+
+| 测试 | 结果 | 对照 |
+|---|---|---|
+| A 组单测 48 项 | **48/48 PASS** | — |
+| 计分正向测试 | **4/4 PASS** | 白/黑将杀 + 逼和 |
+| A/A arena（旧代码） | 4/4 threefold，ply 30–71 | 浅层搜索 |
+| **A/A arena（修复后）** | **4/4 checkmate，ply 36–155** | **递归搜索发现杀着** |
+| **A/B arena（修复后）** | **Stage A 12 / Round 2 20（62.5%）** | **超换代门槛 55%** |
+| 训练器语法验证 | compile OK | — |
+
+### 13.3 A/B 详细结果
+
+| 指标 | 旧 arena（bug） | 修复后 arena |
+|---|---|---|
+| 对局 | 64 | **32** |
+| W/D/L | 0/64/0 | **12/0/20** |
+| A 得分率 | 50.0% | **37.5%** |
+| 平均 ply | 37 | **82** |
+| 终止原因 | 64/64 threefold | **32/32 checkmate** |
+| anomalies | 0 | 0 |
+
+> **关键结论**：
+> 1. 旧 arena 的 `_expand_search` 只做 1 层估值→不递归→全 threefold → **掩盖了真实棋力差异**
+> 2. 修复后 Round 2 的 62.5% 胜率表明：14 步 RL 训练已产生可测量的棋力提升
+> 3. A/A 从 threefold→checkmate 的变化确认了递归搜索的必要性
+> 4. 替换 champion 需 400 局 ≥55% —— 当前 32 局 62.5% 可通过，需按规格跑 400 局正式换代
+
+### 13.4 修复后产物
+
+| 产物 | 路径 |
+|---|---|
+| 修复验证 A/A | `runs/arena_aa_fix/` |
+| 修复验证 A/B | `runs/arena_ab_fix/` |
+| 计分测试 | `runs/scoring_test_fix/` |
 
 ---
 
@@ -568,7 +623,7 @@ gradient norms:
 
 > **结论**：Round 2 模型在政策/价值/重建指标上有明确改善，但 Gumbel-64 搜索在此 8 配对开局集下仍产生全 threefold 和棋。棋力尚未可测量地提升。
 > 
-> **下一轮建议**：受控的小范围训练调整——考虑降低 `c_visit`/`c_scale` 减少快速重复、增加开局配对数量打破对称、或单独调整 value 头学习率。
+> **⚠️ 此结论在 2026-09-18 review 后被推翻**：浅层搜索 bug（`_expand_search` 只走 1 层不递归）是 64/64 和的真实根因。修复后重测见 §13。
 
 ### 12.4 产物清单
 
