@@ -1,0 +1,468 @@
+From 784dc646b31ca148dcfa77d9d04063843b56c8ab Mon Sep 17 00:00:00 2001
+From: jeefy <jeefy163@163.com>
+Date: Sat, 19 Sep 2026 20:55:41 +0800
+Subject: [PATCH] =?UTF-8?q?fix:=20=E7=BB=88=E5=B1=80=E8=A3=81=E5=86=B3?=
+ =?UTF-8?q?=E5=8F=A3=E5=BE=84=E7=BB=9F=E4=B8=80=20+=20arena=20=E5=BC=80?=
+ =?UTF-8?q?=E5=B1=80=20encode-before-move?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+1) 生成器 result() 用严格 is_repetition(3)/is_fifty_moves() 分类，而对局循环用
+   is_game_over(claim_draw=True) 退出，差一 ply → 规则申和局全部被兜底记为"300 ply
+   封顶截断"。实测 gen2k 前 400 局：218 条 truncated 中 173 条（79%）实为申和，
+   真实封顶率 11% 而非 54%。新增 adapter.classify_final_board 作为唯一裁决入口，
+   生成器与 arena 共用。
+2) arena 开局库写成 push→advance，导致初始局面 B₀ 从未入 R、最后一个开局局面被
+   重复步进两次（occurrence 也多记一次）。改为 encode-before-move。
+3) _play_ply 中 _resolve_move 返回 None 时改为 raise，不再静默结束对局。
+4) 新增 tools/repair_v3_meta.py：按棋盘重放就地重算已有分片的 meta 三字段
+   （动作/π′/z 均正确，无需重跑生成）。
+5) 新增 tests/test_termination_classify.py 回归覆盖以上两处。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ stateseq/adapter.py                |  48 ++++++++---
+ tests/test_termination_classify.py | 128 +++++++++++++++++++++++++++++
+ tools/repair_v3_meta.py            | 128 +++++++++++++++++++++++++++++
+ tools/ssm_gumbel_arena.py          |  21 ++---
+ tools/ssm_gumbel_selfplay.py       |  25 +++---
+ 5 files changed, 310 insertions(+), 40 deletions(-)
+ create mode 100644 tests/test_termination_classify.py
+ create mode 100644 tools/repair_v3_meta.py
+
+diff --git a/stateseq/adapter.py b/stateseq/adapter.py
+index 228037a..571fe72 100644
+--- a/stateseq/adapter.py
++++ b/stateseq/adapter.py
+@@ -83,22 +83,48 @@ def get_termination_reason(board: chess.Board, max_plies: int, ply: int) -> tupl
+     return "unknown", False
+ 
+ 
++# python-chess Termination → v3 meta 的 termination_reason 口径（§2.5）。
++# 五次重复/七十五步是强制终局，与"可申和"的三次重复/五十步同因，归入同一编码。
++_TERMINATION_TO_REASON = {
++    chess.Termination.CHECKMATE: "checkmate",
++    chess.Termination.STALEMATE: "stalemate",
++    chess.Termination.INSUFFICIENT_MATERIAL: "insufficient_material",
++    chess.Termination.FIFTY_MOVES: "fifty_move",
++    chess.Termination.SEVENTYFIVE_MOVES: "fifty_move",
++    chess.Termination.THREEFOLD_REPETITION: "threefold",
++    chess.Termination.FIVEFOLD_REPETITION: "threefold",
++}
++
++
+ # 从分片读取时重构终止原因（不依赖 max_plies，用实际 n_plies 判断）
+ def get_termination_reason_from_board(board: chess.Board) -> tuple[str, bool]:
+     outcome = board.outcome(claim_draw=True)
+     if outcome is None:
+         return "unknown", False
+-    if outcome.termination == chess.Termination.CHECKMATE:
+-        return "checkmate", False
+-    if outcome.termination == chess.Termination.STALEMATE:
+-        return "stalemate", False
+-    if outcome.termination == chess.Termination.INSUFFICIENT_MATERIAL:
+-        return "insufficient_material", False
+-    if outcome.termination == chess.Termination.FIFTY_MOVES:
+-        return "fifty_move", False
+-    if outcome.termination == chess.Termination.THREEFOLD_REPETITION:
+-        return "threefold", False
+-    return "unknown", False
++    return _TERMINATION_TO_REASON.get(outcome.termination, "unknown"), False
++
++
++def classify_final_board(board: chess.Board) -> tuple[int, str, bool]:
++    """终局裁决唯一入口 → (result 白视角 0 胜/1 和/2 负, termination_reason, is_truncated)。
++
++    口径必须与对局循环的退出条件 `is_game_over(claim_draw=True)` 一致：该语义把"下一着
++    可申和"的三次重复/五十步也算终局，而 `board.is_repetition(3)` / `is_fifty_moves()`
++    是**严格**判定，两者差一 ply。曾因此把 78% 的规则申和局错记为"300 ply 封顶截断"
++    （2026-09-19 实测 gen2k：218 条 truncated 中 173 条实为申和），连带污染封顶率统计与
++    mlh 有效位。这里统一以 `outcome(claim_draw=True)` 为准，**只有规则未终局**（= 走满
++    max_plies）才是真截断。
++    """
++    outcome = board.outcome(claim_draw=True)
++    if outcome is None:
++        return 1, "truncated", True
++    if outcome.winner is None:
++        result = 1
++    else:
++        result = 0 if outcome.winner == chess.WHITE else 2
++    reason = _TERMINATION_TO_REASON.get(outcome.termination)
++    if reason is None:  # 标准国际象棋不应出现（variant 终止）
++        raise ValueError(f"未知终止原因 {outcome.termination} @ {board.fen()}")
++    return result, reason, False
+ 
+ 
+ def encode_board(board: chess.Board, occurrence: int = 0) -> np.ndarray:
+diff --git a/tests/test_termination_classify.py b/tests/test_termination_classify.py
+new file mode 100644
+index 0000000..f92dcf3
+--- /dev/null
++++ b/tests/test_termination_classify.py
+@@ -0,0 +1,128 @@
++"""回归：终局裁决口径必须与对局循环退出条件（claim_draw=True）一致。
++
++背景 bug（2026-09-19 实测）：生成器用 `is_repetition(3)` / `is_fifty_moves()`（严格判定）
++分类，而对局循环用 `is_game_over(claim_draw=True)`（含"下一着可申和"）退出，差一 ply →
++规则申和局全部掉进兜底分支被记为"300 ply 封顶截断"。gen2k 前 400 局中 173/218 条如此。
++
++另覆盖 arena 开局库的 encode-before-move 口径（B₀ 必须入 R、且无局面重复步进）。
++"""
++
++from __future__ import annotations
++
++import unittest
++
++import chess
++import numpy as np
++import torch
++
++from stateseq.adapter import classify_final_board
++from stateseq.gumbel import TERM_CODES
++
++
++def _claimable_threefold_board() -> chess.Board:
++    """马来回走 7 个半回合：此时"下一着可申和"成立，但严格三次重复尚未成立。"""
++    board = chess.Board()
++    for san in ("Nf3", "Nf6", "Ng1", "Ng8", "Nf3", "Nf6", "Ng1"):
++        board.push_san(san)
++    return board
++
++
++class TerminationClassifyTest(unittest.TestCase):
++    def test_claimable_threefold_is_not_truncated(self):
++        board = _claimable_threefold_board()
++        # 这正是 bug 触发条件：循环认为终局，严格判定认为没有
++        self.assertTrue(board.is_game_over(claim_draw=True))
++        self.assertFalse(board.is_repetition(3))
++
++        result, reason, is_truncated = classify_final_board(board)
++        self.assertEqual(reason, "threefold")
++        self.assertFalse(is_truncated)
++        self.assertEqual(result, 1)  # 和棋（白视角）
++        self.assertIn(reason, TERM_CODES)
++
++    def test_unfinished_game_is_truncated(self):
++        board = chess.Board()
++        board.push_san("e4")
++        result, reason, is_truncated = classify_final_board(board)
++        self.assertEqual(reason, "truncated")
++        self.assertTrue(is_truncated)
++        self.assertEqual(result, 1)
++
++    def test_checkmate_result_is_white_perspective(self):
++        board = chess.Board()
++        for san in ("f3", "e5", "g4", "Qh4#"):
++            board.push_san(san)
++        result, reason, is_truncated = classify_final_board(board)
++        self.assertEqual(reason, "checkmate")
++        self.assertFalse(is_truncated)
++        self.assertEqual(result, 2)  # 黑胜
++
++    def test_stalemate_and_insufficient_material(self):
++        stale = chess.Board("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1")
++        self.assertEqual(classify_final_board(stale)[1], "stalemate")
++        bare = chess.Board("8/8/4k3/8/8/4K3/8/8 w - - 0 1")
++        self.assertEqual(classify_final_board(bare)[1], "insufficient_material")
++
++    def test_generator_result_uses_same_verdict(self):
++        """生成器 GameState.result() 必须与 classify_final_board 同口径。"""
++        from tools.ssm_gumbel_selfplay import GameState
++
++        game = GameState.__new__(GameState)  # 不触发模型加载
++        game.board = _claimable_threefold_board()
++        result, code, is_truncated = game.result()
++        self.assertEqual(TERM_CODES[code], "threefold")
++        self.assertFalse(is_truncated)
++        self.assertEqual(result, 1)
++
++
++class _RecordingModel:
++    """最小 ArenaModel 替身：记录每次 step 的 785 维特征。"""
++
++    device = "cpu"
++
++    def __init__(self):
++        self.ckpt_path = "fake"
++        self.feats: list[np.ndarray] = []
++
++    def initial_cache(self, b: int = 1):
++        return [(torch.zeros(1), torch.zeros(1))]
++
++    def step(self, feats, tc, elo, color, cache):
++        self.feats.append(np.asarray(feats, dtype=np.float32).reshape(-1).copy())
++        logits = np.zeros((1, 1936), dtype=np.float32)
++        wdl = np.zeros((1, 3), dtype=np.float32)
++        n = cache[0][0] + 1.0
++        return logits, wdl, np.zeros((1, 1), np.float32), np.zeros((1, 512), np.float32), [(n, n)]
++
++
++class ArenaOpeningHistoryTest(unittest.TestCase):
++    """开局库必须 encode-before-move：B₀ 入 R，且没有局面被重复步进。"""
++
++    def test_opening_positions_each_encoded_once(self):
++        from stateseq.adapter import encode_board
++        from tools.ssm_gumbel_arena import _board_key, play_one_game
++
++        cfg = type("cfg", (), {"n_sims": 2, "m0": 2, "max_plies": 0,
++                               "c_visit": 50.0, "c_scale": 1.0})()
++        mw, mb = _RecordingModel(), _RecordingModel()
++        opening = "e4 e5 Nf3"
++        play_one_game(mw, mb, cfg, opening_san=opening, opening_id=0)
++
++        # max_plies=0 → 只跑开局；双方各步进 len(tokens) 次
++        tokens = opening.split()
++        self.assertEqual(len(mw.feats), len(tokens))
++
++        expected = []
++        board = chess.Board()
++        occ: dict = {}
++        for san in tokens:
++            key = _board_key(board)
++            expected.append(encode_board(board, occ.get(key, 0))[0])
++            occ[key] = occ.get(key, 0) + 1
++            board.push_san(san)
++        for got, want in zip(mw.feats, expected):
++            np.testing.assert_array_equal(got, want)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tools/repair_v3_meta.py b/tools/repair_v3_meta.py
+new file mode 100644
+index 0000000..536b1b1
+--- /dev/null
++++ b/tools/repair_v3_meta.py
+@@ -0,0 +1,128 @@
++"""修复 v3 分片的终止元信息（termination_reason / is_truncated / result）。
++
++背景：生成器 `GameState.result()` 曾用 `is_repetition(3)` / `is_fifty_moves()`（**严格**判定）
++分类终局，而对局循环用 `is_game_over(claim_draw=True)`（含"下一着可申和"）退出——两者差一 ply，
++于是所有规则申和局都落到兜底分支被记成"300 ply 封顶截断"。实测 gen2k 前 400 局：218 条
++truncated 中 173 条（79%）实为三次重复/五十步申和，真实封顶率 11% 而非 54%。
++
++影响面仅限 meta 三字段：动作序列、π′ 目标、z 标签（申和局本就记和）均正确，因此**不需要重跑生成**，
++按棋盘重放重算 meta 即可。本工具就地重写 `.meta.npz`（原子替换）并刷新 manifest 的 gen 统计。
++
++用法：
++    python tools/repair_v3_meta.py runs/stage_b_gen2k [--dry-run]
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import sys
++import tempfile
++
++import chess
++import numpy as np
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++from stateseq.actions import move_to_action
++from stateseq.adapter import classify_final_board
++from stateseq.gumbel import TERM_CODES
++
++
++def _resolve_move(action: int, board: chess.Board) -> chess.Move | None:
++    for m in board.legal_moves:
++        if move_to_action(m) == action:
++            return m
++    return None
++
++
++def replay_final_board(actions: np.ndarray) -> chess.Board:
++    board = chess.Board()
++    for a in actions:
++        mv = _resolve_move(int(a), board)
++        if mv is None:
++            raise ValueError(f"动作 {int(a)} 在 {board.fen()} 上不合法（分片数据损坏）")
++        board.push(mv)
++    return board
++
++
++def repair_shard(base: str, dry_run: bool) -> dict:
++    npz = np.load(base + ".meta.npz")
++    metas = npz["metas"].copy()
++    offsets = npz["offsets"]
++    pool = np.memmap(base + ".actions.bin", dtype=np.uint16, mode="r")
++
++    stats = {"games": len(metas), "reason_changed": 0, "trunc_changed": 0,
++             "result_changed": 0, "before": {}, "after": {}}
++    for i in range(len(metas)):
++        start, n = int(offsets[i]), int(metas[i]["n_plies"])
++        board = replay_final_board(np.asarray(pool[start:start + n]))
++        result, reason, is_truncated = classify_final_board(board)
++        code = TERM_CODES.index(reason)
++        old_reason = TERM_CODES[int(metas[i]["termination_reason"])]
++        stats["before"][old_reason] = stats["before"].get(old_reason, 0) + 1
++        stats["after"][reason] = stats["after"].get(reason, 0) + 1
++        if int(metas[i]["termination_reason"]) != code:
++            stats["reason_changed"] += 1
++            metas[i]["termination_reason"] = code
++        if int(metas[i]["is_truncated"]) != int(is_truncated):
++            stats["trunc_changed"] += 1
++            metas[i]["is_truncated"] = 1 if is_truncated else 0
++        if int(metas[i]["result"]) != result:
++            stats["result_changed"] += 1
++            metas[i]["result"] = result
++
++    if not dry_run:
++        d = os.path.dirname(base)
++        fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
++        os.close(fd)
++        with open(tmp, "wb") as fh:
++            np.savez(fh, metas=metas, offsets=offsets)
++        os.replace(tmp, base + ".meta.npz")
++    return stats
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("shard_dir")
++    ap.add_argument("--dry-run", action="store_true")
++    args = ap.parse_args()
++
++    mpath = os.path.join(args.shard_dir, "manifest.json")
++    with open(mpath, encoding="utf-8") as fh:
++        manifest = json.load(fh)
++
++    total = {"games": 0, "reason_changed": 0, "trunc_changed": 0, "result_changed": 0}
++    before: dict[str, int] = {}
++    after: dict[str, int] = {}
++    for name in manifest["shards"]:
++        st = repair_shard(os.path.join(args.shard_dir, name), args.dry_run)
++        for k in total:
++            total[k] += st[k]
++        for k, v in st["before"].items():
++            before[k] = before.get(k, 0) + v
++        for k, v in st["after"].items():
++            after[k] = after.get(k, 0) + v
++        print(f"  {name}: {st['games']} 局，reason 改 {st['reason_changed']}，"
++              f"is_truncated 改 {st['trunc_changed']}，result 改 {st['result_changed']}")
++
++    n = max(total["games"], 1)
++    print(f"\n合计 {total['games']} 局：termination_reason 修正 {total['reason_changed']}，"
++          f"is_truncated 修正 {total['trunc_changed']}，result 修正 {total['result_changed']}")
++    print("修复前分布:", {k: f"{v} ({v/n:.1%})" for k, v in sorted(before.items())})
++    print("修复后分布:", {k: f"{v} ({v/n:.1%})" for k, v in sorted(after.items())})
++
++    if not args.dry_run:
++        gen = manifest.get("gen", {})
++        gen["termination_reason_counts"] = {k: after.get(k, 0) for k in TERM_CODES}
++        gen["truncated_rate"] = after.get("truncated", 0) / n
++        gen["meta_repaired"] = "termination_reason/is_truncated 按 claim_draw 口径重算"
++        manifest["gen"] = gen
++        with open(mpath, "w", encoding="utf-8") as fh:
++            json.dump(manifest, fh, ensure_ascii=False, indent=1)
++        print(f"manifest 已更新：真实封顶率 {gen['truncated_rate']:.1%}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/ssm_gumbel_arena.py b/tools/ssm_gumbel_arena.py
+index 070345b..db27a22 100644
+--- a/tools/ssm_gumbel_arena.py
++++ b/tools/ssm_gumbel_arena.py
+@@ -35,7 +35,7 @@ from stateseq.model_r import clone_cache
+ from stateseq.gumbel import C_SCALE, C_VISIT, Node, order_halving
+ from stateseq.adapter import (
+     encode_board, standardize_elo, wdl_logits_to_q,
+-    get_terminal_q, get_termination_reason_from_board,
++    get_terminal_q, classify_final_board,
+ )
+ 
+ # ---- 开局库（ECO 经典变例）----
+@@ -234,9 +234,12 @@ def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
+         return mover_logits, mover_wdl
+ 
+     if opening_san:
++        # 先编码当前局面再落子（encode-before-move），与生成器 / 训练重放同口径：
++        # 序列是 B₀,B₁,…，每个局面恰好进 R 一次。此前写成 push→advance，导致初始局面
++        # B₀ 从未入 R、而最后一个开局局面被重复步进两次（occurrence 也多记一次）。
+         for token in opening_san.split():
+-            board.push_san(token)
+             _advance()
++            board.push_san(token)
+ 
+     for ply in range(cfg.max_plies):
+         if board.is_game_over(claim_draw=True):
+@@ -271,20 +274,10 @@ def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
+             break
+         board.push(mv)
+ 
+-    term_reason, _ = get_termination_reason_from_board(board)
+-    if term_reason == "unknown":
+-        term_reason = "truncated"
+-    is_truncated = term_reason == "truncated"
++    # 终局裁决与生成器共用唯一入口（claim_draw=True 口径；未终局 = 走满 max_plies）
++    our_result, term_reason, is_truncated = classify_final_board(board)
+     result_str = _result_str(board)
+ 
+-    outcome = board.outcome(claim_draw=True)
+-    if outcome is None or outcome.winner is None:
+-        our_result = 1  # draw
+-    elif outcome.winner == chess.WHITE:
+-        our_result = 0  # white wins
+-    else:
+-        our_result = 2  # black wins
+-
+     game_pgn = chess.pgn.Game.from_board(board)
+     return {
+         "opening_id": opening_id,
+diff --git a/tools/ssm_gumbel_selfplay.py b/tools/ssm_gumbel_selfplay.py
+index 95dbcb5..8a43cee 100644
+--- a/tools/ssm_gumbel_selfplay.py
++++ b/tools/ssm_gumbel_selfplay.py
+@@ -31,7 +31,7 @@ from stateseq.actions import move_to_action
+ from stateseq.conditions import TimeControlBucket
+ from stateseq.data.sequences import _board_key
+ from stateseq.adapter import (
+-    encode_board, wdl_logits_to_q, get_terminal_q,
++    encode_board, wdl_logits_to_q, get_terminal_q, classify_final_board,
+ )
+ from stateseq.gumbel import (
+     C_SCALE,
+@@ -232,8 +232,8 @@ class GameState:
+         self.pipol_probs.append(probs.astype(np.float32))
+ 
+         move = _resolve_move(chosen, self.board)
+-        if move is None:
+-            return False
++        if move is None:  # 搜索只在合法着上选择，走到这里说明动作编解码已损坏
++            raise RuntimeError(f"选中动作 {chosen} 在 {self.board.fen()} 上不合法")
+         self.board.push(move)
+         return True
+ 
+@@ -368,18 +368,13 @@ class GameState:
+                 "sims_used": sims_used, "max_depth": counters["max_depth"]}
+ 
+     def result(self) -> tuple[int, int, bool]:
+-        if self.board.is_checkmate():
+-            r = 0 if self.board.turn == chess.BLACK else 2
+-            return r, TERM_CODES.index("checkmate"), False
+-        if self.board.is_stalemate():
+-            return 1, TERM_CODES.index("stalemate"), False
+-        if self.board.is_fifty_moves():
+-            return 1, TERM_CODES.index("fifty_move"), False
+-        if self.board.is_repetition(3):
+-            return 1, TERM_CODES.index("threefold"), False
+-        if self.board.is_insufficient_material():
+-            return 1, TERM_CODES.index("insufficient_material"), False
+-        return 1, TERM_CODES.index("truncated"), True
++        """→ (result 白视角 0/1/2, termination_reason 编码, is_truncated)。
++
++        统一走 `adapter.classify_final_board`（口径 = 对局循环的 claim_draw=True），
++        只有规则未终局才是 300 ply 封顶截断。
++        """
++        result, reason, is_truncated = classify_final_board(self.board)
++        return result, TERM_CODES.index(reason), is_truncated
+ 
+ 
+ # ------------------------- 驱动器：跨局拼批 + 槽位复用 -------------------------
+-- 
+2.53.0.windows.2
+
