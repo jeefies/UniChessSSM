@@ -71,3 +71,76 @@
 | 单测 48 项 | 48/48 PASS | 48/48 PASS |
 
 **不涉及模型架构或超参变动。**
+
+## 7. Review 2026-09-19 第二轮：终局裁决口径 bug（commit 784dc64）
+
+### 7.1 审查范围与方法
+对 `gumbel.py` / `ssm_gumbel_selfplay.py` / `ssm_gumbel_arena.py` / `adapter.py` /
+`gshards.py` / `losses.py` / `dataset*.py` / `model*.py` / `train/stage_b2.py` 做规格–代码
+逐条比对，并在远端 GPU 上做两项实测验证（分片重放审计、σ 归一化在线探针）。
+
+### 7.2 发现与修复
+
+| # | 严重度 | 位置 | 问题 | 修复 |
+|---|---|---|---|---|
+| A | CRITICAL | `ssm_gumbel_selfplay.py::GameState.result` | 分类用**严格**判定 `is_repetition(3)`/`is_fifty_moves()`，而对局循环用 `is_game_over(claim_draw=True)` 退出——后者含"下一着可申和"，早一 ply。规则申和局全部掉进兜底分支被记成"300 ply 封顶截断" | 新增 `adapter.classify_final_board` 为唯一裁决入口，生成器 + arena 共用 |
+| B | CRITICAL | `ssm_gumbel_arena.py::play_one_game` | 开局库写成 `push_san → _advance`，初始局面 B₀ 从未入 R，最后一个开局局面被重复步进两次且 occurrence 多记一次 | 改为 encode-before-move（`_advance → push_san`） |
+| C | WARNING | `ssm_gumbel_selfplay.py::_play_ply` | `_resolve_move` 返回 None 时静默 `return False`，会把编解码损坏伪装成正常终局 | 改为 `raise RuntimeError` |
+
+### 7.3 实测验证（bug A 的影响面）
+
+重放全部分片动作序列、按 `claim_draw=True` 口径重算：
+
+| 数据集 | 局数 | 封顶率（修复前记录） | 封顶率（实际） | reason 修正 | **result 修正** |
+|---|---|---|---|---|---|
+| `stage_b_gen2k` | 2,000 | 54.2% | **15.9%** | 766 | **0** |
+| `stage_b_gen_round2` | 2,500 | 53.0% | **16.8%** | 906 | **0** |
+| `stage_b_val64` | 256 | 50.8% | **11.3%** | 101 | **0** |
+
+关键结论：**`result`（z 标签）修正数为 0** ——申和局本就记和，动作序列 / π′ / z 全部正确，
+因此**不需要重跑 9.3 小时的自对弈生成**，只需就地重算 meta 三字段
+（`tools/repair_v3_meta.py`，已对以上三个目录执行）。
+
+修复后真实终局分布（gen2k）：checkmate 33.2% / threefold 38.0% / truncated 15.9% /
+stalemate 7.2% / insufficient_material 5.4% / fifty_move 0.3%。
+**三次重复是仅次于将杀的第二大终局原因**，而非此前记录的"0 局"。
+
+### 7.4 连带失效的既有结论
+
+- `docs/stage-b-experiment.md` §4.1「记录 vs 实际终止不匹配 0 局」「实际五十步和棋 0 / 实际三次重复 0」——**错误**。
+- 同文 §8「封顶问题专题」：其假设表以"五十步=0、三次重复=0"为由否决了「重复/五十步绕行导致封顶」，
+  该否决的前提不成立，整节分析作废。真实封顶率仅 ~16%。
+- `mlh_valid_mask` 此前错误剔除 ~54% 的对局；修复后 gen2k 有效局从 46% 升至 **84.1%**，
+  round2 升至 **83.2%**。moves-left 头的有效训练样本翻倍。
+- Arena A/A 16/16 与 A/B 28/4 因 bug B 失效，已重跑（见 §7.6）。
+
+### 7.5 记录在案但未改动的偏离
+
+1. **q̂ 归一化的视角混用**（`gumbel.py`）：`qbox` 以 `root.q`（父视角）起算、用 `child.q`
+   （子视角）扩展，再去归一化父视角的 `completed_q`。论文为每节点独立归一。在线探针
+   28,540 次调用实测：span 中位 1.83（混用是**放大**而非压缩量程），q̂ 越界 [0,1] 仅 4.6%
+   （范围 −1.68…1.86），σ 展幅 p50 1.2 / p90 15.8 / max 114。不发散，暂记为偏离与风险项，
+   不触发重跑；后续可改为逐节点归一并做 A/B。
+2. **来源权重未归一**：自对弈 0.85 + 人类 0.10 = 0.95（谜题 0.05 未接线），等效缩放了学习率 5%。
+3. **π′ 熵与文档不符**：`docs/stage-b-experiment.md` §4.3 记 H(π′)=0.0605、75% 硬目标，
+   §11.3 记 1.94。当前 gen2k 实测 **均值 1.2644 / 中位 1.4447 / 零熵 8.1% / max_prob>0.999 占 8.5%**，
+   §4.3 的数字不描述当前数据，已在实验文档更正。
+
+### 7.6 回归与重跑
+
+- 新增 `tests/test_termination_classify.py`（6 项）：可申和三次重复 → `threefold` 且非截断、
+  未终局 → `truncated`、将杀 result 白视角映射、逼和/子力不足、生成器 `result()` 同口径、
+  arena 开局每个局面恰好入 R 一次。
+- 全量单测 **70/70 PASS**（A 组门禁满足）。
+- Arena A/A 与 A/B 按修复后代码重跑（`runs/arena_aa_round4` / `runs/arena_ab_round4`）：
+
+| 对局 | 修复前 | **修复后** |
+|---|---|---|
+| A/A（Stage A vs 自身，4 局） | 2/2，50%，4 checkmate | **2/2，50%，4 checkmate，0 anomaly** |
+| A/B（Stage A vs Round 2，32 局） | 28/0/4，**87.5%**，218s | **22/2/8，71.9%，1,762s，30 checkmate + 2 子力不足** |
+
+Stage A 强于 Round 2 的方向不变（Round 2 不应晋级），但优势幅度从 87.5% 回落到 71.9%
+——此前被错误的开局历史放大。用时 8× 增长与非将杀终局的出现，是"历史正确后棋力表现
+更合理"的旁证。32 局置信区间仍宽（±~16pp），正式换代须按 §2.8 C 组跑 400 局。
+
+**不涉及模型架构或超参变动。**
