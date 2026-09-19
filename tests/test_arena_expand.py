@@ -72,7 +72,7 @@ class ArenaExpandTest(unittest.TestCase):
         b_after = chess.Board()
         b_after.push_uci("e2e4")
         exp_feats, _, _, _ = encode_board(b_after, 0)
-        np.testing.assert_array_equal(self.model.calls[-1][0], exp_feats.reshape(1, -1))
+        np.testing.assert_array_equal(self.model.calls[-1], exp_feats.reshape(1, -1))
 
         # 深度 2：必须从根重放 a1，再评估 a2 —— 特征等于 根+a1+a2
         a2 = _aid("e7e5")
@@ -83,7 +83,7 @@ class ArenaExpandTest(unittest.TestCase):
         b2.push_uci("e2e4")
         b2.push_uci("e7e5")
         exp2, _, _, _ = encode_board(b2, 0)
-        np.testing.assert_array_equal(self.model.calls[-1][0], exp2.reshape(1, -1))
+        np.testing.assert_array_equal(self.model.calls[-1], exp2.reshape(1, -1))
 
     def test_occurrence_encode_before_increment(self):
         # 走 4 步回到初始局面：根已计 1 次 → 该局面此前出现 2 次 → is2=1, is1=0
@@ -94,7 +94,7 @@ class ArenaExpandTest(unittest.TestCase):
             node = _expand_child(self.model, self.board, self.cache, self.occur, node, _aid(uci))
         leaf = _expand_child(self.model, self.board, self.cache, self.occur, node, _aid("f6g8"))
         self.assertEqual(leaf.path, (_aid("g1f3"), _aid("g8f6"), _aid("f3g1"), _aid("f6g8")))
-        feats = self.model.calls[-1][0][0]
+        feats = self.model.calls[-1][0]
         self.assertEqual(float(feats[783]), 0.0, "is1 应为 0（此前出现 2 次）")
         self.assertEqual(float(feats[784]), 1.0, "is2 应为 1（此前出现 ≥2 次）")
 
