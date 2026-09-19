@@ -381,6 +381,35 @@ class V3ShardReader:
         }
 
 
+def validate_v3_pipol(pipol_actions, pipol_probs, n_plies: int,
+                      legal_masks: np.ndarray | None = None,
+                      prob_sum_lo: float = 0.99, prob_sum_hi: float = 1.01) -> None:
+    """v3 π′ 读取端完整性校验（规格 §2.5）：概率和 ∈ [lo, hi]；支持集与规则引擎一致。
+
+    legal_masks 提供时（(n_plies, NUM_ACTIONS) bool，训练加载器重放可得）额外校验：
+    支持集大小 == 当步合法着数、且每个目标动作都在合法掩码内。
+    任何不一致 raise ValueError——调用方据此拒绝该批（数据完整性错误）。
+    """
+    if pipol_actions is None or pipol_probs is None:
+        raise ValueError("v3 分片缺少 π′ 目标（pipol）")
+    if len(pipol_actions) < n_plies or len(pipol_probs) < n_plies:
+        raise ValueError(f"pipol 记录数不足：{len(pipol_actions)}/{len(pipol_probs)} < {n_plies}")
+    for t in range(n_plies):
+        acts = np.asarray(pipol_actions[t])
+        probs = np.asarray(pipol_probs[t], dtype=np.float64)
+        if len(acts) == 0 or len(acts) != len(probs):
+            raise ValueError(f"ply {t}: 非法 π′ 支持集大小 acts={len(acts)} probs={len(probs)}")
+        s = float(probs.sum())
+        if not (prob_sum_lo <= s <= prob_sum_hi):
+            raise ValueError(f"ply {t}: π′ 概率和 {s:.4f} 超出 [{prob_sum_lo}, {prob_sum_hi}]")
+        if legal_masks is not None:
+            mask = np.asarray(legal_masks[t])
+            if int(mask.sum()) != len(acts):
+                raise ValueError(f"ply {t}: π′ 支持集 {len(acts)} != 规则引擎合法着 {int(mask.sum())}")
+            if not bool(np.all(mask[acts.astype(np.int64)])):
+                raise ValueError(f"ply {t}: π′ 支持集含非法着法")
+
+
 def encode_v3_pipol(per_ply_actions: list[np.ndarray], per_ply_probs: list[np.ndarray]) -> bytes:
     """把每 ply 的 (legal_actions, probs) 编码为 v3 pipol 二进制。"""
     buf = bytearray()

@@ -29,20 +29,14 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from stateseq.actions import move_to_action
+from stateseq.data.sequences import _board_key
 from stateseq.model import SeqModel
 from stateseq.model_r import clone_cache
-from stateseq.gumbel import (
-    C_SCALE, C_VISIT, N_SIMS, M0,
-    Node, _Candidate, _n_rounds, completed_q, sigma, normalize_q,
-    export_pi_prime, gumbel_topm, order_halving,
-)
+from stateseq.gumbel import C_SCALE, C_VISIT, Node, order_halving
 from stateseq.adapter import (
-    encode_board, standardize_elo, wdl_logits_to_q, wdl_logits_to_probs,
-    get_terminal_q, get_termination_reason, get_termination_reason_from_board,
-    ELO_MEAN, ELO_STD,
+    encode_board, standardize_elo, wdl_logits_to_q,
+    get_terminal_q, get_termination_reason_from_board,
 )
-
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ---- 开局库（ECO 经典变例）----
 OPENINGS = [
@@ -155,19 +149,67 @@ class ArenaModel:
                 mlh.cpu().numpy(), x.cpu().numpy(), cache_new)
 
 
-# ---- 单局对弈（每局为双方各维护独立搜索，完整历史）----
+# ---- 单局对弈（每方独立模型 + 完整历史 cache/occurrence）----
+
+def _expand_child(model: ArenaModel, board: chess.Board, cache, occur: dict,
+                  node: Node, action: int) -> Node:
+    """从本方根快照重放 node.path，再展开 action（与生成器 `_expand_gen` 同口径）。
+
+    - board/cache/occur 均为**根局面**的快照（该方模型对完整历史推进后的状态）；
+    - occurrence 统一 encode-before-increment（与根节点及训练重放一致）；
+    - 路径重放动作必须合法（规则引擎权威），否则抛 RuntimeError（不得伪造终局）。
+    """
+    b_copy = board.copy()
+    cache_copy = clone_cache(cache)
+    occ_copy = dict(occur)
+    new_path = node.path + (action,)
+    for a in node.path:
+        mv = _resolve_move(a, b_copy)
+        if mv is None:
+            raise RuntimeError(f"路径重放动作 {a} 在 {b_copy.fen()} 上不合法")
+        b_copy.push(mv)
+        key = _board_key(b_copy)
+        feats, tc_val, elo_std, color = encode_board(b_copy, occ_copy.get(key, 0))
+        _, _, _, _, cache_copy = model.step(
+            np.asarray(feats, dtype=np.float32).reshape(1, -1),
+            [int(tc_val)], [float(elo_std)], [int(color)], cache_copy)
+        occ_copy[key] = occ_copy.get(key, 0) + 1
+    mv = _resolve_move(action, b_copy)
+    if mv is None:
+        raise RuntimeError(f"动作 {action} 在 {b_copy.fen()} 上不合法")
+    b_copy.push(mv)
+    if b_copy.is_game_over(claim_draw=True) or not list(b_copy.legal_moves):
+        return Node(np.array([], dtype=np.int64), np.array([], dtype=np.float32),
+                    get_terminal_q(b_copy), depth=node.depth + 1, action=action,
+                    path=new_path, terminal=True)
+    key = _board_key(b_copy)
+    feats, tc_val, elo_std, color = encode_board(b_copy, occ_copy.get(key, 0))
+    lc, wc, _, _, _ = model.step(
+        np.asarray(feats, dtype=np.float32).reshape(1, -1),
+        [int(tc_val)], [float(elo_std)], [int(color)], cache_copy)
+    q_c = wdl_logits_to_q(wc[0])
+    legal_c = _legal_actions_of(b_copy)
+    lc_np = lc[0]
+    lc_masked = np.full(1936, -3e4, dtype=np.float32)
+    lc_masked[legal_c] = lc_np[legal_c]
+    return Node(np.array(legal_c, dtype=np.int64),
+                lc_masked[np.array(legal_c)].astype(np.float32),
+                q_c, depth=node.depth + 1, action=action, path=new_path)
+
 
 def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
-                  opening_fen: str | None = None, opening_id: int = 0) -> dict:
-    models = {chess.WHITE: model_w, chess.BLACK: model_b}
-    board = chess.Board()
-    if opening_fen:
-        board = chess.Board(opening_fen)
+                  opening_san: str | None = None, opening_id: int = 0) -> dict:
+    """单局对弈：双方模型各自对**完整历史**推进 cache/occurrence，搜索复用生产 order_halving。
 
-    cache_w = model_w.initial_cache(1)
-    cache_b = model_b.initial_cache(1)
-    occur_w: dict[str, int] = {}
-    occur_b: dict[str, int] = {}
+    - 每 ply 双方模型都前进一步——每方的根快照等于"该检查点单独下完这盘棋"的 R 状态；
+    - occurrence 全局面共享（口径 = `stateseq/data/sequences.py::_board_key`）；
+    - 开局着法同样经过模型步进（不得凭空跳开局，否则历史缺失）；
+    - 终局原因：棋盘优先（`get_termination_reason_from_board`），未终局记 truncated。
+    """
+    models = {chess.WHITE: model_w, chess.BLACK: model_b}
+    caches = {chess.WHITE: model_w.initial_cache(1), chess.BLACK: model_b.initial_cache(1)}
+    board = chess.Board()
+    occur: dict = {}
     actions: list[int] = []
     anomaly = None
     n_sims = cfg.n_sims
@@ -175,82 +217,46 @@ def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
     c_visit = cfg.c_visit
     c_scale = cfg.c_scale
 
+    def _advance():
+        """当前局面：双方模型各前进一步，返回行棋方 (logits, wdl)。"""
+        key = _board_key(board)
+        feats, tc_val, elo_std, color = encode_board(board, occur.get(key, 0))
+        feats_np = np.asarray(feats, dtype=np.float32).reshape(1, -1)
+        mover_logits = None
+        mover_wdl = None
+        for side in (chess.WHITE, chess.BLACK):
+            lg, wd, _, _, new_cache = models[side].step(
+                feats_np, [int(tc_val)], [float(elo_std)], [int(color)], caches[side])
+            caches[side] = new_cache
+            if side == board.turn:
+                mover_logits, mover_wdl = lg, wd
+        occur[key] = occur.get(key, 0) + 1
+        return mover_logits, mover_wdl
+
+    if opening_san:
+        for token in opening_san.split():
+            board.push_san(token)
+            _advance()
+
     for ply in range(cfg.max_plies):
         if board.is_game_over(claim_draw=True):
             break
         turn = board.turn
-        model = models[turn]
-        cache_turn = cache_w if turn == chess.WHITE else cache_b
-        occur_turn = occur_w if turn == chess.WHITE else occur_b
 
-        # 前向：用当前方的模型和 cache
-        feats, tc_val, elo_std, color = encode_board(board, occur_turn.get(board.fen().split(" ")[0], 0))
-        logits_np, wdl_np, _, _, cache_new = model.step(
-            np.asarray(feats, dtype=np.float32).reshape(1, -1),
-            [int(tc_val)], [float(elo_std)], [color], cache_turn)
-        if turn == chess.WHITE:
-            cache_w = cache_new
-        else:
-            cache_b = cache_new
-        k = board.fen().split(" ")[0]
-        occur_turn[k] = occur_turn.get(k, 0) + 1
-
+        logits_np, wdl_np = _advance()
         q_root = wdl_logits_to_q(wdl_np[0])
         legal_actions = _legal_actions_of(board)
         if not legal_actions:
             break
         legal_arr = np.array(legal_actions, dtype=np.int64)
-        logits_masked = logits_np[0][legal_arr].astype(np.float32)
+        logits_legal = logits_np[0][legal_arr].astype(np.float32)
 
-        # 构建 root node —— 生产搜索的 order_halving 入口
-        root = Node(legal=legal_arr.copy(), logits=logits_masked.copy(), q=q_root)
+        root = Node(legal=legal_arr.copy(), logits=logits_legal.copy(), q=q_root)
 
-        # expand 函数：只使用当前方的模型，不切换
+        side = turn
+
         def expand(node, action):
-            b_copy = board.copy()
-            cache_copy = clone_cache(cache_w if turn == chess.WHITE else cache_b)
-            occ_copy = dict(occur_turn)
-            for a in node.path:
-                mv = _resolve_move(a, b_copy)
-                if mv is None:
-                    return Node(np.array([], dtype=np.int64), np.array([], dtype=np.float32), 0.0, terminal=True)
-                b_copy.push(mv)
-                kk = b_copy.fen().split(" ")[0]
-                occ_copy[kk] = occ_copy.get(kk, 0) + 1
-                ff, tt, ee, cc = encode_board(b_copy, occ_copy.get(b_copy.fen().split(" ")[0], 0))
-                ft = torch.from_numpy(ff).float().unsqueeze(0).to(model.device)
-                with torch.no_grad():
-                    _, _, _, _, cache_copy = model.seq.step(ft,
-                        torch.tensor([int(tt)], dtype=torch.long, device=model.device),
-                        torch.tensor([float(ee)], dtype=torch.float32, device=model.device),
-                        torch.tensor([cc], dtype=torch.long, device=model.device),
-                        cache_copy)
-            mv = _resolve_move(action, b_copy)
-            if mv is None:
-                return Node(np.array([], dtype=np.int64), np.array([], dtype=np.float32), 0.0, terminal=True)
-            b_copy.push(mv)
-            if b_copy.is_game_over(claim_draw=True) or not list(b_copy.legal_moves):
-                q_term = get_terminal_q(b_copy)
-                return Node(np.array([], dtype=np.int64), np.array([], dtype=np.float32), q_term,
-                            depth=node.depth + 1, action=action, terminal=True)
-            kk = b_copy.fen().split(" ")[0]
-            occ_copy[kk] = occ_copy.get(kk, 0) + 1
-            ff, tt, ee, cc = encode_board(b_copy, occ_copy.get(b_copy.fen().split(" ")[0], 0))
-            ft = torch.from_numpy(ff).float().unsqueeze(0).to(model.device)
-            with torch.no_grad():
-                lc, wc, _, _, _ = model.seq.step(ft,
-                    torch.tensor([int(tt)], dtype=torch.long, device=model.device),
-                    torch.tensor([float(ee)], dtype=torch.float32, device=model.device),
-                    torch.tensor([cc], dtype=torch.long, device=model.device),
-                    cache_copy)
-            q_c = wdl_logits_to_q(wc[0].cpu().numpy())
-            lc_np = lc[0].cpu().numpy()
-            legal_c = _legal_actions_of(b_copy)
-            lc_masked = np.full(1936, -3e4, dtype=np.float32)
-            lc_masked[legal_c] = lc_np[legal_c]
-            return Node(np.array(legal_c, dtype=np.int64),
-                        lc_masked[np.array(legal_c)].astype(np.float32),
-                        q_c, depth=node.depth + 1, action=action)
+            return _expand_child(models[side], board, caches[side], occur, node, action)
 
         result = order_halving(root, expand, n_sims=n_sims, m0=m0, g=0.0,
                                c_visit=c_visit, c_scale=c_scale)
@@ -265,8 +271,10 @@ def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
             break
         board.push(mv)
 
-    is_truncated = len(actions) >= cfg.max_plies
-    term_reason, _ = get_termination_reason(board, cfg.max_plies, len(actions))
+    term_reason, _ = get_termination_reason_from_board(board)
+    if term_reason == "unknown":
+        term_reason = "truncated"
+    is_truncated = term_reason == "truncated"
     result_str = _result_str(board)
 
     outcome = board.outcome(claim_draw=True)
@@ -391,10 +399,7 @@ def main():
 
     for g in range(half):
         oi = g % n_openings
-        b = chess.Board()
-        for token in OPENINGS[oi].split():
-            b.push_san(token)
-        gd = play_one_game(model_a, model_b, cfg, opening_fen=b.fen(), opening_id=oi)
+        gd = play_one_game(model_a, model_b, cfg, opening_san=OPENINGS[oi], opening_id=oi)
         gd["game_idx"] = g; gd["white_ckpt_side"] = "A"; gd["black_ckpt_side"] = "B"
         games_log.append(gd)
         if (g + 1) % 8 == 0:
@@ -402,10 +407,7 @@ def main():
 
     for g in range(half):
         oi = g % n_openings
-        b = chess.Board()
-        for token in OPENINGS[oi].split():
-            b.push_san(token)
-        gd = play_one_game(model_b, model_a, cfg, opening_fen=b.fen(), opening_id=oi)
+        gd = play_one_game(model_b, model_a, cfg, opening_san=OPENINGS[oi], opening_id=oi)
         r = gd["arena_result"]
         gd["arena_result"] = 0 if r == 2 else 2 if r == 0 else 1
         gd["game_idx"] = half + g; gd["white_ckpt_side"] = "B"; gd["black_ckpt_side"] = "A"

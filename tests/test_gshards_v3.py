@@ -31,6 +31,7 @@ V3ShardWriter = gshards.V3ShardWriter
 V3ShardReader = gshards.V3ShardReader
 decode_v3_pipol = gshards.decode_v3_pipol
 encode_v3_pipol = gshards.encode_v3_pipol
+validate_v3_pipol = gshards.validate_v3_pipol
 META_V3_DTYPE = gshards.META_V3_DTYPE
 
 
@@ -112,6 +113,56 @@ class V3ShardTest(unittest.TestCase):
         self.assertEqual(int(rec["meta"]["gen_id"]), 7)
         self.assertEqual(int(rec["meta"]["ckpt_step"]), 5000)
         self.assertEqual(int(rec["meta"]["termination_reason"]), 1)
+
+
+class PipolValidationTest(unittest.TestCase):
+    """§2.5 读取端校验：概率和 ∈ [0.99,1.01]、支持集与规则引擎合法着一致。"""
+
+    def test_valid_passes(self):
+        acts = [np.array([1, 2], dtype=np.uint16)]
+        probs = [np.array([0.6, 0.4], dtype=np.float32)]
+        validate_v3_pipol(acts, probs, 1)
+        masks = np.zeros((1, 1936), dtype=bool)
+        masks[0, [1, 2]] = True
+        validate_v3_pipol(acts, probs, 1, legal_masks=masks)
+
+    def test_missing_pipol_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_v3_pipol(None, None, 1)
+
+    def test_short_records_rejected(self):
+        acts = [np.array([1], dtype=np.uint16)]
+        probs = [np.array([1.0], dtype=np.float32)]
+        with self.assertRaises(ValueError):
+            validate_v3_pipol(acts, probs, 2)
+
+    def test_empty_support_rejected(self):
+        acts = [np.array([], dtype=np.uint16)]
+        probs = [np.array([], dtype=np.float32)]
+        with self.assertRaises(ValueError):
+            validate_v3_pipol(acts, probs, 1)
+
+    def test_prob_sum_out_of_range_rejected(self):
+        acts = [np.array([1, 2], dtype=np.uint16)]
+        probs = [np.array([0.2, 0.2], dtype=np.float32)]
+        with self.assertRaises(ValueError):
+            validate_v3_pipol(acts, probs, 1)
+
+    def test_legal_count_mismatch_rejected(self):
+        acts = [np.array([1, 2], dtype=np.uint16)]
+        probs = [np.array([0.6, 0.4], dtype=np.float32)]
+        masks = np.zeros((1, 1936), dtype=bool)
+        masks[0, [1, 2, 3]] = True
+        with self.assertRaises(ValueError):
+            validate_v3_pipol(acts, probs, 1, legal_masks=masks)
+
+    def test_support_outside_legal_rejected(self):
+        acts = [np.array([1, 3], dtype=np.uint16)]  # 3 不在合法掩码内
+        probs = [np.array([0.6, 0.4], dtype=np.float32)]
+        masks = np.zeros((1, 1936), dtype=bool)
+        masks[0, [1, 2]] = True
+        with self.assertRaises(ValueError):
+            validate_v3_pipol(acts, probs, 1, legal_masks=masks)
 
 
 if __name__ == "__main__":

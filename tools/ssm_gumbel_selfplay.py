@@ -27,10 +27,11 @@ import torch
 sys.stdout.reconfigure(line_buffering=True)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from stateseq.actions import action_to_move, move_to_action
+from stateseq.actions import move_to_action
 from stateseq.conditions import TimeControlBucket
+from stateseq.data.sequences import _board_key
 from stateseq.adapter import (
-    encode_board, standardize_elo, wdl_logits_to_q, get_terminal_q, get_termination_reason,
+    encode_board, wdl_logits_to_q, get_terminal_q,
 )
 from stateseq.gumbel import (
     C_SCALE,
@@ -72,10 +73,6 @@ class SelfPlayConfig:
     elo: float = 2567.5
     tc_bucket: TimeControlBucket = TimeControlBucket.RAPID
     gumbel_g: float = 1.0  # Gumbel 噪声尺度；评测/换代 arena 用 g=0
-
-
-def _board_key(board: chess.Board) -> str:
-    return board.fen().split(" ")[0]
 
 
 def _legal_actions_of(board: chess.Board) -> list[int]:
@@ -174,7 +171,7 @@ class GameState:
         self.cfg = cfg
         self.board = chess.Board()
         self.root_cache = model.initial_cache(1)
-        self.occurrence: dict[str, int] = {}
+        self.occurrence: dict[tuple, int] = {}
         self.actions: list[int] = []
         self.pipol_actions: list[np.ndarray] = []
         self.pipol_probs: list[np.ndarray] = []
@@ -182,6 +179,8 @@ class GameState:
         self.n_nodes_total = 0
         self.n_terminal_total = 0
         self.sims_total = 0
+        self.max_depth_total = 0
+        self.budget_violations = 0
 
     def _update_occurrence(self) -> None:
         key = _board_key(self.board)
@@ -223,6 +222,9 @@ class GameState:
         self.n_nodes_total += result["n_nodes"]
         self.n_terminal_total += result["n_terminal"]
         self.sims_total += result["sims_used"]
+        self.max_depth_total += int(result["max_depth"])
+        if result["sims_used"] != self.cfg.n_sims:
+            self.budget_violations += 1
 
         self.actions.append(int(chosen))
         ids, probs = export_pi_prime(root_node, result["qmin"], result["qmax"])
@@ -243,6 +245,8 @@ class GameState:
         occ = dict(self.occurrence)
         for a in node.path:
             move = _resolve_move(a, board)
+            if move is None:
+                raise RuntimeError(f"路径重放动作 {a} 在 {board.fen()} 上不合法")
             board.push(move)
             key = _board_key(board)
             color = 1 if board.turn == chess.WHITE else 0
@@ -251,6 +255,8 @@ class GameState:
             occ[key] = occ.get(key, 0) + 1
 
         move = _resolve_move(action, board)
+        if move is None:
+            raise RuntimeError(f"动作 {action} 在 {board.fen()} 上不合法")
         board.push(move)
         terminal_by_rule = board.is_game_over(claim_draw=True)
         legal_actions = [] if terminal_by_rule else _legal_actions_of(board)
@@ -284,6 +290,8 @@ class GameState:
             child = yield from self._expand_gen(node, a)
             node.children[key] = child
             counters["n_nodes"] += 1
+            if child.depth > counters["max_depth"]:
+                counters["max_depth"] = child.depth
             if child.is_terminal:
                 counters["n_terminal"] += 1
             if child.q < qbox[0]:
@@ -300,7 +308,7 @@ class GameState:
         cfg = self.cfg
         if root.is_terminal:
             return {"action": None, "qmin": None, "qmax": None, "n_nodes": 0,
-                    "n_terminal": 0, "sims_used": 0}
+                    "n_terminal": 0, "sims_used": 0, "max_depth": 0}
 
         m0 = min(cfg.m0, len(root.legal))
         cands = gumbel_topm(root, m0=m0, rng=self.rng, g=self.cfg.gumbel_g)
@@ -311,13 +319,15 @@ class GameState:
         budget_per_round = [base + (1 if i < rem else 0) for i in range(rounds)]
 
         qbox = [root.q, root.q]  # [qmin, qmax]
-        counters = {"n_nodes": 0, "n_terminal": 0}
+        counters = {"n_nodes": 0, "n_terminal": 0, "max_depth": 0}
 
         def do_sim_root(c: _Candidate):
             if c.child is None:
                 child = yield from self._expand_gen(root, c.action)
                 c.child = child
                 counters["n_nodes"] += 1
+                if child.depth > counters["max_depth"]:
+                    counters["max_depth"] = child.depth
                 if child.is_terminal:
                     counters["n_terminal"] += 1
                 if child.q < qbox[0]:
@@ -345,8 +355,8 @@ class GameState:
             if len(surv) == 1:
                 break
             l_root = {int(a): float(x) for a, x in zip(root.legal, root.logits)}
-            cq_raw = completed_q(root, qbox[0], qbox[1])
-            s_root_vals = sigma(cq_raw, root.n_max, cfg.c_visit, cfg.c_scale)
+            cq_norm = normalize_q(completed_q(root, qbox[0], qbox[1]), qbox[0], qbox[1])
+            s_root_vals = sigma(cq_norm, root.n_max, cfg.c_visit, cfg.c_scale)
             s_map = {int(a): float(x) for a, x in zip(root.legal, s_root_vals)}
             scored = sorted(((c.noise + l_root[c.action] + s_map[c.action], c) for c in surv),
                             key=lambda t: -t[0])
@@ -355,7 +365,7 @@ class GameState:
 
         return {"action": int(surv[0].action), "qmin": qbox[0], "qmax": qbox[1],
                 "n_nodes": counters["n_nodes"], "n_terminal": counters["n_terminal"],
-                "sims_used": sims_used}
+                "sims_used": sims_used, "max_depth": counters["max_depth"]}
 
     def result(self) -> tuple[int, int, bool]:
         if self.board.is_checkmate():
@@ -388,6 +398,8 @@ class Driver:
         self.total_nodes = 0
         self.total_terminal = 0
         self.total_sims = 0
+        self.total_max_depth = 0
+        self.budget_violations = 0
         self.term_reason_counts = [0] * len(TERM_CODES)
         self.truncated_games = 0
 
@@ -434,6 +446,8 @@ class Driver:
         self.total_nodes += game.n_nodes_total
         self.total_terminal += game.n_terminal_total
         self.total_sims += game.sims_total
+        self.total_max_depth += game.max_depth_total
+        self.budget_violations += game.budget_violations
         self.term_reason_counts[term_reason] += 1
         if is_truncated:
             self.truncated_games += 1
@@ -492,6 +506,8 @@ def generate(cfg: SelfPlayConfig) -> dict:
         "plies_per_s": driver.total_plies / max(elapsed, 1e-6),
         "avg_search_nodes_per_ply": driver.total_nodes / max(driver.total_plies, 1),
         "avg_sims_per_ply": driver.total_sims / max(driver.total_plies, 1),
+        "avg_max_tree_depth": driver.total_max_depth / max(driver.total_plies, 1),
+        "budget_violations": driver.budget_violations,
         "termination_reason_counts": dict(zip(TERM_CODES, driver.term_reason_counts)),
         "truncated_rate": driver.truncated_games / max(driver.games_done, 1),
         "concurrency": cfg.concurrency,
@@ -528,6 +544,8 @@ def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: fl
     combined_shards: list[str] = []
     total_games = total_steps = total_skipped = 0
     total_plies = total_nodes = total_terminal = total_sims = 0
+    total_max_depth = 0
+    budget_violations = 0
     term_counts = [0] * len(TERM_CODES)
     truncated_games = 0
     last_cfg: dict = {}
@@ -549,6 +567,8 @@ def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: fl
         total_plies += gen.get("plies", 0)
         total_nodes += gen.get("avg_search_nodes_per_ply", 0.0) * gen.get("plies", 0)
         total_sims += gen.get("avg_sims_per_ply", 0.0) * gen.get("plies", 0)
+        total_max_depth += gen.get("avg_max_tree_depth", 0.0) * gen.get("plies", 0)
+        budget_violations += gen.get("budget_violations", 0)
         for k, v in gen.get("termination_reason_counts", {}).items():
             term_counts[TERM_CODES.index(k)] += v
         truncated_games += round(gen.get("truncated_rate", 0.0) * gen.get("games", 0))
@@ -563,6 +583,8 @@ def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: fl
         "plies_per_s": total_plies / max(wall_elapsed, 1e-6),
         "avg_search_nodes_per_ply": total_nodes / max(total_plies, 1),
         "avg_sims_per_ply": total_sims / max(total_plies, 1),
+        "avg_max_tree_depth": total_max_depth / max(total_plies, 1),
+        "budget_violations": budget_violations,
         "termination_reason_counts": dict(zip(TERM_CODES, term_counts)),
         "truncated_rate": truncated_games / max(total_games, 1),
         "workers": len(worker_dirs),

@@ -20,11 +20,10 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from stateseq.data.gshards import V3ShardReader
+from stateseq.data.sequences import _board_key
 from stateseq.model import SeqModel
-from stateseq.features import encode
 from stateseq.actions import move_to_action
-from stateseq.conditions import TimeControlBucket
-from stateseq.adapter import standardize_elo, wdl_logits_to_q, wdl_logits_to_probs, encode_board
+from stateseq.adapter import wdl_logits_to_probs, encode_board
 
 DEVICE = "cuda"
 
@@ -79,13 +78,17 @@ def evaluate(shard_dir, ckpt_path, label_str):
 
         cache = model.initial_cache(1, device=DEVICE, dtype=torch.float32)
         board = chess.Board()
+        occurrences: dict = {}
         game_label = np.zeros(3, dtype=np.float64)
         game_label[result] = 1.0
         wdl_label_game_sum += game_label
 
         for ply in range(n_plies):
             action_id = int(actions[ply])
-            feats, tc_val, elo_std, color = encode_board(board, occurrence=0)
+            key = _board_key(board)
+            prior = occurrences.get(key, 0)
+            occurrences[key] = prior + 1
+            feats, tc_val, elo_std, color = encode_board(board, occurrence=prior)
 
             f_t = torch.from_numpy(feats).float().unsqueeze(0).to(DEVICE)
             tc_t = torch.tensor([int(tc_val)], dtype=torch.long, device=DEVICE)

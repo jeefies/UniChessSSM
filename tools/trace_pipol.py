@@ -26,15 +26,15 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from stateseq.data.gshards import V3ShardReader
+from stateseq.data.sequences import _board_key
 from stateseq.model import SeqModel
-from stateseq.features import encode
+from stateseq.model_r import clone_cache
 from stateseq.actions import move_to_action
-from stateseq.conditions import TimeControlBucket
+from stateseq.adapter import encode_board, get_terminal_q, wdl_logits_to_q
 from stateseq.gumbel import (
     completed_q, sigma, pi_prime, normalize_q, Node, C_VISIT, C_SCALE,
     order_halving, N_SIMS, M0,
 )
-from stateseq.model_r import clone_cache
 
 DEVICE = "cuda"
 MAX_POSITIONS = 128
@@ -68,18 +68,22 @@ def main():
         game = reader.game(gi)
         actions = game["actions"]
         board = chess.Board()
+        occurrences: dict = {}
 
         for ply in range(len(actions)):
             if positions_parsed >= MAX_POSITIONS:
                 break
             action_id = int(actions[ply])
 
-            # Encode and forward
-            feats = encode(board, occurrence=0)
+            # Encode and forward（单局面 trace：cache 每步重置；条件/重复位与训练口径一致）
+            key = _board_key(board)
+            prior = occurrences.get(key, 0)
+            occurrences[key] = prior + 1
+            feats, tc_val, elo_std, color = encode_board(board, occurrence=prior)
             f_t = torch.from_numpy(feats).float().unsqueeze(0).to(DEVICE)
-            tc_t = torch.tensor([int(TimeControlBucket.RAPID)], dtype=torch.long, device=DEVICE)
-            elo_t = torch.tensor([2567.5], dtype=torch.float32, device=DEVICE)
-            color_t = torch.tensor([1 if board.turn == chess.WHITE else 0], dtype=torch.long, device=DEVICE)
+            tc_t = torch.tensor([int(tc_val)], dtype=torch.long, device=DEVICE)
+            elo_t = torch.tensor([float(elo_std)], dtype=torch.float32, device=DEVICE)
+            color_t = torch.tensor([color], dtype=torch.long, device=DEVICE)
 
             with torch.no_grad():
                 cache = model.initial_cache(1, device=DEVICE, dtype=torch.float32)
@@ -109,7 +113,7 @@ def main():
 
             # Q for each legal action: wdl[0] - wdl[2] (same for all = root value)
             # For root, Q = wdl_np[0] - wdl_np[2] (same-same, the WDL is for the position, not per-move)
-            q_root = float(wdl_np[0] - wdl_np[2])
+            q_root = wdl_logits_to_q(wdl_np)
             q_min = q_root
             q_max = q_root
 
@@ -249,17 +253,21 @@ def main():
         actions = game["actions"]
         board = chess.Board()
         cache = model.initial_cache(1, device=DEVICE, dtype=torch.float32)
+        occurrences: dict = {}
 
         for ply in range(min(len(actions), 50)):
             if positions_searched >= N_SEARCH_POSITIONS:
                 break
             action_id = int(actions[ply])
 
-            feats = encode(board, occurrence=0)
+            key = _board_key(board)
+            prior = occurrences.get(key, 0)
+            occurrences[key] = prior + 1
+            feats, tc_val, elo_std, color = encode_board(board, occurrence=prior)
             f_t = torch.from_numpy(feats).float().unsqueeze(0).to(DEVICE)
-            tc_t = torch.tensor([int(TimeControlBucket.RAPID)], dtype=torch.long, device=DEVICE)
-            elo_t = torch.tensor([2567.5], dtype=torch.float32, device=DEVICE)
-            color_t = torch.tensor([1 if board.turn == chess.WHITE else 0], dtype=torch.long, device=DEVICE)
+            tc_t = torch.tensor([int(tc_val)], dtype=torch.long, device=DEVICE)
+            elo_t = torch.tensor([float(elo_std)], dtype=torch.float32, device=DEVICE)
+            color_t = torch.tensor([color], dtype=torch.long, device=DEVICE)
 
             with torch.no_grad():
                 logits, wdl, mlh, x, cache_new = model.step(f_t, tc_t, elo_t, color_t, cache)
@@ -267,7 +275,7 @@ def main():
 
             logits_np = logits.cpu().numpy()[0].astype(np.float32)
             wdl_np = wdl.cpu().numpy()[0].astype(np.float32)
-            q_root = float(wdl_np[0] - wdl_np[2])
+            q_root = wdl_logits_to_q(wdl_np)
             x_np = x.cpu().numpy()[0]
 
             legal_actions = [a for m in board.legal_moves if (a := move_to_action(m)) is not None]
@@ -281,31 +289,64 @@ def main():
 
             logits_masked = logits_np[legal_arr]
 
-            # Define expand function for Gumbel search
-            def make_expand(board_here, model_here, cache_here):
+            # Define expand function for Gumbel search（路径重放口径同生成器/arena）
+            def make_expand(root_board, model_here, root_cache, root_occ):
                 def _expand(node, action):
+                    b = root_board.copy()
+                    cache_e = clone_cache(root_cache)
+                    occ_e = dict(root_occ)
+                    for a in node.path:
+                        mv = None
+                        for m in b.legal_moves:
+                            if move_to_action(m) == a:
+                                mv = m
+                                break
+                        if mv is None:
+                            raise RuntimeError(f"路径重放动作 {a} 在 {b.fen()} 上不合法")
+                        b.push(mv)
+                        key_e = _board_key(b)
+                        fe_e, tc_e, elo_e, color_e = encode_board(b, occ_e.get(key_e, 0))
+                        with torch.no_grad():
+                            _, _, _, _, cache_e = model_here.step(
+                                torch.from_numpy(fe_e).float().unsqueeze(0).to(DEVICE),
+                                torch.tensor([int(tc_e)], dtype=torch.long, device=DEVICE),
+                                torch.tensor([float(elo_e)], dtype=torch.float32, device=DEVICE),
+                                torch.tensor([color_e], dtype=torch.long, device=DEVICE),
+                                cache_e)
+                        occ_e[key_e] = occ_e.get(key_e, 0) + 1
                     mv = None
-                    for m in board_here.legal_moves:
+                    for m in b.legal_moves:
                         if move_to_action(m) == action:
                             mv = m
                             break
                     if mv is None:
-                        return Node(legal=np.array([], dtype=np.int64), logits=np.array([], dtype=np.float32), q=0.0, terminal=True)
-                    board_here.push(mv)
-                    feats_c = encode(board_here, occurrence=0)
-                    f_c = torch.from_numpy(feats_c).float().unsqueeze(0).to(DEVICE)
+                        raise RuntimeError(f"动作 {action} 在 {b.fen()} 上不合法")
+                    b.push(mv)
+                    new_path = node.path + (action,)
+                    if b.is_game_over(claim_draw=True) or not list(b.legal_moves):
+                        return Node(legal=np.array([], dtype=np.int64), logits=np.array([], dtype=np.float32),
+                                    q=get_terminal_q(b), depth=node.depth + 1, action=action,
+                                    path=new_path, terminal=True)
+                    key_e = _board_key(b)
+                    fe_e, tc_e, elo_e, color_e = encode_board(b, occ_e.get(key_e, 0))
                     with torch.no_grad():
-                        l_c, w_c, _, _, _ = model_here.step(f_c, tc_t, elo_t, color_t, cache_here)
-                    board_here.pop()
-                    q_c = float(w_c[0][0] - w_c[0][2])
-                    legal_c = [a for m in board_here.legal_moves if (a := move_to_action(m)) is not None]
+                        l_c, w_c, _, _, _ = model_here.step(
+                            torch.from_numpy(fe_e).float().unsqueeze(0).to(DEVICE),
+                            torch.tensor([int(tc_e)], dtype=torch.long, device=DEVICE),
+                            torch.tensor([float(elo_e)], dtype=torch.float32, device=DEVICE),
+                            torch.tensor([color_e], dtype=torch.long, device=DEVICE),
+                            cache_e)
+                    q_c = wdl_logits_to_q(w_c[0].cpu().numpy())
+                    legal_c = [a for m in b.legal_moves if (a := move_to_action(m)) is not None]
                     l_np = l_c.cpu().numpy()[0].astype(np.float32)
                     l_mask = np.full(1936, -3e4, dtype=np.float32)
                     l_mask[legal_c] = l_np[legal_c]
-                    return Node(legal=np.array(legal_c, dtype=np.int64), logits=l_mask[np.array(legal_c)], q=q_c, depth=node.depth + 1, action=action)
+                    return Node(legal=np.array(legal_c, dtype=np.int64),
+                                logits=l_mask[np.array(legal_c)], q=q_c,
+                                depth=node.depth + 1, action=action, path=new_path)
                 return _expand
 
-            expand_fn = make_expand(board, model, clone_cache(cache))
+            expand_fn = make_expand(board, model, cache, occurrences)
 
             root_search = Node(legal=legal_arr.copy(), logits=logits_masked.copy(), q=q_root)
             result = order_halving(root_search, expand_fn, n_sims=N_SIMS, m0=M0, g=0.0,

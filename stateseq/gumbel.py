@@ -329,11 +329,10 @@ def order_halving(
             for _ in range(k):
                 do_sim_root(c)
             sims_used += k
-        # 顺序减半：按 g + ℓ + σ(q̂) 淘汰末位一半
+        # 顺序减半：按 g + ℓ + σ(q̂) 淘汰末位一半（σ 前先做本树 min−max 归一，§2.2）
         l_root = {int(a): float(x) for a, x in zip(root.legal, root.logits)}
-        cq = normalize_q(completed_q(root, qmin, qmax), qmin, qmax)
-        cq_map = {int(a): float(x) for a, x in zip(root.legal, cq)}
-        s_root = sigma(completed_q(root, qmin, qmax), root.n_max, c_visit, c_scale)
+        cq_norm = normalize_q(completed_q(root, qmin, qmax), qmin, qmax)
+        s_root = sigma(cq_norm, root.n_max, c_visit, c_scale)
         s_map = {int(a): float(x) for a, x in zip(root.legal, s_root)}
         scored = sorted(
             ((c.noise + l_root[c.action] + s_map[c.action], c) for c in surv),

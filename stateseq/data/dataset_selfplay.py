@@ -17,7 +17,7 @@ import torch
 from ..actions import NUM_ACTIONS
 from ..features import FEATURE_DIM
 from .dataset import replay_game
-from .gshards import V3ShardReader
+from .gshards import V3ShardReader, validate_v3_pipol
 from .sequences import T_MAX as STAGE_A_T_MAX
 
 B2_T_MAX = 300
@@ -37,9 +37,14 @@ def _worker_build(index: int, t_max: int = B2_T_MAX):
     meta = g["meta"]
     data = replay_game(g["actions"], meta, t_max=t_max,
                        pipol_actions=g["pipol_actions"], pipol_probs=g["pipol_probs"])
+    # §2.5 读取端完整性校验：概率和 ∈ [0.99,1.01]、支持集与规则引擎合法着一致
+    if data.get("pipol_actions") is not None:
+        validate_v3_pipol(data["pipol_actions"], data["pipol_probs"], len(data["actions"]),
+                          legal_masks=data["legal_mask"])
     tc = int(meta["tc_bucket"])
     is_truncated = bool(meta["is_truncated"])
-    elo_mean = float(meta.get("elo_mean", 1500.0))
+    # np.void structured scalar：只能按字段名取值（无 .get）
+    elo_mean = float(meta["elo_mean"])
     return index, data, tc, is_truncated, elo_mean
 
 

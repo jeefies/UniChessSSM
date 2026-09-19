@@ -99,6 +99,9 @@ def main() -> None:
     # buffer，混入会使预算恒被 2000 步上限吃满，失去"控制对陈旧搜索目标过拟合遍数"的本意）。
     buffer_games = len(sp_ds.train_indices)
     steps_total = min(3 * buffer_games // eff_batch, 2000)
+    if steps_total < 1:
+        raise RuntimeError(f"遍历预算不足 1 步（buffer {buffer_games} 局 / 有效 batch {eff_batch}）——"
+                           f"请增大 replay buffer 或减小 microbatch×accum")
     warmup = min(200, int(steps_total * 0.1)) if args.warmup == 0 else args.warmup
     print(f"训练局数 human={len(human_ds.train_indices)} selfplay={len(sp_ds.train_indices)}；"
           f"有效 batch {eff_batch}；总步数 {steps_total}；warmup {warmup}；"
@@ -179,6 +182,7 @@ def main() -> None:
     human_iter = None
     sp_iter = None
 
+    step = start_step - 1  # resume 后无可跑步数时，收尾保存仍有确定的 step
     for step in range(start_step, steps_total):
         opt.zero_grad(set_to_none=True)
         data_wait = 0.0
