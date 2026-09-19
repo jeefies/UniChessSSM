@@ -214,8 +214,12 @@ def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
     anomaly = None
     n_sims = cfg.n_sims
     m0 = cfg.m0
-    c_visit = cfg.c_visit
-    c_scale = cfg.c_scale
+    # σ 展幅常数**绑定在模型侧**：换色时随模型一起交换，支持「同权重、不同尺度」对照。
+    # ArenaModel 未显式设置时回落到 cfg（同一份共享配置），行为与旧版一致。
+    scales = {
+        chess.WHITE: (getattr(model_w, "c_visit", cfg.c_visit), getattr(model_w, "c_scale", cfg.c_scale)),
+        chess.BLACK: (getattr(model_b, "c_visit", cfg.c_visit), getattr(model_b, "c_scale", cfg.c_scale)),
+    }
 
     def _advance():
         """当前局面：双方模型各前进一步，返回行棋方 (logits, wdl)。"""
@@ -261,6 +265,7 @@ def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
         def expand(node, action):
             return _expand_child(models[side], board, caches[side], occur, node, action)
 
+        c_visit, c_scale = scales[side]
         result = order_halving(root, expand, n_sims=n_sims, m0=m0, g=0.0,
                                c_visit=c_visit, c_scale=c_scale)
         if result["action"] is None:
@@ -316,6 +321,7 @@ def _aggregate_results(games_log, half, args) -> dict:
     anomalies = sum(1 for g in games_log if g["anomaly"])
     return {
         "ckpt_a": args.ckpt_a, "ckpt_b": args.ckpt_b,
+        "c_visit": args.c_visit, "c_scale_a": args.c_scale_a, "c_scale_b": args.c_scale_b,
         "total_games": len(games_log),
         "wins_a": wins_a, "wins_b": wins_b, "draws": draws,
         "score_a": score_a,
@@ -340,6 +346,9 @@ def main():
     ap.add_argument("--max_plies", type=int, default=300)
     ap.add_argument("--seed", type=int, default=20260917)
     ap.add_argument("--test-scoring", action="store_true")
+    ap.add_argument("--c_visit", type=float, default=C_VISIT, help="双方共用的 c_visit")
+    ap.add_argument("--c_scale_a", type=float, default=C_SCALE, help="A 侧 c_scale")
+    ap.add_argument("--c_scale_b", type=float, default=C_SCALE, help="B 侧 c_scale")
     args = ap.parse_args()
 
     if args.test_scoring:
@@ -384,8 +393,11 @@ def main():
     cfg.n_sims = args.n_sims
     cfg.m0 = args.m0
     cfg.max_plies = args.max_plies
-    cfg.c_visit = C_VISIT
+    cfg.c_visit = args.c_visit
     cfg.c_scale = C_SCALE
+    model_a.c_visit = model_b.c_visit = args.c_visit
+    model_a.c_scale = args.c_scale_a
+    model_b.c_scale = args.c_scale_b
     games_log = []
     t0 = time.time()
     n_openings = min(args.pairs, len(OPENINGS))

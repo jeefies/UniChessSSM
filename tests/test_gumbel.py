@@ -329,3 +329,43 @@ class PerNodeQNormalizationTest(unittest.TestCase):
         pp = pi_prime(node)
         np.testing.assert_allclose(pp, softmax(node.logits), atol=1e-5)
         self.assertTrue(np.all(np.isfinite(pp)))
+
+
+class TestScaleIsPlumbedThrough(unittest.TestCase):
+    """回归：export_pi_prime 曾无参数、恒用 C_SCALE=1.0。
+
+    若搜索按 c_scale=0.1 分配访问、选择动作，而训练目标仍按 1.0 写出，
+    尺度对照实验就会被这条缺口污染。断言：
+        π′_written ≈ softmax(ℓ + qtransform_completed(Q; 配置尺度))
+    在**非默认**尺度下同样成立。
+    """
+
+    @staticmethod
+    def _node():
+        node = Node(legal=np.array([0, 1, 2], np.int64),
+                    logits=np.array([0.0, 0.1, -0.2], np.float32), q=0.0)
+        node.n = np.array([8, 4, 2], np.int64)
+        node.q_sum = np.array([0.9 * 8, 0.6 * 4, 0.1 * 2], np.float32)
+        return node
+
+    @staticmethod
+    def _entropy(p):
+        p = np.asarray(p, np.float64)
+        p = p[p > 0]
+        return float(-(p * np.log(p)).sum())
+
+    def test_export_matches_configured_scale(self):
+        node = self._node()
+        for c_scale in (1.0, 0.1, 0.03):
+            ids, probs = export_pi_prime(node, C_VISIT, c_scale)
+            expect = softmax(node.logits + qtransform_completed(node, C_VISIT, c_scale))
+            np.testing.assert_array_equal(ids, node.legal)
+            np.testing.assert_allclose(probs, expect, rtol=1e-5, atol=1e-7)
+
+    def test_different_scales_give_different_targets(self):
+        """不同尺度必须写出不同目标，否则说明参数没传到底（旧实现会全部相同）。"""
+        node = self._node()
+        _, p1 = export_pi_prime(node, C_VISIT, 1.0)
+        _, p01 = export_pi_prime(node, C_VISIT, 0.1)
+        self.assertFalse(np.allclose(p1, p01, atol=1e-4))
+        self.assertGreater(self._entropy(p01), self._entropy(p1))

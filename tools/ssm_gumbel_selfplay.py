@@ -225,7 +225,7 @@ class GameState:
             self.budget_violations += 1
 
         self.actions.append(int(chosen))
-        ids, probs = export_pi_prime(root_node)
+        ids, probs = export_pi_prime(root_node, self.cfg.c_visit, self.cfg.c_scale)
         self.pipol_actions.append(ids.astype(np.uint16))
         self.pipol_probs.append(probs.astype(np.float32))
 
@@ -507,6 +507,8 @@ def generate(cfg: SelfPlayConfig) -> dict:
         "m0": cfg.m0,
         "gen_id": cfg.gen_id,
         "ckpt_step": cfg.ckpt_step,
+        "c_visit": cfg.c_visit,
+        "c_scale": cfg.c_scale,
     }
     manifest_path = os.path.join(cfg.out_dir, "manifest.json")
     try:
@@ -564,7 +566,7 @@ def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: fl
         for k, v in gen.get("termination_reason_counts", {}).items():
             term_counts[TERM_CODES.index(k)] += v
         truncated_games += round(gen.get("truncated_rate", 0.0) * gen.get("games", 0))
-        last_cfg = {k: gen.get(k) for k in ("n_sims", "m0", "gen_id", "ckpt_step") if k in gen}
+        last_cfg = {k: gen.get(k) for k in ("n_sims", "m0", "gen_id", "ckpt_step", "c_visit", "c_scale") if k in gen}
         shutil.rmtree(wd, ignore_errors=True)
 
     stats = {
@@ -610,7 +612,8 @@ def run_workers(args: argparse.Namespace) -> None:
                "--n_sims", str(args.n_sims), "--m0", str(args.m0),
                "--seed", str(int(worker_seeds[i].generate_state(1)[0])),
                "--gen_id", str(args.gen_id), "--ckpt_step", str(args.ckpt_step),
-               "--g", str(args.g)]
+               "--g", str(args.g),
+               "--c_visit", str(args.c_visit), "--c_scale", str(args.c_scale)]
         log_path = os.path.join(wdir, "worker.log")
         log_fh = open(log_path, "w", encoding="utf-8")
         proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT,
@@ -652,6 +655,10 @@ def main() -> None:
     ap.add_argument("--ckpt_step", type=int, default=0)
     ap.add_argument("--g", type=float, default=1.0,
                     help="Gumbel 噪声尺度；1.0 训练/生成，0.0 评测/换代 arena")
+    ap.add_argument("--c_visit", type=float, default=C_VISIT,
+                    help="σ 展幅常数 c_visit；搜索与 π′ 导出共用同一值")
+    ap.add_argument("--c_scale", type=float, default=C_SCALE,
+                    help="σ 展幅常数 c_scale；搜索与 π′ 导出共用同一值")
     args = ap.parse_args()
 
     if args.workers > 1:
@@ -670,6 +677,8 @@ def main() -> None:
         gen_id=args.gen_id,
         ckpt_step=args.ckpt_step,
         gumbel_g=args.g,
+        c_visit=args.c_visit,
+        c_scale=args.c_scale,
     )
     generate(cfg)
 

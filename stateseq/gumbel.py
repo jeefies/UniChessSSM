@@ -382,8 +382,17 @@ def order_halving(
 
 # ---------------- 目标导出 ----------------
 
-def export_pi_prime(node: Node) -> tuple[np.ndarray, np.ndarray]:
-    """导出训练目标：返回 (legal_action_ids int64, pi_prime fp32)，支持集 = 全部合法着。"""
+def export_pi_prime(
+    node: Node,
+    c_visit: float = C_VISIT,
+    c_scale: float = C_SCALE,
+) -> tuple[np.ndarray, np.ndarray]:
+    """导出训练目标：返回 (legal_action_ids int64, pi_prime fp32)，支持集 = 全部合法着。
+
+    **尺度必须与搜索使用的同一份配置一致**：默认值只是兜底，调用方（生成器/arena）
+    应显式传入 cfg.c_visit / cfg.c_scale；否则会出现「按 c_scale=0.1 分配访问、
+    却按 1.0 写训练目标」的错配。
+    """
     ids = node.legal.astype(np.int64)
-    probs = pi_prime(node)
+    probs = pi_prime(node, c_visit, c_scale)
     return ids, probs
