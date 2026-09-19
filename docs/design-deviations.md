@@ -38,24 +38,36 @@
 - **更新后的 Arena 流程**：每局含诊断 → 逐行 JSON → 聚合统计写 arena.json → 联邦哈希验证 → 记分正向测试
 - **不涉及超参/规格改动，无需设计文档变更。**
 
-## 6. Review v3 修复（2026-09-18）
+## 6. Review 2026-09-18/19 代码审查修复（commit 8d14a58）
 
-### 6.1 模型适配器（`stateseq/adapter.py` 新建）
-统一 Elo 标准化、WDL logits→softmax 概率→Q、终局真值入口。所有生成/arena/评估调用此入口。
+### 6.1 审查范围与方法
+对 `6c8bc62..HEAD`（4 个 commit，10 文件，862 行变更）进行完整源码审计，对照 `docs/state-sequence-model-design.md` D1–D10 及 `docs/stage-b-implementation.md` §2–§3 锁定规格。
 
-### 6.2 Arena 重写
-旧 arena 的 `_expand_search` 仅做 1 层估值即撤回，不是递归搜索（review 归类为"不是设计的搜索"）。
-修复：arena 复用 `stateseq.gumbel.order_halving`（生产搜索后端），expand 函数只使用发起方模型。
-验证：A/A 从 threefold→checkmate 确认递归搜索生效；A/B 从 0/64/0→12/0/20（62.5%）揭示真实棋力差异。
+### 6.2 发现与修复
 
-### 6.3 训练器修复
-- 合法掩码：`forward_train` 在 policy loss 前执行 `apply_legal_mask`
-- 重建权重：显式 `w_r_start=w_r_end=0.1`，禁用 Stage A 的退火继承
-- 检查点：短轮次强制保存完整 `latest.pt`（含 opt/sched）
-- dyn 时间索引：`actions[:,:-1]` 而非 `actions[:,1:]`
+| # | 严重度 | 文件 | 问题 | 修复 |
+|---|---|---|---|---|
+| 1 | CRITICAL | `ssm_gumbel_selfplay.py:211` | `occ_root` 未定义 NameError，生成器完全不可运行 | 改为 `occ` |
+| 2 | CRITICAL | `ssm_gumbel_arena.py:295-314` | 换色局胜者归属双重映射，32 局 A/B 结论 12/20 颠倒 | 直接用 `arena_result` 计数 |
+| 3 | WARNING | `ssm_gumbel_selfplay.py:204-206,250-252` | occurrence 编码时机根节点/展开路径不一致 | 展开路径改为 encode-before-increment |
+| 4 | WARNING | `ssm_gumbel_selfplay.py:205` | `features = encode(...)` 死代码 | 删除 |
+| 5 | WARNING | `ssm_gumbel_arena.py:247` | `if False else` 死代码 | 删除 |
+| 6 | WARNING | `adapter.py:22-23` | `ELO_MEAN/ELO_STD` 重复定义，未从 `conditions` 导入 | 移除未使用导入，补充注释 |
+| 7 | WARNING | `model.py:111` | dyn 索引语义变更未标注 Stage A checkpoint 兼容性 | 补充注释 |
 
-### 6.4 评估脚本修复
-- `eval_dual_checkpoint.py`：标准化 Elo + 每 ply 按行棋方翻转 result
-- `dataset_selfplay.py`：`elo_std` 从存储的 `elo_mean` 标准化计算（非写死 0）
+### 6.3 数据正确性核查
+
+- **v3 pipol 格式**：与规格 §2.5 完全一致（`u16 count + count×(u16 action_id + f16 prob)`）
+- **v3 meta 字段**：generator 写入完整；`dataset_selfplay.py` 正确读取 `elo_mean`→`elo_std`；`mlh_valid` 正确剔除截断局
+- **一条格式偏离**：v3 meta 实际存储为 `.meta.npz`（56B/局 numpy structured array），规格描述为 `.meta.bin`（32B 原始二进制）；当前无 C++ 读取器，不构成互操作 bug，但需在 C++ 读取器实现时对齐
+
+### 6.4 验证结果（修复后重跑）
+
+| 测试 | 修复前 | 修复后 |
+|---|---|---|
+| A/B 32 局（Stage A vs Round 2） | **12/20**（不可信，计分 bug） | **28/4**（Stage A 87.5%，可信） |
+| A/A 4 局 | 2/2 | 2/2（50%，对称） |
+| 计分正向测试 | 4/4 PASS | 4/4 PASS |
+| 单测 48 项 | 48/48 PASS | 48/48 PASS |
 
 **不涉及模型架构或超参变动。**

@@ -384,3 +384,4 @@ $$\pi'(a) = \mathrm{softmax}\big(\ell(a) + \sigma(\mathrm{completedQ}(a))\big)\q
 | 2026-09-18 | review 响应 P0/P1 收尾：arena 逐局诊断（games.jsonl/model_ids.json/--test-scoring，4/4 PASS）；双检查点统一评估 val64 256 局；Q→σ→π′ 轨迹（σ 3000× logits，但 π′ 熵 ~1.94 非 one-hot，f16 损失 5.5e-05）；多代控制流单测 7/7 PASS；所有文档回填 | 作者 |
 | 2026-09-18 | Round 2 闭环：2,500 局生成（4×24，0.136 games/s，53% 封顶）→ 14 步训练（sp_val 0.621，recon 60.0%）→ 64 局 arena（64/64 threefold）；concurrency 从 128→24 修复 GPU 利用率（17%→97%）；所有文档更新 v5 | 作者 |
 | 2026-09-18 | Review v3 全线修复：adapter.py（Elo 标准化 + WDL→softmax Q + 终局真值）；arena 重写（复用 order_halving 递归搜索，单模型评估，完整历史，记分断言）；训练器修复（legal_mask、固定 recon 权重、完整 checkpoint、dyn 索引）；验证 48/48 PASS，A/A 从 threefold→checkmate，A/B 62.5% 超换代门槛 | 作者 |
+| 2026-09-19 | Review 代码审查修复（commit 8d14a58）：CRITICAL ×2（generator `occ_root` NameError；arena 换色局胜者归属 bug 导致 12/20 结论颠倒）→ 重跑 A/B 得 28/4（Stage A 87.5%，可信）；WARNING ×5（occurrence 编码时机、死代码、adapter 常量重复、dyn 兼容性注释）；所有验证 PASS | 作者 |

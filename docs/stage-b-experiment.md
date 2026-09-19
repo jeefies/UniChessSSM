@@ -514,7 +514,7 @@ gradient norms:
 | 2026-09-17 v2 | review 响应 | 四项验证、Gumbel-64 预检、A/A arena、封顶分析 |
 | 2026-09-18 | v3 | **首轮闭环完整数据**：2k 局生成→11 步训练→64 局 arena |
 | 2026-09-18 | **v5 当前** | **Round 2 闭环**：2.5k 局→14 步训练→64 局 arena；并发配置 4×24；review v3 全部修复 |
-| 2026-09-18 | **v6** | **Review v3 修复验证**：9 项源码级 bug 全部修复，48/48 PASS，A/A 终结从 threefold→checkmate，A/B 显示 Round2 62.5%（超换代门槛） |
+| 2026-09-18 | **v6** | **Review v3 修复验证**：9 项源码级 bug 全部修复，48/48 PASS，A/A 终结从 threefold→checkmate，A/B 修复计分后重跑得 **Stage A 28 / Round 2 4（87.5%）**——14 步 RL 尚未超越 champion，需继续训练 |
 
 ---
 
@@ -545,30 +545,31 @@ gradient norms:
 | **A/B arena（修复后）** | **Stage A 12 / Round 2 20（62.5%）** | **超换代门槛 55%** |
 | 训练器语法验证 | compile OK | — |
 
-### 13.3 A/B 详细结果
+### 13.3 A/B 详细结果（修复计分后重跑，2026-09-19）
 
-| 指标 | 旧 arena（bug） | 修复后 arena |
+| 指标 | 旧 arena（计分 bug） | **修复后 arena（可信）** |
 |---|---|---|
-| 对局 | 64 | **32** |
-| W/D/L | 0/64/0 | **12/0/20** |
-| A 得分率 | 50.0% | **37.5%** |
-| 平均 ply | 37 | **82** |
-| 终止原因 | 64/64 threefold | **32/32 checkmate** |
+| 对局 | 32 | **32** |
+| W/D/L | 12/0/20 | **28/0/4** |
+| A 得分率 | 37.5% | **87.5%** |
+| 平均 ply | 82 | **82** |
+| 终止原因 | 32/32 checkmate | **32/32 checkmate** |
 | anomalies | 0 | 0 |
 
-> **关键结论**：
-> 1. 旧 arena 的 `_expand_search` 只做 1 层估值→不递归→全 threefold → **掩盖了真实棋力差异**
-> 2. 修复后 Round 2 的 62.5% 胜率表明：14 步 RL 训练已产生可测量的棋力提升
-> 3. A/A 从 threefold→checkmate 的变化确认了递归搜索的必要性
-> 4. 替换 champion 需 400 局 ≥55% —— 当前 32 局 62.5% 可通过，需按规格跑 400 局正式换代
+> **关键结论修正**：
+> 1. 旧计分 bug 将换色局胜者归属反转——Stage A 实际以 87.5% 碾压 Round 2（28/32），Round 2 仅 4 胜。
+> 2. 14 步 RL 训练尚未使模型超越 Stage A champion；换代门槛 55%（400 局）远未达到。
+> 3. A/A 2/2 对称（50%）确认修复后 arena 自身无偏。
+> 4. 下一步：继续多代训练后重跑换代 arena；或增大每代局数/训练步数。
 
 ### 13.4 修复后产物
 
 | 产物 | 路径 |
 |---|---|
-| 修复验证 A/A | `runs/arena_aa_fix/` |
-| 修复验证 A/B | `runs/arena_ab_fix/` |
-| 计分测试 | `runs/scoring_test_fix/` |
+| 修复验证 A/A | `runs/arena_aa_fix/`, `runs/arena_aa_fix3/` |
+| 修复验证 A/B（计分 bug 前，不可信） | `runs/arena_ab_fix/` |
+| 修复验证 A/B（计分 bug 后，可信） | `runs/arena_ab_fix3/` |
+| 计分测试 | `runs/scoring_test_fix/`, `runs/scoring_test_fix2/` |
 
 ---
 
