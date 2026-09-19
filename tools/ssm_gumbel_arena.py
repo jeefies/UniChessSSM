@@ -35,7 +35,7 @@ from stateseq.model_r import clone_cache
 from stateseq.gumbel import C_SCALE, C_VISIT, Node, order_halving
 from stateseq.adapter import (
     encode_board, standardize_elo, wdl_logits_to_q,
-    get_terminal_q, get_termination_reason_from_board,
+    get_terminal_q, classify_final_board,
 )
 
 # ---- 开局库（ECO 经典变例）----
@@ -234,9 +234,12 @@ def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
         return mover_logits, mover_wdl
 
     if opening_san:
+        # 先编码当前局面再落子（encode-before-move），与生成器 / 训练重放同口径：
+        # 序列是 B₀,B₁,…，每个局面恰好进 R 一次。此前写成 push→advance，导致初始局面
+        # B₀ 从未入 R、而最后一个开局局面被重复步进两次（occurrence 也多记一次）。
         for token in opening_san.split():
-            board.push_san(token)
             _advance()
+            board.push_san(token)
 
     for ply in range(cfg.max_plies):
         if board.is_game_over(claim_draw=True):
@@ -271,19 +274,9 @@ def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
             break
         board.push(mv)
 
-    term_reason, _ = get_termination_reason_from_board(board)
-    if term_reason == "unknown":
-        term_reason = "truncated"
-    is_truncated = term_reason == "truncated"
+    # 终局裁决与生成器共用唯一入口（claim_draw=True 口径；未终局 = 走满 max_plies）
+    our_result, term_reason, is_truncated = classify_final_board(board)
     result_str = _result_str(board)
-
-    outcome = board.outcome(claim_draw=True)
-    if outcome is None or outcome.winner is None:
-        our_result = 1  # draw
-    elif outcome.winner == chess.WHITE:
-        our_result = 0  # white wins
-    else:
-        our_result = 2  # black wins
 
     game_pgn = chess.pgn.Game.from_board(board)
     return {

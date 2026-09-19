@@ -31,7 +31,7 @@ from stateseq.actions import move_to_action
 from stateseq.conditions import TimeControlBucket
 from stateseq.data.sequences import _board_key
 from stateseq.adapter import (
-    encode_board, wdl_logits_to_q, get_terminal_q,
+    encode_board, wdl_logits_to_q, get_terminal_q, classify_final_board,
 )
 from stateseq.gumbel import (
     C_SCALE,
@@ -232,8 +232,8 @@ class GameState:
         self.pipol_probs.append(probs.astype(np.float32))
 
         move = _resolve_move(chosen, self.board)
-        if move is None:
-            return False
+        if move is None:  # 搜索只在合法着上选择，走到这里说明动作编解码已损坏
+            raise RuntimeError(f"选中动作 {chosen} 在 {self.board.fen()} 上不合法")
         self.board.push(move)
         return True
 
@@ -368,18 +368,13 @@ class GameState:
                 "sims_used": sims_used, "max_depth": counters["max_depth"]}
 
     def result(self) -> tuple[int, int, bool]:
-        if self.board.is_checkmate():
-            r = 0 if self.board.turn == chess.BLACK else 2
-            return r, TERM_CODES.index("checkmate"), False
-        if self.board.is_stalemate():
-            return 1, TERM_CODES.index("stalemate"), False
-        if self.board.is_fifty_moves():
-            return 1, TERM_CODES.index("fifty_move"), False
-        if self.board.is_repetition(3):
-            return 1, TERM_CODES.index("threefold"), False
-        if self.board.is_insufficient_material():
-            return 1, TERM_CODES.index("insufficient_material"), False
-        return 1, TERM_CODES.index("truncated"), True
+        """→ (result 白视角 0/1/2, termination_reason 编码, is_truncated)。
+
+        统一走 `adapter.classify_final_board`（口径 = 对局循环的 claim_draw=True），
+        只有规则未终局才是 300 ply 封顶截断。
+        """
+        result, reason, is_truncated = classify_final_board(self.board)
+        return result, TERM_CODES.index(reason), is_truncated
 
 
 # ------------------------- 驱动器：跨局拼批 + 槽位复用 -------------------------

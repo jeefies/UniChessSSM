@@ -83,22 +83,48 @@ def get_termination_reason(board: chess.Board, max_plies: int, ply: int) -> tupl
     return "unknown", False
 
 
+# python-chess Termination → v3 meta 的 termination_reason 口径（§2.5）。
+# 五次重复/七十五步是强制终局，与"可申和"的三次重复/五十步同因，归入同一编码。
+_TERMINATION_TO_REASON = {
+    chess.Termination.CHECKMATE: "checkmate",
+    chess.Termination.STALEMATE: "stalemate",
+    chess.Termination.INSUFFICIENT_MATERIAL: "insufficient_material",
+    chess.Termination.FIFTY_MOVES: "fifty_move",
+    chess.Termination.SEVENTYFIVE_MOVES: "fifty_move",
+    chess.Termination.THREEFOLD_REPETITION: "threefold",
+    chess.Termination.FIVEFOLD_REPETITION: "threefold",
+}
+
+
 # 从分片读取时重构终止原因（不依赖 max_plies，用实际 n_plies 判断）
 def get_termination_reason_from_board(board: chess.Board) -> tuple[str, bool]:
     outcome = board.outcome(claim_draw=True)
     if outcome is None:
         return "unknown", False
-    if outcome.termination == chess.Termination.CHECKMATE:
-        return "checkmate", False
-    if outcome.termination == chess.Termination.STALEMATE:
-        return "stalemate", False
-    if outcome.termination == chess.Termination.INSUFFICIENT_MATERIAL:
-        return "insufficient_material", False
-    if outcome.termination == chess.Termination.FIFTY_MOVES:
-        return "fifty_move", False
-    if outcome.termination == chess.Termination.THREEFOLD_REPETITION:
-        return "threefold", False
-    return "unknown", False
+    return _TERMINATION_TO_REASON.get(outcome.termination, "unknown"), False
+
+
+def classify_final_board(board: chess.Board) -> tuple[int, str, bool]:
+    """终局裁决唯一入口 → (result 白视角 0 胜/1 和/2 负, termination_reason, is_truncated)。
+
+    口径必须与对局循环的退出条件 `is_game_over(claim_draw=True)` 一致：该语义把"下一着
+    可申和"的三次重复/五十步也算终局，而 `board.is_repetition(3)` / `is_fifty_moves()`
+    是**严格**判定，两者差一 ply。曾因此把 78% 的规则申和局错记为"300 ply 封顶截断"
+    （2026-09-19 实测 gen2k：218 条 truncated 中 173 条实为申和），连带污染封顶率统计与
+    mlh 有效位。这里统一以 `outcome(claim_draw=True)` 为准，**只有规则未终局**（= 走满
+    max_plies）才是真截断。
+    """
+    outcome = board.outcome(claim_draw=True)
+    if outcome is None:
+        return 1, "truncated", True
+    if outcome.winner is None:
+        result = 1
+    else:
+        result = 0 if outcome.winner == chess.WHITE else 2
+    reason = _TERMINATION_TO_REASON.get(outcome.termination)
+    if reason is None:  # 标准国际象棋不应出现（variant 终止）
+        raise ValueError(f"未知终止原因 {outcome.termination} @ {board.fen()}")
+    return result, reason, False
 
 
 def encode_board(board: chess.Board, occurrence: int = 0) -> np.ndarray:
