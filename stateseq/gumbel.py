@@ -8,7 +8,10 @@
 - `Node.q` 为**该行棋方视角**的价值标量 q = P(win) − P(loss) ∈ [−1, 1]，和棋 = 0。
   与 WDL 三头换算 `q = wdl[0] − wdl[2]` 同构，与 Stage A 训练标签（行棋方归一）一致。
 - 跨边取负（零和）：父节点上"动作 a 的价值" = −(子节点 q)。
-- σ(q̂) 的 q̂ 是本树本次搜索的 min−max 归一值；归一化统计限定单次搜索，不跨树复用。
+- σ(q̂) 的 q̂ 是**该节点自身 completed Q 集合**的 min−max 归一值（2026-09-19 规格变更，
+  对齐 mctx `qtransform_completed_by_mix_value`）。此前用整棵树的 qbox，且该 qbox 以
+  父视角 root.q 起算、用子视角 child.q 扩展——视角混用且跨节点，会改变 ℓ 与 Q 的相对
+  权重。根评分 / 非根选择 / π′ 导出共用 `qtransform_completed` 一个函数。
 """
 
 from __future__ import annotations
@@ -54,7 +57,13 @@ def sigma(q_hat: np.ndarray | float, n_max: int | np.ndarray,
 
 
 def normalize_q(q: np.ndarray | float, q_min: float, q_max: float) -> np.ndarray:
-    """本树 min−max 归一：q̂ = (q − q_min) / (q_max − q_min + eps) ∈ [0, 1]。"""
+    """min−max 归一：q̂ = (q − q_min) / (q_max − q_min + eps) ∈ [0, 1]。
+
+    ⚠️ 2026-09-19 起 q_min/q_max **必须来自当前节点自身的 completed Q 集合**
+    （见 `qtransform_completed`）。此前传入的是整棵树的 min/max，且该统计以父视角的
+    `root.q` 起算、用子视角的 `child.q` 扩展——视角混用 + 跨节点量程，会改变
+    ℓ 与 Q 在打分中的相对权重（σ 的分母被其他节点撑大后，价值差异被压缩）。
+    """
     span = float(q_max) - float(q_min) + EPS
     return (np.asarray(q, np.float32) - np.float32(q_min)) / np.float32(span)
 
@@ -118,8 +127,7 @@ def policy_probs(node: Node) -> np.ndarray:
     return softmax(node.logits)
 
 
-def v_mix(node: Node, qmin: float, qmax: float,
-          c_visit: float = C_VISIT) -> float:
+def v_mix(node: Node, c_visit: float = C_VISIT) -> float:
     """v_mix = (v̂ + Σ_b N(b) · Σ_{a:N(a)>0} π(a)q(a)/(Σ_{a:N(a)>0} π(a)+ε)) / (1 + Σ_b N(b))。
 
     端点保护：无访问时退化为 v̂；分母加 ε（§2.2 review 意见）。
@@ -136,11 +144,11 @@ def v_mix(node: Node, qmin: float, qmax: float,
     return (v_hat + n_tot * (num / den)) / (1.0 + n_tot)
 
 
-def completed_q(node: Node, qmin: float, qmax: float) -> np.ndarray:
+def completed_q(node: Node) -> np.ndarray:
     """completedQ(a) = q(a) 若 N(a)>0，否则 v_mix。返回按 `legal` 对齐的 fp32 向量。"""
     if node.terminal or node.legal.size == 0:
         return np.zeros(0, np.float32)
-    vm = v_mix(node, qmin, qmax)
+    vm = v_mix(node)
     out = np.full(len(node.legal), vm, np.float32)
     if node.n.size:
         visited = np.flatnonzero(node.n > 0)
@@ -148,27 +156,41 @@ def completed_q(node: Node, qmin: float, qmax: float) -> np.ndarray:
     return out
 
 
-def improved_policy(node: Node, qmin: float, qmax: float,
-                    c_visit: float = C_VISIT, c_scale: float = C_SCALE) -> np.ndarray:
+def qtransform_completed(node: Node, c_visit: float = C_VISIT,
+                         c_scale: float = C_SCALE) -> np.ndarray:
+    """**唯一的 Q→打分变换**：σ(q̂)，q̂ 为该节点自身 completed Q 集合的 min−max 归一。
+
+    根评分（顺序减半淘汰）、非根选择、π′ 导出三处共用本函数，保证同一节点上
+    "选择依据"与"监督目标"完全一致。对齐 mctx 的
+    `qtransform_completed_by_mix_value`：先在当前节点补全全部合法动作的 Q，
+    再对**这一组**值重缩放，而不是用跨节点/跨视角的全树 qbox。
+    """
+    cq = completed_q(node)
+    if cq.size == 0:
+        return cq
+    q_hat = normalize_q(cq, float(cq.min()), float(cq.max()))
+    return sigma(q_hat, node.n_max, c_visit, c_scale)
+
+
+def improved_policy(node: Node, c_visit: float = C_VISIT,
+                    c_scale: float = C_SCALE) -> np.ndarray:
     """π_imp = softmax(ℓ + σ(completedQ))，在全部合法着上。"""
     if node.terminal or node.logits.size == 0:
         return np.zeros(0, np.float32)
-    cq = normalize_q(completed_q(node, qmin, qmax), qmin, qmax)
-    s = sigma(cq, node.n_max, c_visit, c_scale)
-    return softmax(node.logits + s)
+    return softmax(node.logits + qtransform_completed(node, c_visit, c_scale))
 
 
-def pi_prime(node: Node, qmin: float, qmax: float,
-             c_visit: float = C_VISIT, c_scale: float = C_SCALE) -> np.ndarray:
+def pi_prime(node: Node, c_visit: float = C_VISIT,
+             c_scale: float = C_SCALE) -> np.ndarray:
     """训练目标 π′(a) = softmax(ℓ + σ(completedQ(a)))，在**全部合法着**上（§2.2 修正②）。"""
     # 按规格定义，π′ 与 π_imp 的公式完全相同；独立成函数以区分"选择用"与"监督用"。
-    return improved_policy(node, qmin, qmax, c_visit, c_scale)
+    return improved_policy(node, c_visit, c_scale)
 
 
-def select_action(node: Node, qmin: float, qmax: float,
-                  c_visit: float = C_VISIT, c_scale: float = C_SCALE) -> int:
+def select_action(node: Node, c_visit: float = C_VISIT,
+                  c_scale: float = C_SCALE) -> int:
     """非根节点确定性选择（§2.2 修正①）：a* = argmax[π_imp − N/(1+ΣN)]。"""
-    pi_imp = improved_policy(node, qmin, qmax, c_visit, c_scale)
+    pi_imp = improved_policy(node, c_visit, c_scale)
     if node.n.size == 0:
         return int(node.legal[np.argmax(pi_imp)])
     frac = node.n.astype(np.float32) / np.float32(1 + node.n_total)
@@ -228,7 +250,9 @@ def order_halving(
         返回从 parent 走 action 到达的子节点（q 为子局面行棋方视角价值，legal/logits 齐全）；
         None 表示该着不存在（调用方应保证 parent.legal 内的动作都能展开）。
 
-    qmin/qmax：本树本次搜索的 min−max 统计（论文口径）。为 None 时自动在扩展过程中收集。
+    qmin/qmax：**仅作诊断统计**（全树见到的 q 范围），2026-09-19 起不再参与任何打分——
+        归一化已改为逐节点（`qtransform_completed`）。保留入参是为了兼容既有调用与
+        轨迹工具；传入值不影响搜索结果。
     返回 dict：{action, noise, sims_used, rounds, budget_check, survivors_per_round, qmin, qmax,
                  n_nodes, n_terminal, tree}
     """
@@ -277,7 +301,7 @@ def order_halving(
         nonlocal n_nodes, n_terminal
         if node.is_terminal:
             return float(node.q)
-        a = select_action(node, qmin, qmax, c_visit, c_scale)
+        a = select_action(node, c_visit, c_scale)
         edge_idx = int(np.flatnonzero(node.legal == a)[0])
         key = int(a)
         child = node.children.get(key)
@@ -331,8 +355,7 @@ def order_halving(
             sims_used += k
         # 顺序减半：按 g + ℓ + σ(q̂) 淘汰末位一半（σ 前先做本树 min−max 归一，§2.2）
         l_root = {int(a): float(x) for a, x in zip(root.legal, root.logits)}
-        cq_norm = normalize_q(completed_q(root, qmin, qmax), qmin, qmax)
-        s_root = sigma(cq_norm, root.n_max, c_visit, c_scale)
+        s_root = qtransform_completed(root, c_visit, c_scale)
         s_map = {int(a): float(x) for a, x in zip(root.legal, s_root)}
         scored = sorted(
             ((c.noise + l_root[c.action] + s_map[c.action], c) for c in surv),
@@ -359,8 +382,8 @@ def order_halving(
 
 # ---------------- 目标导出 ----------------
 
-def export_pi_prime(node: Node, qmin: float, qmax: float) -> tuple[np.ndarray, np.ndarray]:
+def export_pi_prime(node: Node) -> tuple[np.ndarray, np.ndarray]:
     """导出训练目标：返回 (legal_action_ids int64, pi_prime fp32)，支持集 = 全部合法着。"""
     ids = node.legal.astype(np.int64)
-    probs = pi_prime(node, qmin, qmax)
+    probs = pi_prime(node)
     return ids, probs

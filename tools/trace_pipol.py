@@ -121,12 +121,12 @@ def main():
             root = Node(legal=legal_arr.copy(), logits=legal_logits_f32.copy(), q=q_root)
 
             # Compute completedQ (no visits = v_mix = q_root)
-            cq = completed_q(root, q_min, q_max).astype(np.float32)
-            cq_norm = normalize_q(cq, q_min, q_max).astype(np.float32)
+            cq = completed_q(root).astype(np.float32)
+            cq_norm = normalize_q(cq, float(cq.min()), float(cq.max())).astype(np.float32)
             sig = sigma(cq_norm, 0, C_VISIT, C_SCALE).astype(np.float32)
 
             # π′ = softmax(ℓ + σ(completedQ))
-            pp = pi_prime(root, q_min, q_max, C_VISIT, C_SCALE).astype(np.float32)
+            pp = pi_prime(root, C_VISIT, C_SCALE).astype(np.float32)
 
             # π = softmax(ℓ)
             logits_stable = legal_logits_f32 - legal_logits_f32.max()
@@ -363,9 +363,9 @@ def main():
             qmax_search = float(result["qmax"])
 
             # π′ from search (with completedQ from visit counts)
-            pp_search = pi_prime(root_search, qmin_search, qmax_search, C_VISIT, C_SCALE).astype(np.float32)
-            cq_search = completed_q(root_search, qmin_search, qmax_search).astype(np.float32)
-            cq_norm_search = normalize_q(cq_search, qmin_search, qmax_search).astype(np.float32)
+            pp_search = pi_prime(root_search, C_VISIT, C_SCALE).astype(np.float32)
+            cq_search = completed_q(root_search).astype(np.float32)
+            cq_norm_search = normalize_q(cq_search, float(cq_search.min()), float(cq_search.max())).astype(np.float32)
             sig_search = sigma(cq_norm_search, root_search.n_max, C_VISIT, C_SCALE).astype(np.float32)
 
             # π (raw policy)

@@ -17,14 +17,17 @@ from stateseq.gumbel import (
     N_SIMS,
     Node,
     completed_q,
+    export_pi_prime,
     gumbel_topm,
     improved_policy,
     normalize_q,
     order_halving,
     pi_prime,
     policy_probs,
+    qtransform_completed,
     select_action,
     sigma,
+    softmax,
     v_mix,
 )
 
@@ -91,16 +94,16 @@ class GumbelCorrectnessTest(unittest.TestCase):
 
     def test_v_mix_zero_visits_fallback(self):
         node = _make_node([0, 1], [0.0, 0.0], q=0.5, n=[0, 0])
-        self.assertAlmostEqual(v_mix(node, qmin=0.0, qmax=1.0), 0.5)
+        self.assertAlmostEqual(v_mix(node), 0.5)
 
     def test_v_mix_single_visited(self):
         node = _make_node([0, 1], [0.0, 0.0], q=0.5, n=[1, 0], q_sum=[0.8, 0.0])
-        vm = v_mix(node, qmin=0.0, qmax=1.0)
+        vm = v_mix(node)
         self.assertTrue(np.isfinite(vm))
 
     def test_v_mix_eps_denominator(self):
         node = _make_node([0], [0.0], q=0.0, n=[0])
-        vm = v_mix(node, qmin=-1.0, qmax=1.0)
+        vm = v_mix(node)
         self.assertAlmostEqual(vm, 0.0)
 
     def test_sigma_zero_q(self):
@@ -109,7 +112,7 @@ class GumbelCorrectnessTest(unittest.TestCase):
 
     def test_completed_q_all_visited(self):
         node = _make_node([0, 1], [0.0, 0.0], q=0.0, n=[1, 1], q_sum=[0.5, -0.5])
-        cq = completed_q(node, qmin=-0.5, qmax=0.5)
+        cq = completed_q(node)
         self.assertAlmostEqual(float(cq[0]), 0.5)
         self.assertAlmostEqual(float(cq[1]), -0.5)
 
@@ -127,7 +130,7 @@ class GumbelCorrectnessTest(unittest.TestCase):
 
     def test_pi_prime_sum(self):
         node = _make_node([0, 1], [0.0, 0.0], q=0.0, n=[1, 1], q_sum=[0.3, -0.3])
-        pp = pi_prime(node, qmin=-0.3, qmax=0.3)
+        pp = pi_prime(node)
         s = float(pp.sum())
         self.assertAlmostEqual(s, 1.0, places=5)
 
@@ -142,7 +145,7 @@ class InvariantTest(unittest.TestCase):
         q_sum = np.array([0.1, 0.1, 0.1], dtype=np.float32)
         node = Node(legal=legal, logits=logits, q=0.0, n=n, q_sum=q_sum)
         pi = policy_probs(node)
-        pp = pi_prime(node, qmin=0.0, qmax=0.2)
+        pp = pi_prime(node)
         np.testing.assert_allclose(pp, pi, atol=1e-5)
 
     def test_illegal_actions_zero_prob(self):
@@ -152,7 +155,7 @@ class InvariantTest(unittest.TestCase):
         full = np.full(5, -3e4, dtype=np.float32)
         full[legal] = logits
         node2 = Node(legal=np.array([0, 1, 2, 3, 4], dtype=np.int64), logits=full, q=0.0)
-        pp = pi_prime(node2, qmin=-1.0, qmax=1.0)
+        pp = pi_prime(node2)
         mask = np.isin(np.arange(5), legal)
         zero_mask = ~mask
         if np.any(zero_mask):
@@ -210,7 +213,7 @@ class RecursiveDepthAndSignTest(unittest.TestCase):
         root = _make_node([0, 1], [0.0, 0.0], q=0.0)
         res = order_halving(root, _expand_chain, n_sims=64, m0=2, g=0.0, seed=1)
         self.assertEqual(res["action"], 0)
-        cq = completed_q(root, res["qmin"], res["qmax"])
+        cq = completed_q(root)
         self.assertGreater(cq[0], 0.0)
         self.assertLess(cq[1], 0.0)
 
@@ -237,14 +240,14 @@ class SoftCESafetyTest(unittest.TestCase):
         legal = np.array([0, 1], dtype=np.int64)
         logits = np.array([-3e4, 0.0], dtype=np.float32)
         node = Node(legal=legal, logits=logits, q=0.0)
-        ids, pp = pi_prime(node, qmin=-1.0, qmax=1.0)
+        ids, pp = pi_prime(node)
         self.assertTrue(np.all(np.isfinite(pp)))
         self.assertAlmostEqual(float(pp.sum()), 1.0, places=5)
 
     def test_terminal_node_empty(self):
         node = Node(legal=np.array([], dtype=np.int64), logits=np.array([], dtype=np.float32),
                     q=0.0, terminal=True)
-        pp = pi_prime(node, qmin=0.0, qmax=0.0)
+        pp = pi_prime(node)
         self.assertEqual(len(pp), 0)
 
 
@@ -266,3 +269,63 @@ class LifecycleTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PerNodeQNormalizationTest(unittest.TestCase):
+    """回归：σ 的 q̂ 必须用**本节点自身 completed Q 集合**的量程归一（2026-09-19 规格变更）。
+
+    旧实现用整棵树的 qbox（且以父视角 root.q 起算、用子视角 child.q 扩展），
+    分母被其他节点撑大后会压缩价值差异在打分中的权重，可能改变选择。
+    """
+
+    def _node(self):
+        # 两个合法着：policy 强烈偏向 a0（ℓ 差 7），但 Q 偏向 a1（差 0.20）
+        node = Node(legal=np.array([0, 1], np.int64),
+                    logits=np.array([0.0, -7.0], np.float32), q=0.0)
+        node.n = np.array([1, 1], np.int64)
+        node.q_sum = np.array([0.05, 0.25], np.float32)
+        return node
+
+    def test_uses_own_completed_q_span(self):
+        node = self._node()
+        cq = completed_q(node)
+        np.testing.assert_allclose(cq, [0.05, 0.25], atol=1e-6)
+
+        s = qtransform_completed(node, c_visit=50.0, c_scale=1.0)
+        # 本节点量程 = 0.20 → q̂ = [0, 1] → σ 展幅 = (50+1)*1.0 = 51
+        self.assertAlmostEqual(float(s[0]), 0.0, places=4)
+        self.assertAlmostEqual(float(s[1]), 51.0, places=3)
+
+        # σ 展幅 51 > ℓ 差 7 ⇒ π′ 必须偏向 Q 更高的 a1
+        pp = pi_prime(node)
+        self.assertGreater(float(pp[1]), float(pp[0]))
+        self.assertEqual(int(np.argmax(pp)), 1)
+
+    def test_wide_foreign_span_does_not_leak_in(self):
+        """把无关的大量程塞进全树 qbox 不应再影响本节点打分。"""
+        node = self._node()
+        s_before = qtransform_completed(node)
+        # 旧实现下这类"其他节点的极端 q"会把分母撑到 ~2.0，使 σ 差降到 ~6 < ℓ 差 7
+        node_far = Node(legal=np.array([0], np.int64),
+                        logits=np.array([0.0], np.float32), q=-1.0)
+        _ = completed_q(node_far)
+        s_after = qtransform_completed(node)
+        np.testing.assert_allclose(s_before, s_after, atol=1e-6)
+
+    def test_transform_shared_by_selection_and_target(self):
+        """非根选择与 π′ 导出必须来自同一个变换。"""
+        node = self._node()
+        a = select_action(node)
+        ids, pp = export_pi_prime(node)
+        pi_imp = improved_policy(node)
+        np.testing.assert_allclose(pp, pi_imp, atol=1e-6)
+        frac = node.n.astype(np.float32) / np.float32(1 + node.n_total)
+        self.assertEqual(a, int(node.legal[np.argmax(pi_imp - frac)]))
+
+    def test_constant_completed_q_gives_flat_sigma(self):
+        """所有 completedQ 相同 ⇒ σ 全相等 ⇒ π′ = π（不变量，零量程不得除零）。"""
+        node = Node(legal=np.array([0, 1, 2], np.int64),
+                    logits=np.array([1.0, 0.0, -2.0], np.float32), q=0.3)
+        pp = pi_prime(node)
+        np.testing.assert_allclose(pp, softmax(node.logits), atol=1e-5)
+        self.assertTrue(np.all(np.isfinite(pp)))

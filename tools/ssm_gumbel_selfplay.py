@@ -40,12 +40,10 @@ from stateseq.gumbel import (
     TERM_CODES,
     _Candidate,
     _n_rounds,
-    completed_q,
     export_pi_prime,
     gumbel_topm,
-    normalize_q,
+    qtransform_completed,
     select_action,
-    sigma,
 )
 from stateseq.data.gshards import META_V3_DTYPE, V3ShardWriter, encode_v3_pipol, make_game_key
 
@@ -227,7 +225,7 @@ class GameState:
             self.budget_violations += 1
 
         self.actions.append(int(chosen))
-        ids, probs = export_pi_prime(root_node, result["qmin"], result["qmax"])
+        ids, probs = export_pi_prime(root_node)
         self.pipol_actions.append(ids.astype(np.uint16))
         self.pipol_probs.append(probs.astype(np.float32))
 
@@ -282,7 +280,7 @@ class GameState:
     def _simulate_gen(self, node: Node, qbox: list, counters: dict):
         if node.is_terminal:
             return float(node.q)
-        a = select_action(node, qbox[0], qbox[1], self.cfg.c_visit, self.cfg.c_scale)
+        a = select_action(node, self.cfg.c_visit, self.cfg.c_scale)
         edge_idx = int(np.flatnonzero(node.legal == a)[0])
         key = int(a)
         child = node.children.get(key)
@@ -355,8 +353,7 @@ class GameState:
             if len(surv) == 1:
                 break
             l_root = {int(a): float(x) for a, x in zip(root.legal, root.logits)}
-            cq_norm = normalize_q(completed_q(root, qbox[0], qbox[1]), qbox[0], qbox[1])
-            s_root_vals = sigma(cq_norm, root.n_max, cfg.c_visit, cfg.c_scale)
+            s_root_vals = qtransform_completed(root, cfg.c_visit, cfg.c_scale)
             s_map = {int(a): float(x) for a, x in zip(root.legal, s_root_vals)}
             scored = sorted(((c.noise + l_root[c.action] + s_map[c.action], c) for c in surv),
                             key=lambda t: -t[0])

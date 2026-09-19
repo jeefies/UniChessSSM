@@ -173,8 +173,8 @@ def main():
             qmax = float(result["qmax"])
 
             # π' from completedQ (in-memory)
-            cq = completed_q(root_for_search, qmin, qmax).astype(np.float32)
-            pi_mem = pi_prime(root_for_search, qmin, qmax, C_VISIT, C_SCALE).astype(np.float32)
+            cq = completed_q(root_for_search).astype(np.float32)
+            pi_mem = pi_prime(root_for_search, C_VISIT, C_SCALE).astype(np.float32)
 
             # Encode through v3 pipol format
             pipol_bytes = encode_v3_pipol([root_for_search.legal.astype(np.uint16)], [pi_mem.astype(np.float16)])
