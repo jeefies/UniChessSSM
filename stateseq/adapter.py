@@ -17,8 +17,10 @@ import numpy as np
 import torch
 
 from .features import encode
-from .conditions import EloStandardizer, TimeControlBucket
+from .conditions import TimeControlBucket
 
+# Stage A 人类数据拟合的 Elo 统计量（与 conditions.EloStandardizer 的通用默认值不同）。
+# 自对弈固定条件 2567.5 统一用此组 mean/std。
 ELO_MEAN = 1656.1
 ELO_STD = 390.9
 

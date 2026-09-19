@@ -29,7 +29,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from stateseq.actions import action_to_move, move_to_action
 from stateseq.conditions import TimeControlBucket
-from stateseq.features import encode
 from stateseq.adapter import (
     encode_board, standardize_elo, wdl_logits_to_q, get_terminal_q, get_termination_reason,
 )
@@ -202,12 +201,11 @@ class GameState:
             return False
         key = _board_key(self.board)
         occ = self.occurrence.get(key, 0)
-        features = encode(self.board, occurrence=occ)
         legal_actions = _legal_actions_of(self.board)
         if not legal_actions:
             return False
         color = 1 if self.board.turn == chess.WHITE else 0
-        feats_root, tc_root, elo_root, _ = encode_board(self.board, occ_root)
+        feats_root, tc_root, elo_root, _ = encode_board(self.board, occ)
         logits_np, wdl_np, mlh_np, x_np, cache_new = yield (
             feats_root, int(tc_root), float(elo_root), color, self.root_cache)
         self.root_cache = cache_new
@@ -247,17 +245,16 @@ class GameState:
             move = _resolve_move(a, board)
             board.push(move)
             key = _board_key(board)
-            occ[key] = occ.get(key, 0) + 1
             color = 1 if board.turn == chess.WHITE else 0
             feats, tc_val, elo_std, _ = encode_board(board, occ.get(_board_key(board), 0))
             _, _, _, _, cache = yield (feats, int(tc_val), float(elo_std), color, cache)
+            occ[key] = occ.get(key, 0) + 1
 
         move = _resolve_move(action, board)
         board.push(move)
         terminal_by_rule = board.is_game_over(claim_draw=True)
         legal_actions = [] if terminal_by_rule else _legal_actions_of(board)
         key = _board_key(board)
-        occ[key] = occ.get(key, 0) + 1
         color = 1 if board.turn == chess.WHITE else 0
         new_path = node.path + (action,)
         if terminal_by_rule or not legal_actions:
@@ -268,6 +265,7 @@ class GameState:
         feats, tc_val, elo_std, _ = encode_board(board, occ.get(_board_key(board), 0))
         logits_np, wdl_np, mlh_np, x_np, _ = yield (
             feats, int(tc_val), float(elo_std), color, cache)
+        occ[key] = occ.get(key, 0) + 1
         q = wdl_logits_to_q(wdl_np)
         legal_arr = np.array(legal_actions, dtype=np.int64)
         logits_full = np.full(1936, -3e4, dtype=np.float32)

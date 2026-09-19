@@ -244,7 +244,7 @@ def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
                     torch.tensor([cc], dtype=torch.long, device=model.device),
                     cache_copy)
             q_c = wdl_logits_to_q(wc[0].cpu().numpy())
-            lc_np = lc[0].cpu().numpy()[legal_arr] if False else lc[0].cpu().numpy()
+            lc_np = lc[0].cpu().numpy()
             legal_c = _legal_actions_of(b_copy)
             lc_masked = np.full(1936, -3e4, dtype=np.float32)
             lc_masked[legal_c] = lc_np[legal_c]
@@ -298,15 +298,9 @@ def _aggregate_results(games_log, half, args) -> dict:
     draws = 0
     for gd in games_log:
         if gd["arena_result"] == 0:
-            if gd["white_ckpt_side"] == "A":
-                wins_a += 1
-            else:
-                wins_b += 1
+            wins_a += 1
         elif gd["arena_result"] == 2:
-            if gd["black_ckpt_side"] == "A":
-                wins_a += 1
-            else:
-                wins_b += 1
+            wins_b += 1
         else:
             draws += 1
     # 断言：W_A + W_B + D = N

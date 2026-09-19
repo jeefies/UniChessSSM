@@ -108,6 +108,8 @@ class SeqModel(nn.Module):
 
         # g 动力学：t≥1（t=0 无 x_{-1}，不入 L_dyn）；valid 取 t≥1 段
         # actions[t-1] 从 B_t 推进到 B_{t+1}，配 h_{t-1} 预测 x_t - x_{t-1}
+        # 注意：Stage A 训练使用 actions[:, 1:]，此处改为 actions[:, :-1] 对齐设计规格 §5.6 / §6。
+        # 从 Stage A checkpoint 续训时，dyn 损失定义发生语义变化，前若干步需观察 dyn_rel_err 跳变。
         delta_hat = self.g(h[:, :-1], batch.actions[:, :-1])  # (h_{t-1}, a_{t-1})
         dyn_mask = valid_mask[:, 1:] if valid_mask is not None else None
         l_dyn, diag_dyn = losses.dyn_loss(delta_hat, x[:, 1:], x[:, :-1], dyn_mask)
