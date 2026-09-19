@@ -86,7 +86,7 @@ class ArenaExpandTest(unittest.TestCase):
         np.testing.assert_array_equal(self.model.calls[-1], exp2.reshape(1, -1))
 
     def test_occurrence_encode_before_increment(self):
-        # 走 4 步回到初始局面：根已计 1 次 → 该局面此前出现 2 次 → is2=1, is1=0
+        # 根局面已计 1 次；4 步循环回到该局面 → occurrence=1 → is1=1, is2=0
         a1 = _aid("g1f3")
         child = _expand_child(self.model, self.board, self.cache, self.occur, self._root(), a1)
         node = child
@@ -95,8 +95,20 @@ class ArenaExpandTest(unittest.TestCase):
         leaf = _expand_child(self.model, self.board, self.cache, self.occur, node, _aid("f6g8"))
         self.assertEqual(leaf.path, (_aid("g1f3"), _aid("g8f6"), _aid("f3g1"), _aid("f6g8")))
         feats = self.model.calls[-1][0]
-        self.assertEqual(float(feats[783]), 0.0, "is1 应为 0（此前出现 2 次）")
-        self.assertEqual(float(feats[784]), 1.0, "is2 应为 1（此前出现 ≥2 次）")
+        self.assertEqual(float(feats[783]), 1.0, "is1 应为 1（此前出现 1 次）")
+        self.assertEqual(float(feats[784]), 0.0, "is2 应为 0（此前出现 <2 次）")
+
+        # 根局面已计 2 次 → 回到该局面时 occurrence=2 → is2=1（post-increment 实现会错发 is2）
+        self.model.calls.clear()
+        occur2 = {_board_key(self.board): 2}
+        child = _expand_child(self.model, self.board, self.cache, occur2, self._root(), a1)
+        node = child
+        for uci in ("g8f6", "f3g1"):
+            node = _expand_child(self.model, self.board, self.cache, occur2, node, _aid(uci))
+        _expand_child(self.model, self.board, self.cache, occur2, node, _aid("f6g8"))
+        feats2 = self.model.calls[-1][0]
+        self.assertEqual(float(feats2[783]), 0.0, "is1 应为 0（此前出现 ≥2 次）")
+        self.assertEqual(float(feats2[784]), 1.0, "is2 应为 1（此前出现 ≥2 次）")
 
     def test_illegal_path_action_raises(self):
         bad_root = Node(legal=np.array([0], dtype=np.int64),
