@@ -79,6 +79,9 @@ def main() -> None:
     ap.add_argument("--limit-games", type=int, default=0)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--w-selfplay", type=float, default=0.85, help="来源权重（§2.6 锁定 0.85）")
+    # 有效来源权重和 = 0.95（谜题 0.05 未接线）。这是整体损失缩放，**不等价于学习率乘 0.95**：
+    # AdamW 的自适应分母会抵消梯度的统一缩放（m/√v 对 g→cg 不变），实际影响还受
+    # 裁剪、ε 与解耦 weight decay 干扰。本轮保留 0.85/0.10，不补偿 LR，不为凑 1 强行接谜题。
     ap.add_argument("--w-human", type=float, default=0.10, help="来源权重（§2.6 锁定 0.10；谜题 0.05 plumbing 未接入，暂不参与）")
     args = ap.parse_args()
 
@@ -105,7 +108,8 @@ def main() -> None:
     warmup = min(200, int(steps_total * 0.1)) if args.warmup == 0 else args.warmup
     print(f"训练局数 human={len(human_ds.train_indices)} selfplay={len(sp_ds.train_indices)}；"
           f"有效 batch {eff_batch}；总步数 {steps_total}；warmup {warmup}；"
-          f"来源权重 selfplay={args.w_selfplay} human={args.w_human}", flush=True)
+          f"来源权重 w_selfplay={args.w_selfplay} w_human={args.w_human} w_puzzle=0 "
+          f"active_source_weight_sum={args.w_selfplay + args.w_human:.2f}", flush=True)
 
     model = SeqModel(dropout=0.1).to(device)
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
