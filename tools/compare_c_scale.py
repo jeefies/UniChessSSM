@@ -188,7 +188,15 @@ def _run_search(model, probes, scale: float, seed: int, cfg_n_sims: int, cfg_m0:
         sig = qtransform_completed(node, C_VISIT, scale)
         score = node.logits + sig
         order = np.argsort(-score)
-        best_i, second_i = int(order[0]), int(order[1])
+        # 终局前可能只剩 1 个合法着；此时"最优/次优差"无定义，记 None 而不是造假值
+        if len(order) >= 2:
+            best_i, second_i = int(order[0]), int(order[1])
+            score_gap = float(score[best_i] - score[second_i])
+            raw_q_gap = float(cq[best_i] - cq[second_i])
+            logit_gap = float(node.logits[best_i] - node.logits[second_i])
+        else:
+            best_i = int(order[0])
+            score_gap = raw_q_gap = logit_gap = None
         visits = node.n.astype(np.float64) if node.n.size else np.zeros(0)
         rec = {
             "game_idx": pr["game_idx"], "phase": pr["phase"], "ply": pr["target_ply"],
@@ -199,9 +207,9 @@ def _run_search(model, probes, scale: float, seed: int, cfg_n_sims: int, cfg_m0:
             "target_entropy_frac": _entropy(pi_target) / max(np.log(len(node.legal)), 1e-8),
             "kl_target_vs_policy": _kl(pi_target, pi_pol),
             "policy_entropy": _entropy(pi_pol),
-            "score_gap": float(score[best_i] - score[second_i]),
-            "raw_q_gap": float(cq[best_i] - cq[second_i]),
-            "logit_gap": float(node.logits[best_i] - node.logits[second_i]),
+            "score_gap": score_gap,
+            "raw_q_gap": raw_q_gap,
+            "logit_gap": logit_gap,
             "completed_q_span": span,
             "chosen_action": int(node.legal[best_i]),
             "chosen_is_best_score": True,
