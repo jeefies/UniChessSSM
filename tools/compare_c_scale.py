@@ -209,7 +209,7 @@ def _run_search(model, probes, scale: float, seed: int, cfg_n_sims: int, cfg_m0:
             "root_n_max": int(visits.max()) if visits.size else 0,
             "root_visits_candidates": int((visits > 0).sum()),
             "sims_used": int(res["sims_used"]),
-            "budget_ok": bool(res["budget_check"]),
+            "budget_ok": bool(res["sims_used"] == cfg_n_sims),
             "n_nodes": int(res["n_nodes"]),
             "n_terminal": int(res["n_terminal"]),
             "max_depth": int(res["max_depth"]),
