@@ -175,8 +175,14 @@ $$a^* = \arg\max_a \Big[\pi_{imp}(a) - \frac{N(a)}{1+\sum_b N(b)}\Big]$$
 completedQ(a) = q(a)            若 N(a) > 0
               = v_mix           否则
 v_mix = ( v̂ + Σ_b N(b) · Σ_{a:N(a)>0} π(a)q(a) / (Σ_{a:N(a)>0} π(a) + ε) ) / ( 1 + Σ_b N(b) )
-σ(q̂)  = ( c_visit + max_b N(b) ) · c_scale · q̂ ,   c_visit=50, c_scale=1.0
+σ(q̂)  = ( c_visit + max_b N(b) ) · c_scale · q̂ ,   c_visit=50, c_scale=0.1
 ```
+
+**c_scale 变更记录**（2026-09-20，`design-deviations.md` §9）：原定 c_scale=1.0 在 128 固定局面
+对照中把 ~0.03 的原始 Q 差放大成 18-logit 打分差，KL(π′‖π)=2.20 反超原始 policy 熵 1.81，
+60% 局面目标退化为近乎确定选择；32 局同权重搜索对抗验证 c_scale=0.1 明显更强（65.6% vs
+34.4%，0 和棋）。**改为 c_scale=0.1**，此前用 1.0 生成的 `stage_b_gen_fix500` 降级为诊断数据，
+不进入短训。
 
 其中 v̂ 为当前节点自身的网络价值，π 为当前节点 policy 概率。**端点保护**（review 意见）：节点尚无访问时 v_mix 退化为 v̂；分母加 ε；全部在 fp32 下计算。Q 归一化方式与缩放系数**只取论文版**，不与 mctx 当前默认值混合复制（两版不完全相同）。
 
@@ -351,7 +357,7 @@ $$\pi'(a) = \mathrm{softmax}\big(\ell(a) + \sigma(\mathrm{completedQ}(a))\big)\q
 | 通用 | 条件输入 | 自对弈：Elo 2567.5（+2.33σ）/ RAPID=2；人类：**保留原始条件**；谜题：Elo 2567.5 / unknown |
 | 通用 | 裁决 / 封顶 | 双方统一 claim_draw=True（含"下一着可申和"语义）/ 300 ply 记和、termination_reason 单独记录（封顶率 >20% 报警） |
 | 通用 | 训练序列长度 | **完整 300 ply**（不得静默继承 T_max=200；microbatch 按 T=300 重测） |
-| 主线 | Gumbel n / m₀ / c_visit / c_scale | 64 / 16 / 50 / 1.0（评测 g=0；吞吐降级档 n=32/m=8；前 3 代允许 n=96，记变更） |
+| 主线 | Gumbel n / m₀ / c_visit / c_scale | 64 / 16 / 50 / 0.1（2026-09-20 由 1.0 改，见 design-deviations.md §9；评测 g=0；吞吐降级档 n=32/m=8；前 3 代允许 n=96，记变更） |
 | 主线 | 每代局数 | 首轮闭环 2k–5k → 主循环 25k/代 |
 | 主线 | replay buffer | 最近 10 代，按代均匀采样 |
 | 主线 | 每代训练量 | **遍历预算 min(3 × buffer ÷ 512, 2000) 步**；warmup min(200, 步数×10%)；LR 每代 cosine 3e-5→3e-6 |

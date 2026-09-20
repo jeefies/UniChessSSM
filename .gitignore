@@ -3,6 +3,24 @@
 /runs/
 /logs/
 
+# 隐私档案（AI 会话转录，严禁进入公网仓库）
+claude-history/
+
+# 模型权重与训练数据
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.zst
+
+# 构建产物（C++ 分片构建器本地编译输出）
+tools/pgn2shards
+
+# 虚拟环境与日志
+.venv/
+venv/
+*.log
+
 # Python
 __pycache__/
 *.py[cod]
