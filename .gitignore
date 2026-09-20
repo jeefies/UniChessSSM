@@ -5,6 +5,10 @@
 
 # 隐私档案（AI 会话转录，严禁进入公网仓库）
 claude-history/
+session-ses_*.md
+session-*.md
+kimi-export-*.md
+*transcript*.md
 
 # 模型权重与训练数据
 *.pt
