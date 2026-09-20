@@ -129,7 +129,7 @@ def _build_root(model, probe):
     logits, wdl, mlh, x, cache_new = model.step_batch(
         np.asarray(feats, np.float32).reshape(1, -1), [int(tc_val)],
         [float(elo_std)], [int(color)], probe["cache"])
-    q = wdl_logits_to_q(wdl)
+    q = wdl_logits_to_q(wdl[0])
     legal = [a for m in probe["board"].legal_moves if (a := move_to_action(m)) is not None]
     legal_arr = np.array(legal, dtype=np.int64)
     logits_full = np.full(1936, -3e4, dtype=np.float32)
