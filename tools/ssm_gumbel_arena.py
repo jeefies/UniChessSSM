@@ -17,6 +17,7 @@ import argparse
 import hashlib
 import json
 import math
+import multiprocessing as mp
 import os
 import sys
 import time
@@ -199,7 +200,8 @@ def _expand_child(model: ArenaModel, board: chess.Board, cache, occur: dict,
 
 
 def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
-                  opening_san: str | None = None, opening_id: int = 0) -> dict:
+                  opening_san: str | None = None, opening_id: int = 0,
+                  seed: int = 0) -> dict:
     """单局对弈：双方模型各自对**完整历史**推进 cache/occurrence，搜索复用生产 order_halving。
 
     - 每 ply 双方模型都前进一步——每方的根快照等于"该检查点单独下完这盘棋"的 R 状态；
@@ -267,8 +269,9 @@ def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
             return _expand_child(models[side], board, caches[side], occur, node, action)
 
         c_visit, c_scale = scales[side]
+        ply_seed = seed + ply * 100003
         result = order_halving(root, expand, n_sims=n_sims, m0=m0, g=0.0,
-                               c_visit=c_visit, c_scale=c_scale)
+                               seed=ply_seed, c_visit=c_visit, c_scale=c_scale)
         if result["action"] is None:
             anomaly = "order_halving returned None"
             break
@@ -287,6 +290,7 @@ def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
     game_pgn = chess.pgn.Game.from_board(board)
     return {
         "opening_id": opening_id,
+        "seed": seed,
         "ckpt_white": model_w.ckpt_path,
         "ckpt_black": model_b.ckpt_path,
         "n_plies": len(actions),
@@ -332,10 +336,201 @@ def _aggregate_results(games_log, half, args, sprt_info=None) -> dict:
         "termination": term_counts,
         "truncated_rate": truncated / max(len(games_log), 1),
         "anomalies": anomalies,
+        "workers": getattr(args, "workers", 1),
     }
     if sprt_info:
         res["sprt"] = sprt_info
     return res
+
+
+# ---- 独立工作进程（多进程并行评测）----
+
+def _worker_process_fn(
+    worker_id: int,
+    assigned_pairs: list[tuple[int, int, str]],  # [(pair_idx, opening_id, opening_san), ...]
+    args: argparse.Namespace,
+    result_queue: mp.Queue,
+    stop_event: mp.Event,
+):
+    """Worker process:
+    - Loads model_a and model_b in its own process/context
+    - Plays assigned opening pairs (2 games each: A-W/B-B and B-W/A-B)
+    - Puts played pairs onto result_queue
+    - Listens to stop_event (e.g. for SPRT early stopping)
+    """
+    try:
+        model_a = ArenaModel(args.ckpt_a)
+        model_b = ArenaModel(args.ckpt_b)
+        model_a.c_visit = model_b.c_visit = args.c_visit
+        model_a.c_scale = args.c_scale_a
+        model_b.c_scale = args.c_scale_b
+
+        cfg = lambda: None
+        cfg.n_sims = args.n_sims
+        cfg.m0 = args.m0
+        cfg.max_plies = args.max_plies
+        cfg.c_visit = args.c_visit
+        cfg.c_scale = C_SCALE
+
+        for pair_idx, oi, opening_san in assigned_pairs:
+            if stop_event.is_set():
+                break
+
+            # 局 1: A 白 B 黑
+            g1_idx = pair_idx * 2
+            seed_1 = args.seed + worker_id * 1000 + g1_idx
+            gd1 = play_one_game(model_a, model_b, cfg, opening_san=opening_san, opening_id=oi, seed=seed_1)
+            gd1["game_idx"] = g1_idx
+            gd1["pair_idx"] = pair_idx
+            gd1["white_ckpt_side"] = "A"
+            gd1["black_ckpt_side"] = "B"
+            gd1["worker_id"] = worker_id
+
+            if stop_event.is_set():
+                result_queue.put(("game_pair", (pair_idx, [gd1])))
+                break
+
+            # 局 2: B 白 A 黑
+            g2_idx = pair_idx * 2 + 1
+            seed_2 = args.seed + worker_id * 1000 + g2_idx
+            gd2 = play_one_game(model_b, model_a, cfg, opening_san=opening_san, opening_id=oi, seed=seed_2)
+            r2 = gd2["arena_result"]
+            gd2["arena_result"] = 0 if r2 == 2 else 2 if r2 == 0 else 1
+            gd2["game_idx"] = g2_idx
+            gd2["pair_idx"] = pair_idx
+            gd2["white_ckpt_side"] = "B"
+            gd2["black_ckpt_side"] = "A"
+            gd2["worker_id"] = worker_id
+
+            result_queue.put(("game_pair", (pair_idx, [gd1, gd2])))
+
+        result_queue.put(("worker_done", worker_id))
+    except Exception as e:
+        import traceback
+        result_queue.put(("worker_error", (worker_id, str(e), traceback.format_exc())))
+
+
+def run_parallel_arena(args: argparse.Namespace, num_pairs: int, n_openings: int, t0: float) -> tuple[list[dict], dict | None]:
+    """多进程执行 arena 对弈并支持渐进式 SPRT 检查。"""
+    n_workers = min(args.workers, num_pairs)
+    # 按 round-robin 分配 pairs 给 workers
+    worker_pairs: list[list[tuple[int, int, str]]] = [[] for _ in range(n_workers)]
+    for pair_idx in range(num_pairs):
+        oi = pair_idx % n_openings
+        opening_san = OPENINGS[oi]
+        worker_pairs[pair_idx % n_workers].append((pair_idx, oi, opening_san))
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    stop_event = ctx.Event()
+
+    workers = []
+    for wid in range(n_workers):
+        p = ctx.Process(
+            target=_worker_process_fn,
+            args=(wid, worker_pairs[wid], args, result_queue, stop_event),
+            daemon=True,
+        )
+        p.start()
+        workers.append(p)
+        print(f"[worker {wid}] 启动 pid={p.pid} pairs={len(worker_pairs[wid])}", flush=True)
+
+    # SPRT 参数与阈值
+    p0, p1 = 0.50, 0.55
+    bound_b = math.log(args.sprt_beta / (1.0 - args.sprt_alpha))
+    log_p1_p0 = math.log(p1 / p0)
+    log_1p1_1p0 = math.log((1.0 - p1) / (1.0 - p0))
+
+    received_pairs: dict[int, list[dict]] = {}
+    completed_workers = 0
+    sprt_info = None
+
+    while completed_workers < n_workers:
+        try:
+            msg_type, payload = result_queue.get(timeout=1.0)
+        except Exception:
+            dead = [i for i, p in enumerate(workers) if not p.is_alive()]
+            if dead and completed_workers + len(dead) >= n_workers:
+                while not result_queue.empty():
+                    msg_type, payload = result_queue.get_nowait()
+                    if msg_type == "game_pair":
+                        pair_idx, games = payload
+                        received_pairs[pair_idx] = games
+                    elif msg_type == "worker_done":
+                        completed_workers += 1
+                break
+            continue
+
+        if msg_type == "game_pair":
+            pair_idx, games = payload
+            received_pairs[pair_idx] = games
+            total_games_so_far = sum(len(g) for g in received_pairs.values())
+            if len(received_pairs) % 4 == 0 or len(received_pairs) == num_pairs:
+                print("  [%.0fs] games %d/%d (pair %d/%d)" % (
+                    time.time() - t0, total_games_so_far, args.games, len(received_pairs), num_pairs), flush=True)
+
+            if args.sprt and total_games_so_far >= args.sprt_min_games and total_games_so_far < args.games and not stop_event.is_set():
+                all_current_games = []
+                for p_idx in sorted(received_pairs.keys()):
+                    all_current_games.extend(received_pairs[p_idx])
+                current_n = len(all_current_games)
+                s_a = sum(1.0 if g["arena_result"] == 0 else 0.5 if g["arena_result"] == 1 else 0.0
+                          for g in all_current_games)
+                llr = s_a * log_p1_p0 + (current_n - s_a) * log_1p1_1p0
+                if llr <= bound_b:
+                    saved_games = args.games - current_n
+                    saved_pct = saved_games / args.games * 100.0
+                    stop_event.set()
+                    sprt_info = {
+                        "early_stopped": True,
+                        "stop_reason": "sprt_reject_h1",
+                        "llr": float(llr),
+                        "llr_bound": float(bound_b),
+                        "alpha": float(args.sprt_alpha),
+                        "beta": float(args.sprt_beta),
+                        "p0": float(p0),
+                        "p1": float(p1),
+                        "games_played": current_n,
+                        "games_planned": args.games,
+                        "compute_saved_games": saved_games,
+                        "compute_saved_percent": saved_pct,
+                    }
+                    print(f"\n[SPRT Early Stop Triggered] LLR={llr:.3f} <= bound={bound_b:.3f} at game {current_n}/{args.games}", flush=True)
+                    print(f"Candidate rejected early. Compute saved: {saved_games} games ({saved_pct:.1f}%)\n", flush=True)
+
+        elif msg_type == "worker_done":
+            completed_workers += 1
+        elif msg_type == "worker_error":
+            wid, err_str, tb_str = payload
+            stop_event.set()
+            print(f"[worker {wid} ERROR]: {err_str}\n{tb_str}", file=sys.stderr, flush=True)
+            raise RuntimeError(f"Worker {wid} failed with error: {err_str}")
+
+    if stop_event.is_set():
+        # 给 workers 一点时间退出并收集剩余入队数据
+        time.sleep(0.5)
+        while not result_queue.empty():
+            try:
+                msg_type, payload = result_queue.get_nowait()
+                if msg_type == "game_pair":
+                    pair_idx, games = payload
+                    if pair_idx not in received_pairs:
+                        received_pairs[pair_idx] = games
+            except Exception:
+                break
+
+    for p in workers:
+        p.join(timeout=5.0)
+
+    all_games_log = []
+    current_game_idx = 0
+    for p_idx in sorted(received_pairs.keys()):
+        for gd in received_pairs[p_idx]:
+            gd["game_idx"] = current_game_idx
+            current_game_idx += 1
+            all_games_log.append(gd)
+
+    return all_games_log, sprt_info
 
 
 def main():
@@ -349,6 +544,7 @@ def main():
     ap.add_argument("--m0", type=int, default=16)
     ap.add_argument("--max_plies", type=int, default=300)
     ap.add_argument("--seed", type=int, default=20260917)
+    ap.add_argument("--workers", type=int, default=1, help="并行工作进程数（默认 1：串行运行）")
     ap.add_argument("--test-scoring", action="store_true")
     ap.add_argument("--c_visit", type=float, default=C_VISIT, help="双方共用的 c_visit")
     ap.add_argument("--c_scale_a", type=float, default=C_SCALE, help="A 侧 c_scale")
@@ -364,9 +560,6 @@ def main():
         return
 
     os.makedirs(args.out, exist_ok=True)
-    model_a = ArenaModel(args.ckpt_a)
-    model_b = ArenaModel(args.ckpt_b)
-
     # 模型身份验证
     ckpt_a_data = torch.load(args.ckpt_a, map_location="cpu", weights_only=False)
     sd_a = ckpt_a_data.get("model", ckpt_a_data)
@@ -375,17 +568,25 @@ def main():
     id_a = _model_id(sd_a)
     id_b = _model_id(sd_b)
 
-    dummy_feats = np.zeros((1, 785), dtype=np.float32)
-    dummy_tc = [2]
-    dummy_elo = [float(standardize_elo(2567.5))]
-    dummy_color = [1]
-    la, wa, _, _, _ = model_a.step(dummy_feats, dummy_tc, dummy_elo, dummy_color, model_a.initial_cache(1))
-    lb, wb, _, _, _ = model_b.step(dummy_feats, dummy_tc, dummy_elo, dummy_color, model_b.initial_cache(1))
-    import torch.nn.functional as F
-    pa = F.softmax(torch.from_numpy(la[0]), dim=0).numpy()
-    pb = F.softmax(torch.from_numpy(lb[0]), dim=0).numpy()
-    policy_diff = float(np.max(np.abs(pa - pb)))
-    wdl_diff = float(np.max(np.abs(wa - wb)))
+    if args.workers <= 1:
+        model_a = ArenaModel(args.ckpt_a)
+        model_b = ArenaModel(args.ckpt_b)
+        dummy_feats = np.zeros((1, 785), dtype=np.float32)
+        dummy_tc = [2]
+        dummy_elo = [float(standardize_elo(2567.5))]
+        dummy_color = [1]
+        la, wa, _, _, _ = model_a.step(dummy_feats, dummy_tc, dummy_elo, dummy_color, model_a.initial_cache(1))
+        lb, wb, _, _, _ = model_b.step(dummy_feats, dummy_tc, dummy_elo, dummy_color, model_b.initial_cache(1))
+        import torch.nn.functional as F
+        pa = F.softmax(torch.from_numpy(la[0]), dim=0).numpy()
+        pb = F.softmax(torch.from_numpy(lb[0]), dim=0).numpy()
+        policy_diff = float(np.max(np.abs(pa - pb)))
+        wdl_diff = float(np.max(np.abs(wa - wb)))
+    else:
+        policy_diff = 0.0 if id_a == id_b else 1.0
+        wdl_diff = 0.0 if id_a == id_b else 1.0
+        model_a = None
+        model_b = None
 
     model_ids = {"a": {"hash": id_a}, "b": {"hash": id_b}, "same_hash": id_a == id_b,
                  "forward_comparison": {"max_policy_prob_diff": policy_diff,
@@ -398,85 +599,93 @@ def main():
     # 运行对局：成对开局与颜色互换
     # pair i 包含 2 局：第 1 局 A 白 B 黑，第 2 局 B 白 A 黑（复用相同开局）
     num_pairs = args.games // 2
-    cfg = lambda: None
-    cfg.n_sims = args.n_sims
-    cfg.m0 = args.m0
-    cfg.max_plies = args.max_plies
-    cfg.c_visit = args.c_visit
-    cfg.c_scale = C_SCALE
-    model_a.c_visit = model_b.c_visit = args.c_visit
-    model_a.c_scale = args.c_scale_a
-    model_b.c_scale = args.c_scale_b
-    games_log = []
-    t0 = time.time()
     n_openings = min(args.pairs, len(OPENINGS))
+    t0 = time.time()
 
-    # SPRT 参数与阈值
-    # H0: p <= 0.50 vs H1: p >= 0.55
-    p0, p1 = 0.50, 0.55
-    bound_b = math.log(args.sprt_beta / (1.0 - args.sprt_alpha))  # ~ -2.944 (落后时提前拒绝 H1)
-    log_p1_p0 = math.log(p1 / p0)
-    log_1p1_1p0 = math.log((1.0 - p1) / (1.0 - p0))
+    if args.workers > 1:
+        # 多进程并行模式
+        games_log, sprt_info = run_parallel_arena(args, num_pairs, n_openings, t0)
+    else:
+        # 串行模式（workers == 1）
+        cfg = lambda: None
+        cfg.n_sims = args.n_sims
+        cfg.m0 = args.m0
+        cfg.max_plies = args.max_plies
+        cfg.c_visit = args.c_visit
+        cfg.c_scale = C_SCALE
+        model_a.c_visit = model_b.c_visit = args.c_visit
+        model_a.c_scale = args.c_scale_a
+        model_b.c_scale = args.c_scale_b
+        games_log = []
 
-    sprt_stopped = False
-    sprt_info = None
+        # SPRT 参数与阈值
+        # H0: p <= 0.50 vs H1: p >= 0.55
+        p0, p1 = 0.50, 0.55
+        bound_b = math.log(args.sprt_beta / (1.0 - args.sprt_alpha))  # ~ -2.944 (落后时提前拒绝 H1)
+        log_p1_p0 = math.log(p1 / p0)
+        log_1p1_1p0 = math.log((1.0 - p1) / (1.0 - p0))
 
-    for pair_idx in range(num_pairs):
-        oi = pair_idx % n_openings
-        opening_san = OPENINGS[oi]
+        sprt_stopped = False
+        sprt_info = None
 
-        # 局 1: A 白 B 黑
-        g1_idx = len(games_log)
-        gd1 = play_one_game(model_a, model_b, cfg, opening_san=opening_san, opening_id=oi)
-        gd1["game_idx"] = g1_idx
-        gd1["pair_idx"] = pair_idx
-        gd1["white_ckpt_side"] = "A"
-        gd1["black_ckpt_side"] = "B"
-        games_log.append(gd1)
+        for pair_idx in range(num_pairs):
+            oi = pair_idx % n_openings
+            opening_san = OPENINGS[oi]
 
-        # 局 2: B 白 A 黑
-        g2_idx = len(games_log)
-        gd2 = play_one_game(model_b, model_a, cfg, opening_san=opening_san, opening_id=oi)
-        r2 = gd2["arena_result"]
-        # 对齐到 A 视角：原结果 0(白胜/B胜) -> 2(A负), 2(黑胜/A胜) -> 0(A胜), 1 -> 1
-        gd2["arena_result"] = 0 if r2 == 2 else 2 if r2 == 0 else 1
-        gd2["game_idx"] = g2_idx
-        gd2["pair_idx"] = pair_idx
-        gd2["white_ckpt_side"] = "B"
-        gd2["black_ckpt_side"] = "A"
-        games_log.append(gd2)
+            # 局 1: A 白 B 黑
+            g1_idx = len(games_log)
+            seed_1 = args.seed + 0 * 1000 + g1_idx
+            gd1 = play_one_game(model_a, model_b, cfg, opening_san=opening_san, opening_id=oi, seed=seed_1)
+            gd1["game_idx"] = g1_idx
+            gd1["pair_idx"] = pair_idx
+            gd1["white_ckpt_side"] = "A"
+            gd1["black_ckpt_side"] = "B"
+            games_log.append(gd1)
 
-        if len(games_log) % 8 == 0 or len(games_log) == args.games:
-            print("  [%.0fs] games %d/%d (pair %d/%d)" % (
-                time.time() - t0, len(games_log), args.games, pair_idx + 1, num_pairs))
+            # 局 2: B 白 A 黑
+            g2_idx = len(games_log)
+            seed_2 = args.seed + 0 * 1000 + g2_idx
+            gd2 = play_one_game(model_b, model_a, cfg, opening_san=opening_san, opening_id=oi, seed=seed_2)
+            r2 = gd2["arena_result"]
+            # 对齐到 A 视角：原结果 0(白胜/B胜) -> 2(A负), 2(黑胜/A胜) -> 0(A胜), 1 -> 1
+            gd2["arena_result"] = 0 if r2 == 2 else 2 if r2 == 0 else 1
+            gd2["game_idx"] = g2_idx
+            gd2["pair_idx"] = pair_idx
+            gd2["white_ckpt_side"] = "B"
+            gd2["black_ckpt_side"] = "A"
+            games_log.append(gd2)
 
-        # 成对边界处检查 SPRT 早停（候选为 A）
-        current_n = len(games_log)
-        if args.sprt and current_n >= args.sprt_min_games and current_n < args.games:
-            s_a = sum(1.0 if g["arena_result"] == 0 else 0.5 if g["arena_result"] == 1 else 0.0
-                      for g in games_log)
-            llr = s_a * log_p1_p0 + (current_n - s_a) * log_1p1_1p0
-            if llr <= bound_b:
-                saved_games = args.games - current_n
-                saved_pct = saved_games / args.games * 100.0
-                sprt_stopped = True
-                sprt_info = {
-                    "early_stopped": True,
-                    "stop_reason": "sprt_reject_h1",
-                    "llr": float(llr),
-                    "llr_bound": float(bound_b),
-                    "alpha": float(args.sprt_alpha),
-                    "beta": float(args.sprt_beta),
-                    "p0": float(p0),
-                    "p1": float(p1),
-                    "games_played": current_n,
-                    "games_planned": args.games,
-                    "compute_saved_games": saved_games,
-                    "compute_saved_percent": saved_pct,
-                }
-                print(f"\n[SPRT Early Stop Triggered] LLR={llr:.3f} <= bound={bound_b:.3f} at game {current_n}/{args.games}")
-                print(f"Candidate rejected early. Compute saved: {saved_games} games ({saved_pct:.1f}%)\n")
-                break
+            if len(games_log) % 8 == 0 or len(games_log) == args.games:
+                print("  [%.0fs] games %d/%d (pair %d/%d)" % (
+                    time.time() - t0, len(games_log), args.games, pair_idx + 1, num_pairs))
+
+            # 成对边界处检查 SPRT 早停（候选为 A）
+            current_n = len(games_log)
+            if args.sprt and current_n >= args.sprt_min_games and current_n < args.games:
+                s_a = sum(1.0 if g["arena_result"] == 0 else 0.5 if g["arena_result"] == 1 else 0.0
+                          for g in games_log)
+                llr = s_a * log_p1_p0 + (current_n - s_a) * log_1p1_1p0
+                if llr <= bound_b:
+                    saved_games = args.games - current_n
+                    saved_pct = saved_games / args.games * 100.0
+                    sprt_stopped = True
+                    sprt_info = {
+                        "early_stopped": True,
+                        "stop_reason": "sprt_reject_h1",
+                        "llr": float(llr),
+                        "llr_bound": float(bound_b),
+                        "alpha": float(args.sprt_alpha),
+                        "beta": float(args.sprt_beta),
+                        "p0": float(p0),
+                        "p1": float(p1),
+                        "games_played": current_n,
+                        "games_planned": args.games,
+                        "compute_saved_games": saved_games,
+                        "compute_saved_percent": saved_pct,
+                    }
+                    print(f"\n[SPRT Early Stop Triggered] LLR={llr:.3f} <= bound={bound_b:.3f} at game {current_n}/{args.games}")
+                    print(f"Candidate rejected early. Compute saved: {saved_games} games ({saved_pct:.1f}%)\n")
+                    break
 
     elapsed = time.time() - t0
     manifest = _aggregate_results(games_log, len(games_log) // 2, args, sprt_info=sprt_info)
