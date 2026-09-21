@@ -70,8 +70,10 @@ def main() -> None:
     ap.add_argument("--microbatch", type=int, default=32)
     ap.add_argument("--accum", type=int, default=16)
     ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--mem-fraction", type=float, default=0.0, help="显存软上限比例 (0.0=不限制, 0.5=限制使用至多50%%显存)")
+    ap.add_argument("--threads", type=int, default=0, help="PyTorch CPU 线程数限制 (0=保持默认)")
     ap.add_argument("--lr", type=float, default=3e-5)
-    ap.add_argument("--warmup", type=int, default=0, help="0 = 自动 min(200, 步数×10%)")
+    ap.add_argument("--warmup", type=int, default=0, help="0 = 自动 min(200, 步数×10%%)")
     ap.add_argument("--save-every", type=int, default=1000)
     ap.add_argument("--val-every", type=int, default=1000)
     ap.add_argument("--val-batches", type=int, default=8)
@@ -88,6 +90,12 @@ def main() -> None:
 
     os.makedirs(args.out, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda" and args.mem_fraction > 0.0:
+        torch.cuda.set_per_process_memory_fraction(args.mem_fraction, 0)
+        print(f"限制 PyTorch 显存上限至 {args.mem_fraction * 100:.1f}%", flush=True)
+    if args.threads > 0:
+        torch.set_num_threads(args.threads)
+        print(f"限制 PyTorch CPU 计算线程数至 {args.threads}", flush=True)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
