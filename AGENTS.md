@@ -9,8 +9,8 @@ UniChessSSM 是 UniChess 的**新架构独立项目**：状态序列模型（sta
 → 基础 Mamba R（12 层）→ policy/WDL/moves-left 三头 f；训练期辅助模块 D（MLP 重建）与
 g（残差动力学）不参与推理。预热用 Lichess 人类棋谱行为克隆（**不用 Stockfish 蒸馏**）。
 
-**权威设计文档**：`docs/state-sequence-model-design.md`（v2.0，D1–D10【锁定】不可改）。
-**偏差记录**：`docs/design-deviations.md`（实现时经文档作者确认的口径调整，权威文档原文不动）。
+**权威系统设计与框架说明书**：`docs/state-sequence-model-design.md`（v3.0，唯一权威架构与代码手册，D1–D10【锁定】不可改）。
+**设计偏差与审计日志**：`docs/design-deviations.md`（历史审查与变更审计索引，内容已合入设计说明书 v3.0）。
 **Stage B 实施规格**：`docs/stage-b-implementation.md`（唯一规格来源，与 handoff 冲突时以规格为准）。
 **阶段交接**：`docs/stage-b-handoff.md`（阶段① 实现+算法单测；A 组全过前禁止生成正式训练数据）。
 

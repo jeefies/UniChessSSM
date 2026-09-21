@@ -1,404 +1,395 @@
-# UniChess 状态序列模型 · 实施设计文档
+# UniChess SSM 状态序列模型系统设计与框架说明书 (v3.0)
 
-> 版本：v2.0（实施交接稿）  日期：2026-09-14
-> 读者：负责实现的 agent / 工程师。**本文档自包含**，不依赖任何对话上下文。
-> 项目性质：游玩性质的小项目——不做消融实验矩阵，只保留最小冒烟门禁。
-> 一句话定位：**带历史记忆与预测性辅助训练的策略—价值模型**（D/g 只在训练时辅助表示学习，不参与推理与规划）。
-> 代码落地位置：WSL Ubuntu 项目 `/home/jeefy/UniChess`（本 Windows 目录只放文档）。
-
-**版本沿革**
-- v2.0：展开为实施级文档；新增数据管线规格、模块精确结构、阶段 0 验收测试、实施约束、附录 A（否决/缓行路线）。
-- v1.3：依据外部评审修正（数据源勘误、D 改 MLP、MCTS 缓存重写、残差动力学措辞、参数/成本重算、损失归一化、序列一致性）。
-- v1.2：全模块残差化；g 升级为残差动力学。v1.1：E=格子级 Transformer、R=基础 Mamba、Pre-RMSNorm。
+> **版本**：v3.0（框架权威技术手册）  
+> **最后更新**：2026-09-21  
+> **文档性质**：本文档为 UniChessSSM 项目的**唯一权威框架说明书**。  
+> **范围界定**：本文档**严格仅保留两类核心信息**：
+> 1. **框架真实的设计结构与代码实现**（Architecture, Dataflow, Feature Specs, Model Topologies, Loss Formulations, Gumbel Search Engine, Shard Protocols, Training & Inference Pipelines, Code Layout）；
+> 2. **当前阶段存在的问题与技术债务**（Known Issues, Technical Debt, Numerical Constraints, Traps & Methodological Lessons）。
+>
+> *(注：所有分阶段历史实施计划、定性/定量基准实验结果、消融矩阵与探索推演，均已剥离至专用文档：`docs/stage-a-experiment.md`、`docs/stage-b-experiment.md`、`docs/stage-b-implementation.md`、`docs/stage-b-handoff.md` 与 `docs/offline-explorations.md`。原 `docs/design-deviations.md` 的所有已确认偏差与改进均已完整审核并合入本文档。)*
 
 ---
 
-## 0. 目录
+## 1. 核心架构设计与系统总览
 
-1. 背景与现状  2. 决策记录  3. 总体架构  4. 数据管线规格  5. 模型规格（含全部公式）  6. 损失函数  7. 梯度回传与训练稳定性  8. 分阶段训练管线  9. MCTS 集成规格  10. 验证与门禁  11. 监控  12. 风险登记册  13. 实施约束  附录 A. 否决与缓行路线  附录 B. 参考资料
+UniChessSSM 是一个针对国际象棋的**状态序列模型（State-Sequence Model, SSM）**。区别于将局面序列化为字符 token 的文本生成模型或仅看单步画面的传统卷积网络，UniChessSSM 将整局历史中每一步棋盘状态显式编码为密集向量，通过双遍格子级 Transformer 提取单步局部拓扑空间嵌入，随后送入单向 12 层 Mamba-2 状态空间时序主干处理长程依赖与时空上下文，最终由轻量级三头多任务预测层输出策略与价值评估。在训练期间，辅以浅层棋盘重构模块（Model D）与残差动力学表征预测模块（Model g），在无引擎蒸馏的前提下实现高效自主表征塑造。
 
----
-
-## 1. 背景与现状
-
-UniChess 是一个国际象棋引擎项目。现役模型为 46M 参数 ResNet（24 残差块 × 320 通道），由 Stockfish 标注数据监督训练（蒸馏路线），内部评测棋力约 1300 Elo。
-
-**已存在且可复用的基础设施**（位于 WSL `/home/jeefy/UniChess`，详见 `claude-history/HANDOFF.md`）：
-- 自对弈 autoloop 系统（actors 批量 GPU 推理 + learner + arena），5070 Ti 主机常驻；
-- 修复过的 MCTS 实现（root-Q 符号、真实重复历史、唯一挂起叶、升变 target、Syzygy 残局库接入）；
-- champion 门控评测（24 色对 / 400 sims / paired sign p<.05 / score>.52）；
-- 已部署的对弈网站与反向隧道（unichess-server / unichess-tunnel）。
-- 环境：5070 Ti 主机 conda 环境 `/home/jeefy/miniconda3/envs/unichess/bin/python`；另有共享 PRO 6000 主机（仅限空闲窗口，项目目录 `/root/autodl-tmp/fwj/UniChess`，依赖装项目本地 pylibs，**不得动共享 conda**）。
-
-**本项目（本文档覆盖范围）**：训练一个新架构模型——状态序列化输入（每步局面显式编码为向量序列）+ 时间主干整合全历史 + 世界模型式辅助训练。人类棋谱行为克隆（BC）预热，随后接入自对弈 RL。**不用 Stockfish 蒸馏。**
-
----
-
-## 2. 决策记录（已锁定，实现时不得偏离；如需变更回到文档作者确认）
-
-| # | 决策 | 内容 |
-|---|---|---|
-| D1 | 预热方案 | Lichess 原始 PGN 重放生成状态序列，人类走子 BC；不用任何引擎蒸馏 |
-| D2 | 条件输入 | 保留 `[time_control][elo][color]` 三个条件向量 |
-| D3 | 算力分配 | 5070 Ti 常开 autoloop；PRO 6000 空闲窗口做预热大训 |
-| D4 | 规模 | 目标总量 ~28M 参数（预算表 §5.6，待代码实测核算） |
-| D5 | 输入 | 全历史局面状态序列；棋盘固定**白方绝对坐标**，不随走子方翻转 |
-| D6 | 架构 | E=格子级 Transformer（权重共享走两遍）；R=基础 Mamba；f=policy/WDL/moves-left 三头；D=MLP 重建解码器（仅训练）；g=残差动力学侧枝（仅训练） |
-| D7 | Norm | 全局 Pre-RMSNorm；禁用 BatchNorm；同形堆叠块一律残差 |
-| D8 | 实验纪律 | 不做消融矩阵；仅保留冒烟门禁（§10）；L_aux 暂缓 |
-| D9 | 数据配比 | 初始：全分段保留 + 线性 Elo 加权 r≈20（初始选择，可按观测调整，非铁律） |
-| D10 | 动作空间 | 紧凑 (from,to)+升变编码，1936 维（§3.3 精确构造，双射单测强制） |
-
----
-
-## 3. 总体架构与核心规格
-
-### 3.1 架构总览
+### 1.1 架构数据流图 (Dataflow)
 
 ```
-                     ┌────────── 主路径（推理 = 这条） ──────────┐
+                       ┌────────── 主前向路径（训练 + 推理共用） ──────────┐
 
- 局面序列 B₀..B_T ──► E(·) ──► x₀..x_T ──► R(·) ──► h₀..h_T ──► f(·)
- (§3.2 特征,          格子级Transformer   局面嵌入序列   基础Mamba    隐状态   ├─ policy（1936+合法mask）
-  白方绝对坐标)       (64格token×2遍)                                       ├─ WDL 价值
-                      ▲                                    ▲               └─ moves-left
-                      │                                    │
-            D 重建侧枝 │                            g 动力学侧枝 │
-            MLP(x_t)→64×13                  x̂_t = sg(x_{t-1}) + predictor(g(h_{t-1}, a_t))
-            （辅助监督/诊断）                  L_dyn = ‖Δ̂ − sg(x_t − x_{t-1})‖²
+  棋盘状态 B_t ────────► E(·) ─────► x_t ∈ R^512 ──(+)──► Pre-RMSNorm ──► R(·) ──► h_t ∈ R^512 ──► f(·)
+  (785 维无损特征,       格子级Transformer         ▲                     12层Mamba-2       ├─ Policy logits (1936 + mask)
+   白方绝对坐标)         (64格token×2遍)          │                     (逐层conv+ssm)     ├─ WDL 胜平负概率三分类
+                                                   │                                       └─ Moves-Left 剩余步数
+                         条件嵌入 c_t ──────────────┘
+                         (time_control + elo + color)
+
+                         ┌────────── 辅助监督侧枝（仅训练期激活，推理完全丢弃） ──────────┐
+                         │                                                                  │
+                         ▼ D 模块 (MLP 重建侧枝)                                            ▼ g 模块 (残差动力学侧枝)
+                         B̂_t = D(x_t)                                                       Δ̂_t = predictor(g(h_{t-1}, emb_a(a_t)))
+                         (64×13 棋子重构 + 3类全局辅助位)                                   x̂_t = sg(x_{t-1}) + Δ̂_t
+                         L_recon 辅助空间表征锚定                                            L_dyn = ‖Δ̂_t − sg(x_t − x_{t-1})‖²
 ```
 
-| 模块 | 功能 | 训练 | 推理 |
+### 1.2 核心设计决策 (D1–D10 架构约束)
+
+根据系统锁定规范，以下十项核心决策构成项目的不可变基石：
+
+- **D1（预热方案）**：使用 Lichess 真实人类棋谱行为克隆（Behavior Cloning, BC）预热，严禁使用 Stockfish 或其他传统国际象棋引擎进行特征与分数蒸馏。
+- **D2（条件输入）**：保留 `time_control`（时间控制）、`elo`（选手评分等级）、`color`（走子方视角）三类条件特征嵌入，使模型具备风格与强度的可控条件先验。
+- **D3（算力与调度规范）**：自对弈生成与强化学习训练单卡分时交替，互不争抢显存；严格遵循各计算设备的隔离约束。
+- **D4（模型参数规模）**：整体规模严格受控在 ~26.4M–28M 参数量，主干兼顾推理低延迟与表征容量。
+- **D5（白方绝对坐标系）**：输入特征严格采用白方绝对坐标（a1..h8 拓扑恒定），棋盘不随当前走子方翻转；走子方信息由显式特征位提供。
+- **D6（模块拓扑分配）**：
+  - 格子级 Transformer $E$：单层权重共享循环两遍（$K=2$），无跨局面历史；
+  - 基础主干 $R$：12 层 Mamba-2 状态空间模型（d_model=512, expand=2, d_state=16）；
+  - 预测头 $f$：policy（1936 维）/ WDL 价值（3 分类）/ moves-left（1 标量）；
+  - 辅助模块 $D$：浅层 MLP 局面重建解码器（训练期）；
+  - 辅助模块 $g$：残差动力学增量预测器（训练期）。
+- **D7（归一化与残差范式）**：全局采用 Pre-RMSNorm 架构；**全模型严禁使用 BatchNorm**（防止批次统计量泄露、自对弈分布漂移与 train/eval 不一致）；同形堆叠块严格残差连接。
+- **D8（工程实验纪律）**：主线工程不做组合爆炸的消融矩阵，仅维持最小可验证的冒烟门禁，聚焦快速闭环。
+- **D9（数据分布与加权）**：人类棋谱保留全分段覆盖，配合线性 Elo 权重聚焦高质量决策。
+- **D10（紧凑动作空间）**：采用 1936 维紧凑动作空间（后/马合法有序对 + 升变特判），通过全量双射保证空间完备性与高效 softmax。
+
+---
+
+## 2. 局面与动作表征规范
+
+### 2.1 785 维局面特征编码（白方绝对坐标）
+
+每个半回合局面由规则引擎推导并编码为 $B_t \in \mathbb{R}^{785}$ 的密集张量。该编码是**确定性且完全无损的**（由该特征可精确逆向恢复 FEN 与全部棋规状态）：
+
+| 索引区间 | 维度 | 字段定义与物理含义 | 取值范围与编码规范 |
 |---|---|---|---|
-| E（≈MuZero 的 h） | 局面 → x_t ∈ R^512 | ✅ | ✅ 每节点一次 |
-| R | h_t = R(h_{t-1}, x_t)，12 层 Mamba | ✅ | ✅ 每节点单步 |
-| f | policy / WDL / moves-left | ✅ | ✅ |
-| D | x_t → 棋盘（辅助监督与诊断） | ✅ | ❌ |
-| g + predictor | (h_{t-1}, a_t) → 增量 Δ̂（表示塑形） | ✅ | ❌ |
+| `[0, 768)` | 768 (12×64) | 12 个棋子平面的占用位棋盘 | 严格二值 $\{0, 1\}$。平面顺序：白 P, N, B, R, Q, K (0..5)，黑 P, N, B, R, Q, K (6..11)；格序按 a1=0, b1=1, ..., h8=63 绝对排列 |
+| `[768]` | 1 | 走子方标记 (Side to move) | 白方走子 = 1.0，黑方走子 = 0.0 |
+| `[769, 773)` | 4 | 四方易位权 (Castling rights) | 白王翼、白后翼、黑王翼、黑后翼，二值 $\{0, 1\}$ |
+| `[773, 781)` | 8 | 吃过路兵列 (En-passant target file) | 列 a..h 的 8 维 One-Hot（仅当场上存在**合法可执行**吃过路兵走法时置 1，否则全零） |
+| `[781]` | 1 | 半回合计数器 (Halfmove clock) | `halfmove_clock / 100.0`（截断上限 1.0，用于五十步和棋规则追踪） |
+| `[782]` | 1 | 完整回合数 (Fullmove number) | `fullmove / 200.0`（截断上限 1.0） |
+| `[783, 785)` | 2 | 局面重复计数历史 (Repetition references) | `[is_rep_1, is_rep_ge2]`，此前出现 1 次 / $\ge 2$ 次（供网络参考；终局判定权威严格在规则引擎） |
 
-### 3.2 局面特征 B_t（无损；规则引擎推导；白方绝对坐标）
+#### 零分配高速位棋盘提取器 (`encode_board_fast`)
+为解决 Python 字典遍历与动态对象创建的高昂开销，核心编码器底层（`stateseq/features.py`）采用零堆分配（Zero-Allocation）位棋盘直接解包算法：
+- 直接提取 `chess.Board` 的 `occupied_co` 及其各兵种 `uint64` 掩码；
+- 使用预分配固定缓冲区 `_MASKS_SCRATCH` 与 `np.unpackbits` 对 64 位整数进行矢量化解包；
+- 易位权与过路兵通过位运算提取，支持外部传入预分配张量 `out` 原地覆写；
+- 编码单次延迟压降至 **8.97 $\mu\text{s}$**（相比通用实现的 49.92 $\mu\text{s}$ 提速 **5.57×**，吞吐达 11.1 万局面/秒），保证单步 MCTS / Gumbel 仿真中 CPU 瓶颈彻底消除，且输出与标准 785 维特征张量保持**逐位严格浮点一致**。
 
-每半回合由规则引擎（python-chess 或项目现有 movegen）导出：
+### 2.2 1936 维紧凑动作空间与双射协议
 
-| 特征 | 形状 | 说明 |
-|---|---|---|
-| 棋子平面 | 12 × 64 二值 | 平面顺序：白 P N B R Q K，黑 P N B R Q K；格索引 a1=0, b1=1, …, h8=63 |
-| 走子方 | 1 | 白走=1 |
-| 易位权 | 4 | 白王/后翼、黑王/后翼 |
-| 过路兵格 | 8 | 可吃过路兵的 file one-hot，无则全零 |
-| 半回合计数 | 1 | halfmove_clock / 100 |
-| 全回合数 | 1 | fullmove / 200（截断到 1） |
-| 重复计数 | 2 | 当前局面此前出现 0/1/≥2 次 → [is1, is2]（参考特征，判定权威永远在规则引擎） |
+为降低全展开 4672 维动作空间对 softmax 与注意力头带来的冗余计算与显存开销，UniChessSSM 严格采用 1936 维紧凑动作空间：
+$$\mathcal{A}_{\text{total}} = 1456 (\text{后走法}) + 336 (\text{马走法}) + 144 (\text{升变走法}) = 1936$$
 
-合计约 790 维。**无损**：由上述字段可完整恢复 FEN。
+1. **后走法有序对 (1456)**：包含车、象、后及兵的常规直斜进移动，以及王的两格横向移动（王车易位天然编码在王横移两格的有序对中，如白王 e1→g1、e1→c1，无需额外特判分支）。
+2. **马走法有序对 (336)**：覆盖全盘所有合法马跃步。
+3. **升变走法特判 (144)**：白兵 7→8 线、黑兵 2→1 线，共 16 个出发格 × 3 个名义方向（直推、左吃、右吃）× 3 种兵种 $\{R, B, N\} = 144$ 种动作（升后走法已完全被后走法 1456 空间覆盖，不重复计入）。
 
-### 3.3 动作空间（1936 维，紧凑编码）
+`stateseq/actions.py` 将上述规则固化为全局只读双射映射常量表（`ACTION_TO_MOVE` 与 `MOVE_TO_ACTION`），并受自动化单测严格看护，确保双向单射无空洞、无重叠。
 
-- **非升变**：所有后/马可达的有序 (from,to) 对 = 1456（后走法）+ 336（马走法）= **1792** 个 id；
-- **升变**：兵到末排的 (from,to) 对（白 7→8 线、黑 2→1 线，共 16 from 格 × 3 方向 = 48 对）× {R,B,N} 三种 = **144** 个 id（升后已含于 1792 的后走法中）；
-- 合计 **1936**。id 编排规则由实现方定义并**写死为常量表**，强制单元测试：动作 id ↔ (from,to,promo) 双射、覆盖全部合法着（含全部升变）、与 §3.2 的白方绝对坐标一致。
-- 参考：ChessMimic 用 1968 维（构造略异，https://arxiv.org/html/2606.04473v1 ）；备选标准方案为 AlphaZero 式 8×8×73=4672（更浪费但更常见）——选用 1936 是出于 softmax 成本。
+### 2.3 多源条件输入嵌入 ($c_t$)
 
-### 3.4 条件输入
-
-`[time_control]`（离散桶 embedding：bullet/blitz/rapid/classical/correspondence/other）、`[elo]`（双方平均 Elo，标准化到零均值单位方差后线性投影）、`[color]`（2 类）。三者各投影到 R^512 后与 x_t **相加**进 R。推理时置最大 Elo 桶求最强，置目标分段得人类化风格。缺失元数据的训练样本用专用 "unknown" 桶。
-
----
-
-## 4. 数据管线规格（Stage A）
-
-### 4.1 源数据
-
-- Lichess 开放数据库 https://database.lichess.org/ 月度标准对局文件（`.pgn.zst`）。
-- 首月即可启动（单月约数亿局，按吞吐实测决定取量）；**默认保留全分段**（D9）。
-- 排除：变体棋（antichess/atomic 等）、超短局（<10 ply）、无结果局以外的异常终止（abandoned 可保留但结果按实际计）。
-- 元数据提取：双方 Elo、time control、结果。
-
-### 4.2 序列构建
-
-对每局 PGN：用规则引擎从初始局面重放，每个半回合 t 产出一条记录：
-
-```
-(B_t 特征[790], a_t 动作id[1936], legal_mask_t[1936 二值],
- result ∈ {W,D,L}（对行棋方归一）, moves_left_t = (T − t)（单位：ply）,
- cond = {time_control 桶, elo_mean, color})
-```
-
-- 每局生成**双方视角两条序列**是旧方案（走子序列模型）的做法；本方案局面显式输入，**一条序列即可**（模型在每一步都预测行棋方动作）。
-- moves_left 以 ply 计；超长截断到 T_max=200。
-- 存储：复用项目现有分片惯例（或新设 `data/stateseq/` 分片），每片固定局数；按 game_id 哈希划分 train/val（val 取 0.5%），**同一局不得跨 train/val**。
-
-### 4.3 Elo 加权
-
-线性：`w(e) = (e − e_min) / (e_max − e_min) · (r−1) + 1`，e_min/e_max 取数据分布的 P1/P99 截断，r=20（D9）。归一化见 §6。
+每个半回合的条件向量 $c_t \in \mathbb{R}^{512}$ 由三路特征独立线性投影后相加构成：
+$$c_t = \mathrm{emb}_{tc}(b^{tc}) + W_e \cdot \hat{e} + \mathrm{emb}_{color}(j_t)$$
+- **时间控制桶 ($\mathrm{emb}_{tc}$)**：7 类别 Embedding（bullet, blitz, rapid, classical, correspondence, other, unknown），依据对局总时限与加秒综合折算。
+- **选手评分等级 ($W_e$)**：双方平均 Elo 经全量数据集 P1/P99 截断并归一化为零均值单位方差标量 $\hat{e} = (e - \mu) / \sigma$，经 1×512 线性变换投射。
+- **走子方视角 ($\mathrm{emb}_{color}$)**：当前半回合走子方（2 类 Embedding）。**必须按每步实际走子方动态逐步切换**，严禁使用对局首步值静态绑定，确保时序展开中黑白方条件对称。
 
 ---
 
-## 5. 模型规格（全部公式；目标 ~28M，见 §5.6）
+## 3. 模型各模块详细拓扑与数学规格
 
-记号：d=512（主干维度）；T≤200；d_e=256（E 内部宽度）；heads=8。
+全模型实测参数量为 **26.40M**（完全符合 D4 预算要求）。
 
-### 5.1 Norm 与残差总则
+| 模块名称 | 源码定位 | 参数量 | 推理时是否启用 | 核心功能与维度 |
+|---|---|---|---|---|
+| **E (格子级 Transformer)** | `stateseq/model_e.py` | 1.14M | **是**（每步 1 次） | 785 维特征 $\to$ 64 格 Token $\to$ 2 遍权重共享 Transformer $\to$ 单查询聚合 $\to x_t \in \mathbb{R}^{512}$ |
+| **R (Mamba-2 主干)** | `stateseq/model_r.py` | 19.25M | **是**（每步单步递推） | 12 层 Mamba-2，d_model=512, expand=2，隐状态时序更新 $h_t \in \mathbb{R}^{512}$ |
+| **f (预测头群)** | `stateseq/heads.py` | 1.52M | **是**（每步输出） | policy logits (1936), WDL 价值 (3), moves-left 剩余步数 (1) |
+| **D (MLP 重建侧枝)** | `stateseq/model_d.py` | 1.39M | **否**（仅训练） | $x_t \to 64\times 13$ 棋盘类别重构 + 走子方/易位权/半回合辅助预测 |
+| **g + predictor (残差动力学)** | `stateseq/model_g.py` | 3.09M | **否**（仅训练） | $(h_{t-1}, a_t) \to \Delta \hat{t} \in \mathbb{R}^{512}$，对齐潜在状态差分 $\text{sg}(x_t - x_{t-1})$ |
 
-```
-RMSNorm(u) = u / sqrt(mean(u²) + 1e-6) ⊙ γ        # 无均值居中、无 β
-y = u + F(RMSNorm(u))                              # 所有同形堆叠块的统一形式
-```
+### 3.1 编码器 E：格子级 Transformer（权重共享双遍，K=2）
 
-禁用 BatchNorm（理由：批次依赖统计量、train/eval 口径不一致、自对弈期分布漂移；旧 CNN 有 BN 漂移前科）。x_t 进 R 前再过一层 RMSNorm。
+编码器 $E$ 旨在将单步全局特征 $B_t$ 转化为高内聚的单一局面嵌入向量 $x_t \in \mathbb{R}^{512}$，不依赖任何历史记忆：
+1. **格子 Token 初始构造**：
+   $$s_i^{(0)} = \mathrm{piece\_emb}(c_i) + \mathrm{pos\_emb}(i) + W_g \cdot \mathrm{globals}_t \quad (i = 0 \dots 63)$$
+   每个格子 $i$ 包含当前格棋子类别嵌入（13 类，含空格）、可学习绝对坐标嵌入 $\mathrm{pos\_emb}(i) \in \mathbb{R}^{256}$，以及 17 维全局状态（走子方、易位、过路兵、半回合数、重复标记）经线性投影 $W_g$ 注入的偏置。
+2. **权重共享双遍前向 (K=2)**：
+   $$S^{(1)} = \mathrm{TrmBlock}(S^{(0)}), \quad S^{(2)} = \mathrm{TrmBlock}(S^{(1)})$$
+   单层 TransformerBlock 内部包含 Pre-RMSNorm 的 8 头多头自注意力（MHA）与 4 倍隐藏宽度的 MLP 残差块。同一组网络权重串行前向计算两次，使得全盘棋子交互感受野在不增加网络参数量的前提下得到倍增。
+3. **可学习单查询全局汇聚 (Cross-Attention Pooling)**：
+   $$x_t = \mathrm{RMSNorm}\left( W_{\text{proj}} \cdot \mathrm{CrossAttn}\left(q_{\text{learn}}, S^{(2)}, S^{(2)}\right) \right) \in \mathbb{R}^{512}$$
+   利用单一可学习的查询向量 $q_{\text{learn}} \in \mathbb{R}^{256}$ 对 64 个格子的上下文特征进行注意力加权汇聚，经线性投影放大至 512 维，经 Pre-RMSNorm 后输出。
 
-### 5.2 E：格子级 Transformer（d_e=256，单块权重共享走两遍）
+### 3.2 时序主干 R：12 层 Mamba-2 状态空间模型
 
-```
-逐格输入：s_i⁽⁰⁾ = piece_emb(c_i) + pos_emb(i) + W_g·globals        i=1..64
-  piece_emb: 13类×256；pos_emb: 64×256 可学；globals = §3.2 非棋子字段
-TrmBlock：S ← S + MHA(RMSNorm(S))；S ← S + MLP₄ₓ(RMSNorm(S))       # Pre-RMSNorm 残差
-S⁽¹⁾ = TrmBlock(S⁽⁰⁾)；S⁽²⁾ = TrmBlock(S⁽¹⁾)                       # 同一权重走两遍（K=1）
-x_t  = RMSNorm( q + CrossAttn(RMSNorm(q), S⁽²⁾, S⁽²⁾) )            # q∈R^256 可学单查询
-x_t ← W_proj · x_t  （256→512，如需）再 RMSNorm
-```
+主干网络 $R$ 负责建模整局走子的因果发展、战术积累与重复局面历史上下文：
+- **基础超参**：层数 $L = 12$，$d_{\text{model}} = 512$，$d_{\text{inner}} = 1024$（$\text{expand}=2$），状态维度 $d_{\text{state}} = 16$，局部卷积核宽 $d_{\text{conv}} = 4$，头维度 $\text{headdim} = 64$。
+- **数值精度规范**：官方 `mamba_ssm` kernel 内部并行关联扫描（Selective Scan）必须**全程保持 float32 数值精度**，防止深度时序累积下溢或梯度爆炸。
+- **递推双模态一致性**：
+  - **训练期**：整条序列并行关联扫描（Parallel Scan），单次前向完成 $T$ 步计算；
+  - **推理/自对弈期**：逐步单步递推 `step(x_t, cache)`。单步内部通过原地维护每个块的 `(conv_state, ssm_state)` 推进状态，显存占用恒定为 $O(1)$。
+  - **浮点扰动界**：官方 GPU Triton/CUDA kernel 处于并行 Scan 与逐步 decode 之间存在硬件层固有微小计算顺序差异。在 fp32 下，单层累积误差约为 $\sim 1\text{e-}5$，12 层累积叠加 policy 头放大后 logits 最大标量差界定在 $\le 2\text{e-}4$。**系统严格断言：推理实际消费的 Masked Softmax 策略概率绝对差必须 $< 1\text{e-}4$**（实测 $< 1.2\text{e-}5$），WDL 与 Moves-Left 的 raw logits 绝对差严格 $< 1\text{e-}4$。
 
-说明：第二遍=参数不增但 E 计算量翻倍；"再思考"语义未经本场景验证，K 是可调超参（默认 1）。
+### 3.3 预测头群 f
 
-### 5.3 R：基础 Mamba（12 层，d=512）
+时序输出隐向量 $h_t \in \mathbb{R}^{512}$ 首先通过共享的两层残差适配层：
+$$u_t = h_t + \mathrm{MLP}_2(\mathrm{RMSNorm}(h_t))$$
+随后分流至三个多任务头：
+1. **策略头 (Policy Head)**：
+   $$z_t^p = W_p \cdot u_t \in \mathbb{R}^{1936}, \quad p(a \mid s_t) = \mathrm{softmax}(z_t^p + M_t)$$
+   其中 $M_t$ 为规则引擎输出的非法着法掩码。**数值安全硬约束：非法动作处填充掩码必须使用有限大负数 $-3\times 10^4$（严禁使用 $-\infty$）**，彻底避免 Softmax 反向传播梯度与交叉熵计算中触发 $0 \times (-\infty) = \mathrm{NaN}$。
+2. **WDL 胜平负价值头 (Value Head)**：
+   $$(P_W, P_D, P_L)_t = \mathrm{softmax}(W_v \cdot \mathrm{RMSNorm}(u_t)) \in \Delta^2$$
+   输出当前**行棋方视角**的胜、和、负三项分类概率。节点标量价值严格定义为期望胜负分：
+   $$Q = P_W - P_L \in [-1.0, 1.0]$$
+3. **剩余步数头 (Moves-Left Head, MLH)**：
+   $$\hat{m}_t = \mathrm{Mish}(W_m \cdot \mathrm{RMSNorm}(u_t)) \in \mathbb{R}_{\ge 0}$$
+   预测距本局真实终止剩余的半回合步数（ply）。
 
-依赖官方 `mamba_ssm`（Mamba-2 块）。每块配置：`d_model=512, expand=2 (d_inner=1024), d_state=16, d_conv=4, headdim=64`。块级：`h ← h + MambaBlock(RMSNorm(h))`。**scan 部分保持 fp32**（官方 kernel 默认）。
+### 3.4 训练期辅助侧枝：Model D 与 Model g
 
-递推视角：`h_t = Ā_t ⊙ h_{t-1} + B̄_t x_t`（时间维残差结构：上一步状态 + 本步增量）。
-R 的职责：整合历史脉络/重复线索/风格上下文；**不需要记棋盘**（当前局面由输入显式给出）。
-
-### 5.4 f：预测头
-
-```
-u_t        = h_t + MLP₂(RMSNorm(h_t))                     # 2 层共享小变换，残差
-z_t^p      = W_p u_t ∈ R^1936                              # policy logits
-p(a|s_t)   = softmax(z_t^p + M_t)                          # M_t：非法着 -inf
-(W,D,L)_t  = softmax(W_v · RMSNorm(u_t))                   # 三分类
-m̂_t        = Mish(w_m · RMSNorm(u_t))                      # 剩余 ply 预测
-```
-
-### 5.5 D：MLP 重建解码器（仅训练）
-
-```
-B̂_t = reshape( W₂·GELU(W₁·RMSNorm(x_t)) , 64, 13 )         # 512→1024→832
-辅助位头：走子方(2) / 易位权(4 路独立 sigmoid) / 半回合计数分桶(16 类)
-```
-
-定位：辅助监督与诊断工具，**不是可逆性证书**，不作为进入 RL 的门槛。
-
-### 5.6 g + predictor：残差动力学（仅训练）
-
-```
-emb_a: 1936×512 动作嵌入表
-u_t   = g( [RMSNorm(h_{t-1}); emb_a(a_t)] )                # MLP 1024→1024→512，残差
-x̂_t   = sg(x_{t-1}) + predictor(u_t)                       # predictor: 512→512 两层 MLP
-Δ̂_t   = predictor(u_t)
-```
-
-t=0 时 h_{-1} := h_init（可学向量）。
-
-### 5.7 参数预算（估算，以代码统计为准）
-
-| 模块 | 配置要点 | 估算 |
-|---|---|---|
-| E | d_e=256 单块（attn 0.26M + MLP 0.52M）+ 嵌入/池化/投影 | ≈ 1.3M |
-| R | 12 × Mamba(512, expand2) ≈ 1.7M/层 | ≈ 20M |
-| f | policy 512→1936 + WDL/MLH | ≈ 1.4M |
-| D | 512→1024→832 + 辅助头 | ≈ 1.5M |
-| g+predictor | 1024→1024→512 + 512→512 | ≈ 1.6M |
-| emb_a + 条件 | 1936×512 等 | ≈ 1.1M |
-| **合计** | | **≈ 27M** |
+两模块仅在训练反向传播中提供辅助梯度流，模型导出推理与自对弈树搜索时完全不参与计算：
+1. **Model D（局面重构解码器）**：
+   $$\hat{B}_t = \mathrm{reshape}\left( W_2 \cdot \mathrm{GELU}(W_1 \cdot \mathrm{RMSNorm}(x_t)), 64, 13 \right)$$
+   由局面向量 $x_t$ 逆向重建 64 格的棋子分类，辅以走子方（2 分类）、易位权（4 路独立 BCE）与半回合分桶预测。用于对 $E$ 施加显式信息保留压力，确保空间表征不坍缩。
+2. **Model g（残差动力学侧枝）**：
+   包含动作嵌入表 $\mathrm{emb}_a \in \mathbb{R}^{1936 \times 512}$ 与增量预测器：
+   $$u_t^g = g\left( [\mathrm{RMSNorm}(h_{t-1}); \mathrm{emb}_a(a_t)] \right), \quad \hat{\Delta}_t = \mathrm{predictor}(u_t^g)$$
+   网络预测一步动作转移引起的潜在空间差分：
+   $$\mathcal{L}_{\text{dyn}} = \frac{1}{d} \left\| \hat{\Delta}_t - \text{sg}(x_t - x_{t-1}) \right\|_2^2$$
+   **阻止梯度反传保护机制（Stop-Gradient, sg）**：目标项 $\text{sg}(x_t - x_{t-1})$ 必须双侧切断梯度（答案侧绝对保护），使得动力学损失只沿 $h_{t-1} \to \theta_R \to x_{t-1} \to \theta_E$ 反向传播，仅对前置状态产生结构化动力学塑形，坚决避免平凡坍缩解（即 $E(B) \equiv \text{const}, \hat{\Delta} \equiv 0$）。
 
 ---
 
-## 6. 损失函数（归一化口径统一，强制）
+## 4. 多任务联合损失体系与数值口径
 
-每步 t：π_t = policy target（Stage A=人类走子 one-hot；Stage B+=MCTS 访问分布），y_t=对局结果（对行棋方归一），e=双方平均 Elo。
+训练总损失严格定义为五项归一化分量的加权和：
+$$\mathcal{L} = w_p \mathcal{L}_{\text{policy}} + w_v \mathcal{L}_{\text{value}} + w_m \mathcal{L}_{\text{mlh}} + w_r(\tau) \mathcal{L}_{\text{recon}} + w_d \mathcal{L}_{\text{dyn}}$$
+
+### 4.1 各分量精确公式与掩码约束
+
+1. **策略损失 ($\mathcal{L}_{\text{policy}}$)**：
+   $$\mathcal{L}_{\text{policy}} = \frac{\sum_t w(e) \cdot \mathrm{CrossEntropy}(\pi_t, p(\cdot \mid s_t))}{\sum_t w(e)}$$
+   - 在 Stage A（人类棋谱）中，$\pi_t$ 为实际走法的 One-Hot 标签；
+   - 在 Stage B（自对弈）中，$\pi_t$ 为 Gumbel 搜索导出的软目标概率分布 $\pi'$；
+   - 损失按有效权重和严格归一；非法着法 logits 经 $-3\times 10^4$ 屏蔽。
+2. **价值损失 ($\mathcal{L}_{\text{value}}$)**：
+   $$\mathcal{L}_{\text{value}} = \frac{1}{T} \sum_t \mathrm{CrossEntropy}((P_W, P_D, P_L)_t, y_t)$$
+   $y_t \in \{W, D, L\}$ 为对局终局结果转换至当前行棋方视角的 One-Hot 标签（零和对齐）。
+3. **剩余步数损失 ($\mathcal{L}_{\text{mlh}}$)**：
+   标准模式下采用绝对步数 Huber 损失（$\delta=1.0$）：
+   $$\mathcal{L}_{\text{mlh}} = \frac{1}{\sum_t \mathbf{1}_{\text{valid}}} \sum_{t: \text{valid}} \mathrm{Huber}_\delta(\hat{m}_t - m_t)$$
+   - **截断与无效样本剔除**：**截断局（`is_truncated=1`）及谜题样本必须从 MLH 损失中严格剔除**（`mlh_valid=0`），防止伪造和棋导致的步数标签系统性污染。
+   - **可选 Log-Huber 变换模式 (`--mlh-log`)**：当启用该开关时，对预测与真实目标施加 $\log(1 + \mathrm{ReLU}(\cdot))$ 空间映射并采用 $\delta=0.5$，将开局阶段高达 100+ plies 的残差梯度模长压降 88% 以上，彻底解除 MLH 对主干表征梯度的过度劫持。
+4. **局面重建损失 ($\mathcal{L}_{\text{recon}}$)**：
+   $$\mathcal{L}_{\text{recon}} = \frac{1}{64} \sum_{\text{sq}=0}^{63} \mathrm{CE}(\hat{B}_t[\text{sq}], B_t[\text{sq}]) + 0.3 \cdot \mathcal{L}_{\text{aux}}$$
+   严格按全盘 64 格平均计算（严禁写成 64 格求和，避免权重失衡）。
+5. **残差动力学损失 ($\mathcal{L}_{\text{dyn}}$)**：
+   $$\mathcal{L}_{\text{dyn}} = \frac{1}{T \cdot d} \sum_t \left\| \hat{\Delta}_t - \text{sg}(x_t - x_{t-1}) \right\|_2^2$$
+   诊断指标 `dyn_rel_err` 必须在有效位置掩码 `pos_mask` 下统计：$\frac{\mathbb{E}\|\hat{\Delta} - \Delta\|^2}{\mathbb{E}\|\Delta\|^2 + \epsilon}$，健康阈值应显著 $< 1.0$（实测 Stage A 稳定于 0.26）。
+
+### 4.2 权重配置与退火日程
+
+- 锁定配置：$w_p = 1.0, w_v = 0.8, w_m = 0.1, w_d = 0.5$；
+- 重建权重 $w_r(\tau)$：在前 30% 训练步内由 $1.0$ 线性退火至 $0.1$，随后保持 $0.1$。
+- **多源数据混合权重**：在 Stage B 混合训练中，自对弈数据占 85%（软策略标签 + 最终结果 $z$），人类棋谱占 10%（人类走子 BC + 真实结果），谜题数据占 5%（战术首步 + 强制将杀标记，MLH 剔除）。三类数据源在各自子批次独立计算归一化损失后再按权重加权求和，**不存在单源梯度主导问题**。
+
+---
+
+## 5. Gumbel-Top-k 顺序减半树搜索引擎
+
+Stage B 采用无经典 UCB 探索公式的 Gumbel 顺序减半（Sequential Halving）启发式树搜索（实现于 `stateseq/gumbel.py` 与 `tools/ssm_gumbel_selfplay.py`）。该算法在浅层模拟（如 $n=64$）下具有严格的策略改进保证。
+
+### 5.1 搜索超参锁定标准
+
+- **根节点初始候选集容量**：$m_0 = 16$（当合法着法不足 16 时取全部合法着法）；
+- **总模拟预算**：$n = 64$ 次前向递推；
+- **顺序减半轮次**：固定 4 轮迭代（候选集沿 $16 \to 8 \to 4 \to 2 \to 1$ 逐轮减半，模拟次数分配为 $32 \to 16 \to 8 \to 8$）；
+- **探索常数**：$c_{\text{visit}} = 50$；
+- **价值尺度缩放常数【锁定】**：**$c_{\text{scale}} = 0.1$**（严禁恢复为历史遗留值 1.0）。
+
+### 5.2 核心数学机制
+
+#### 1. 根节点 Gumbel 噪声初始化
+对根节点所有合法动作 $a \in \mathcal{A}_{\text{legal}}$，提取网络前向策略 logits $\ell(a)$，独立采样标准 Gumbel 噪声 $g(a) \sim \mathrm{Gumbel}(0, 1)$。依据 $g(a) + \ell(a)$ 选取 Top-$m_0$ 动作作为初始候选集 $S_0$。
+
+#### 2. 补全 Q 估计 (Completed Q) 与端点保护
+对于树中任意未访问的分支动作，不可直接置零，必须采用混淆值（Mixed Value）进行插值补全：
+$$v_{\text{mix}} = \frac{v_{\text{root}} + \sum_{b \in \mathcal{A}_{\text{visited}}} N(b) Q(b)}{1 + \sum_{b \in \mathcal{A}_{\text{visited}}} N(b)}$$
+$$\bar{Q}(a) = \begin{cases} Q(a) & \text{若 } N(a) > 0 \\ v_{\text{mix}} & \text{若 } N(a) = 0 \end{cases}$$
+该公式具备严格的端点保护特性：在零访问极端情况下平滑退化为先验估值 $v_{\text{root}}$，分母加 1 避免零除。
+
+#### 3. 逐节点局部 completed-Q 归一化 (`qtransform_completed`)【锁定】
+为消除全树全局跨节点 Q 值极差将局部细微差距过度压缩的缺陷，**归一化量程必须严格按当前节点内部全部合法动作的 completed-Q 取局部 min-max**：
+$$q_{\min} = \min_{b \in \mathcal{A}} \bar{Q}(b), \quad q_{\max} = \max_{b \in \mathcal{A}} \bar{Q}(b), \quad \text{span} = q_{\max} - q_{\min}$$
+$$q_{\text{norm}}(a) = \begin{cases} \frac{\bar{Q}(a) - q_{\min}}{\text{span}} & \text{若 } \text{span} > 1\text{e-}6 \\ 0.5 & \text{若 } \text{span} \le 1\text{e-}6 \end{cases}$$
+`gumbel.qtransform_completed` 是**全系统唯一**的 Q 值变换函数，由**根节点淘汰打分、非根节点分支选择、以及最终策略目标 $\pi'$ 导出三处完全共用**，确保搜索行为与训练监督目标同构。
+
+#### 4. 尺度变换 $\sigma(\hat{q})$ 与 $c_{\text{scale}}=0.1$ 的必要性
+价值调整项定义为：
+$$\sigma(\hat{q}(a)) = (c_{\text{visit}} + \max_b N(b)) \cdot c_{\text{scale}} \cdot q_{\text{norm}}(a)$$
+当历史采用 $c_{\text{scale}}=1.0$ 时，系数常年高达 $50 \sim 80$，将仅 $\sim 0.03$ 的细微价值差异剧烈放大为 18+ logit 差，导致 60.3% 的局面策略目标退化为绝对确定的 One-Hot 分布；而采用 $c_{\text{scale}}=0.1$ 时，系数回落至 $5 \sim 8$，使网络先验与价值探索保持健康平衡。
+
+#### 5. 非根节点选择法则
+非根节点不使用 UCB 上置信界，而是基于改进策略分布与访问计数的显式惩罚匹配：
+$$\pi_{\text{imp}}(a) = \mathrm{softmax}\left( \ell(a) + \sigma(q_{\text{norm}}(a)) \right)$$
+$$a^* = \arg\max_{a \in \mathcal{A}_{\text{legal}}} \left[ \pi_{\text{imp}}(a) - \frac{N(a)}{1 + \sum_b N(b)} \right]$$
+
+#### 6. 变长合法策略监督目标 $\pi'$ 导出
+搜索结束时，训练目标 $\pi'$ **必须在全部合法动作集合上计算 Softmax**（不仅限于被搜索采样的候选集），保证未搜索分支仍保留合法的先验概率反向梯度：
+$$\pi'(a) = \mathrm{softmax}\left( \ell(a) + \sigma(q_{\text{norm}}(a)) \right)_{a \in \mathcal{A}_{\text{legal}}}$$
+该公式天然满足恒等不变性：若所有合法动作的 Completed-Q 严格相等，则 $\pi' \equiv \pi$。
+
+---
+
+## 6. 时序缓存与树搜索生命周期管理
+
+在带状态主干的 Mamba-2 模型上运行树搜索，显存管理与状态隔离是工程成败的关键。
+
+### 6.1 R Cache 拓扑与分支隔离
+
+Mamba-2 模型的单步递推状态包含每一层的卷积状态与 SSM 状态：
+- 每层状态：$\mathrm{ssm\_state} \in \mathbb{R}^{d_{\text{inner}} \times d_{\text{state}}}$，$\mathrm{conv\_state} \in \mathbb{R}^{d_{\text{inner}} \times (d_{\text{conv}}-1)}$；
+- 单个节点 R Cache 尺寸（$L=12, \text{bfloat16}$）：
+  $$12 \times 1024 \times (16 + 3) \times 2 \text{ Bytes} \approx 0.44 \text{ MiB / 节点}$$
+- **原地改写破坏性约束**：官方 `Mamba2.step()` 底层会对传入的 `conv_state` 与 `ssm_state` 张量进行**原地（In-place）破坏性覆写**。
+- **快照与隔离机制**：
+  - 每局自对弈维护唯一的**实战根节点不可变快照**（Root Cache Snapshot）；
+  - 每轮模拟从根快照浅拷贝克隆一份独立工作张量（Working Cache）；
+  - 树内节点仅缓存 $x = E(B_t)$ 向量（bf16 仅 1 KiB）；叶子扩展时沿搜索路径单向重放递推，严禁任何跨分支可写 Cache 共享。
+
+### 6.2 槽位复用与并发安全
+
+自对弈生成器（`tools/ssm_gumbel_selfplay.py`）采用预分配固定槽位（Slots）的批处理并发架构：
+- **生命周期清空准则**：某对局终止时，其所在槽位的 R Cache、棋盘实例、哈希 occurrence 计数器必须**完全重置为零**；
+- **并发独立性**：各并发槽位间张量前向操作严格批量独立，防止任何跨局隐状态交叉污染；
+- **权重只读隔离**：每个代次的自对弈进程在启动时单次加载 Champion 权重至 GPU，对弈期间保持 `torch.no_grad()` 与只读冻结。
+
+---
+
+## 7. 数据分片协议规范 (v2 与 v3)
+
+项目数据管线严禁将数十亿步的中间状态全部以明文张量持久化存储，而是采用**紧凑二进制动作流 + 结构化元数据**存储范式。
+
+### 7.1 v2 分片协议（Stage A 人类棋谱专用，只读冻结）
+
+- `*.meta.npz`：每局 16 字节定长 Numpy 结构化数组，字段包含：`n_plies` (u16), `tc_bucket` (u8), `result` (u8), `elo_mean` (f32), `game_key` (u64)。
+- `*.actions.bin`：全局平铺的 uint16 紧凑动作 ID 池。训练时由数据加载器多进程重放棋盘并在线提取 785 维特征。
+
+### 7.2 v3 分片协议（Stage B 强化学习自对弈专用）
+
+v3 分片支持变长搜索软策略分布 $\pi'$、丰富终局因果分析与严格的数据溯源：
 
 ```
-L_policy = Σ_t w(e)·CE(π_t, p(·|s_t)) / Σ_t w(e)          # 按有效权重和归一
-L_value  = mean_t CE( (W,D,L)_t , y_t )
-L_mlh    = mean_t Huber( m̂_t − m_t )
-L_recon  = mean_{t,sq} CE( B̂_t[sq] , B_t[sq] ) + 0.3·辅助位损失   # 按格平均（不是求和）
-L_dyn    = mean_t (1/d)·‖ Δ̂_t − sg(x_t − x_{t-1}) ‖²
-L = w_p·L_policy + w_v·L_value + w_m·L_mlh + w_r(τ)·L_recon + w_d·L_dyn
+分片文件群结构：
+├── shard_00000.meta.npz       # 结构化数组：定长 56 字节/局
+├── shard_00000.actions.bin    # 实战动作序列：uint16 紧凑 ID 平铺
+├── shard_00000.pipol.bin      # 变长 π' 稀疏目标：二进制紧凑编码
+└── shard_00000.pipol.offsets.bin # 各局各步在 pipol.bin 中的起始偏移索引
 ```
 
-初值：`w_p=1.0, w_v=0.8, w_m=0.1, w_d=0.5`；`w_r` 从 1.0 线性退火到 0.1（前 30% 训练步）。上线前按首 1000 步各分量对共享主干的梯度范数校准，使各分量贡献同数量级。
-（L_aux——合法着分布/被攻击格/对手下一着——**暂缓**，Stage C 视情追加。）
+#### 1. 变长策略目标编码 (`*.pipol.bin`)
+每个半回合仅持久化当前局面的合法动作搜索结果：
+$$\text{存储单元} = \underbrace{\text{u16 } K}_{\text{合法动作数}} + \sum_{k=1}^K \left( \underbrace{\text{u16 } a_k}_{\text{紧凑动作 ID}} + \underbrace{\text{f16 } p_k}_{\text{搜索导出概率 } \pi'(a_k)} \right)$$
+相比全量 1936 维密集存储，存储空间压降 **96.5%** 以上。
+
+#### 2. 终局因果判定权威与唯一入口 (`adapter.classify_final_board`)
+为彻底杜绝规则申和提前退出的语义不一致问题，系统固化 `adapter.classify_final_board` 为终局裁决的**唯一权威入口**：
+- **终局原因分类枚举**：`checkmate`（将杀）、`stalemate`（逼和）、`insufficient_material`（子力不足）、`threefold`（三次重复，包含当前步走完即满足申和条件的局面）、`fifty_move`（五十步规则）、`truncated`（达到 300 ply 步数硬封顶）。
+- **截断与训练标记**：若为封顶截断局，元数据中 `is_truncated = 1`，终局价值 $z$ 按和棋（0.0）记录，**但其 `mlh_valid` 标志必须置为 0（训练时彻底剔除出剩余步数损失）**。
 
 ---
 
-## 7. 梯度回传与训练稳定性
+## 8. 代码库模块映射与工程拓扑
 
-### 7.1 L_dyn 梯度路径
+核心源码位于 `stateseq/`、`train/`、`tools/` 与 `tests/`，层次边界严格隔离：
 
 ```
-∂L/∂Δ̂_t ∝ Δ̂_t − sg(x_t − x_{t-1})
-   ├─► predictor / g / emb_a 参数
-   ├─► h_{t-1} ─► θ_R ─►（沿序列 BPTT）─► x_{t-1} ─► θ_E     ✅ 原因侧塑形
-   ├─✖ base = sg(x_{t-1})            ⛔
-   └─✖ target = sg(x_t − x_{t-1})    ⛔ 答案侧保护
+UniChessSSM/
+├── stateseq/                   # 核心模型与算法 Python 包
+│   ├── actions.py              # 1936 动作空间常量表、双射与合法掩码
+│   ├── features.py             # 785 维局面特征编码/解码，含 encode_board_fast 位棋盘加速
+│   ├── conditions.py           # time_control / elo / color 多源条件嵌入投影层
+│   ├── model_e.py              # 格子级 Transformer E (d_e=256, 权重共享双遍)
+│   ├── model_r.py              # 12 层 Mamba-2 状态空间主干 (mamba_ssm 包装)
+│   ├── model_d.py              # MLP 局面重建模块 (仅训练辅助)
+│   ├── model_g.py              # 残差动力学侧枝与 predictor (仅训练辅助)
+│   ├── heads.py                # policy (1936), WDL (3), moves-left (1) 预测头
+│   ├── losses.py               # 统一多任务损失定义 (含 pos_mask 保护与可选 Log-Huber)
+│   ├── gumbel.py               # 纯 CPU/Numpy Gumbel-Top-k 顺序减半搜索核心算法
+│   ├── model.py                # SSMModel 全架构总装集成
+│   └── data/
+│       ├── shards.py           # v2 分片数据读写
+│       └── gshards.py          # v3 变长策略分片读写与元数据校验
+├── train/
+│   ├── stage_a.py              # Stage A 人类棋谱 BC 预训练器
+│   └── stage_b2.py             # Stage B2 强化学习自对弈训练器 (85/10/5 混合监督)
+├── tools/                      # 离线工具、自对弈生成器与评测 Arena
+│   ├── ssm_gumbel_selfplay.py  # 多进程原生 Gumbel 树搜索自对弈生成器 (支持 --openings)
+│   ├── ssm_gumbel_arena.py     # 换代对抗评测 Arena (含 --sprt 早停检验与逐局诊断)
+│   ├── ssm_infer_server.py     # 单 GPU Unix Domain Socket 推理服务器
+│   ├── ssm_uci.py / ssm_uci.sh # 跨进程纯 CPU UCI 引擎客户端
+│   ├── ssm_path_audit.py       # 跨链路前向逐位精度对拍工具
+│   └── repair_v3_meta.py       # 历史分片元数据就地修复工具
+└── tests/                      # 自动化回归单元测试集
+    ├── test_actions.py         # 动作空间完备性与双射测试
+    ├── test_features.py        # 特征编码与逆向解码往返一致性
+    ├── test_gumbel.py          # Gumbel 搜索算法、Completed-Q 量程与目标一致性测试
+    ├── test_gshards_v3.py      # v3 分片二进制序列化往返测试
+    ├── test_termination_classify.py # 终局原因判定唯一入口一致性测试
+    └── test_sprt_arena.py      # 换代 Arena Wald SPRT 序贯检验逻辑测试
 ```
 
-原因/答案轮转：第 t 步 x_t 在答案侧，第 t+1 步它站上原因侧收梯度——E 在每个位置被 L_dyn 塑形，同时被 L_recon/L_policy/L_value 锚定。
-
-### 7.2 坍缩风险缓解（注意：非数学充分保证）
-
-sg（target 与 base 双侧）+ predictor 不对称头 + recon/policy/value 的表示压力。已知残余坍缩解（E(B)=c, Δ̂=0）由后三者压制。监控指标见 §10。
-
-### 7.3 稳定性参数
-
-- **Stage A 全序列训练**：T≤200 直接整序列前向（Mamba 并行扫描），不使用 TBPTT。若未来训练更长流：窗口间必须携带隐状态继续，禁止片段起点静默重置；权重更新后不复用旧隐状态。
-- grad clip 1.0；AdamW β(0.9,0.999)、wd 0.1；lr 1e-4 cosine→1e-5，warmup 4000 步；dropout 0.1；bf16（scan fp32）。
-- 结构性稳定来源：状态序列输入 → 信用分配路径短；每步密集损失 → 深监督效应；Mamba 对角转移特征值 <1 → 数值稳定。
-
 ---
 
-## 8. 分阶段训练管线
+## 9. 当前阶段已知问题与技术债务
 
-### 阶段 0 · 接口验证（先行，详见 §10.1 验收清单）
+本节系统梳理当前版本在算法、工程链路与算力协同中已识别的客观缺陷、历史陷阱与技术债务，供后续迭代针对性攻坚。
 
-小批 PGN 跑通 E/R/f/D/g 与数据管线；全部单元测试通过。
+### 9.1 自对弈多进程显存并发陷阱 (Worker OOM Trap)
 
-### Stage A · 人类棋谱预热（28M）
+- **现象**：在远端 15.51 GiB 显存的 5070 Ti 机器上运行 `ssm_gumbel_selfplay.py` 时，若设置 `--workers 3 --concurrency 128`，所有 Worker 进程瞬间崩溃并抛出 `torch.OutOfMemoryError`。
+- **根因**：生成器中 `--concurrency` 参数的语义是**每个 Worker 进程各自独立的并发局数**，而非全局总量。每个子进程均创建了独立的 PyTorch CUDA Context（底噪开销 ~500 MiB）及 128 个完整槽位的张量分配。3 个 Worker 各占约 5.1 GiB，瞬间突破 15.51 GiB 总显存上限。
+- **现行边界与防线**：
+  - 显存预算必须按 $\text{Workers} \times \text{Concurrency}$ 计算；
+  - 实测安全并发配置：`--workers 4 --concurrency 24`（合计 96 并发，显存稳定占用 ~11.8 GiB，GPU 算力利用率 97%）；
+  - 失败时生成器故意不合并半成品分片，防止破损数据混入正式训练集。
 
-- 数据：§4 管线；初始配比全分段 + 线性 Elo 加权 r≈20（D9）。
-- 有效 batch：microbatch 由显存实测决定 + 梯度累积；吞吐指标 = **有效局面/秒（完整前向+反向）**。不照搬走子级论文的 batch=2048。
-- 出口（冒烟门禁）：留出集 policy/value 损失持续改善；recon/dyn 曲线健康（§10.2）；能完整对弈；与现役 46M champion 打**同口径** arena（固定 sims 与固定时间双口径）。
-- **不做棋力承诺**：参考论文中 28M 走子序列模型 bullet ~2000 是另一套输入/训练/评测条件，仅作量级锚点。
+### 9.2 历史分片数据定级：旧版 Teacher 策略不可用作搜索目标
 
-### Stage B · 接入自对弈
+- **背景与状态**：
+  - `stage_b_smoke`、`stage_b_val64`、`stage_b_gen2k`、`stage_b_gen_round2` 四个历史分片生成于早期 Adapter 修复（commit `4835b79`）之前。
+  - 当时搜索存在三大缺陷：WDL 差分作用于未经 Softmax 的原始 logits、使用了未标准化的原始 Elo、终局叶子由网络估值而非规则真值接入。
+  - `stage_b_gen_fix500` 虽修复了 Adapter，但使用了过度激进的 `c_scale=1.0`（60% 目标处于伪确定性坍缩态）。
+- **处置方案与技术债务**：
+  - 上述分片的 `actions` 序列、终局结果 $z$ 及经 `repair_v3_meta.py` 修复后的终局元数据**完全可用**；
+  - **上述分片的 `pi_prime` 字段已被正式定级为 `legacy_teacher`，严禁作为最新策略改进的监督目标**；
+  - 当前待办任务依赖以 $c_{\text{scale}}=0.1$ 重新生成的标准数据集（`stage_b_gen_fix500_cs01`）。
 
-- 沿用现有 MCTS/autoloop/champion 门控；KataGo 式 playout cap randomization + forced playouts/target pruning 按象棋与算力调整（数值不照搬围棋）。
-- **序列一致性（关键正确性）**：快搜索回合**留在序列中**——无 policy 标签（不贡献 L_policy），但参与 R 递推与 g 的一步预测对齐；禁止从序列删除，否则相邻监督步之间隔多着而 g 仍预测一步，训练定义错误。
-- Syzygy 真值注入（≤7 子局面 value 用 WDL 真值）。
-- 重复/终局判定权威永远在规则引擎（python-chess 区分 is_repetition / can_claim；网络特征不作判定依据）。
-- 出口：挑战旧 champion + 固定 puzzle 集 + 运行稳定性。
+### 9.3 基础网络战术盲区（两步杀漏算与低价值分辨率）
 
-### Stage C/D · 按观察到的瓶颈再加功能
+- **现象**：Stage A 预训练权重在面对简单战术（如强制两步将杀 Mate-in-2）时，纯 Policy 预测经常下出严重缓着甚至漏杀。
+- **根因分析**：
+  - 预热完全基于 Lichess 人类快棋对局（超快棋占比高，人类在复杂战术中存在大量错漏）；
+  - 模型未引入任何战术引擎离线强化；
+  - 价值头在复杂局面下的标量辨识度有限，在 $c_{\text{scale}}=1.0$ 时容易将 $\pm 0.03$ 的价值噪声误判为胜负手。
+- **缓解方向**：依赖 Stage B 自对弈中 Gumbel 树搜索对局部战术走法的强制展开筛选，并在后续阶段按规划注入 5% 高质量残局与战术谜题。
 
-优先 reanalyze、搜索预算分配、吞吐优化；Gumbel、league、DAG 转置一律后移（DAG 的局面合并不适用于历史相关的 R 状态，§9）。
+### 9.4 终局裁决平局偏置与和棋奖励妥协
 
----
+- **权衡记录**：系统当前严格执行国际象棋规则裁决（可申和的三次重复与五十步规则直接判定为和棋，结果 $z=0.0$）。
+- **潜在风险**：早期自对弈模型在优势局面下可能由于缺乏强烈的破和驱动，反复运子导致进入三次重复求和。目前三次重复占自然终局的 38.0%。系统已明确暂不引入启发式和棋惩罚，避免在模型棋力尚不稳定时引入人为奖励偏置，保持纯净零和博弈属性。
 
-## 9. MCTS 集成规格（工程重点）
+### 9.5 历史提交哈希悬空与文档陈旧引用
 
-**节点状态 = 完整 Mamba cache，不是最后一层输出向量。**
-
-- 每层缓存 `ssm_state`（d_inner×d_state）+ `conv_state`（d_inner×(d_conv−1)）。
-- 每节点字节数：`L · d_inner · (d_state + d_conv−1) · sizeof(dtype)`。
-  示例（L=12, d_inner=1024, d_state=16, d_conv=4, bf16）：12×1024×19×2 ≈ 0.44 MiB/节点 → 400 节点 ≈ 178 MiB → 64 树×400 节点 ≈ 11 GiB（**按假设估算，非实测**；fp32 更高）。
-- **分支隔离**：官方单步接口原地更新状态；子节点必须复制父 cache（copy-on-write）；禁止两分支共享可写 cache（搜索顺序污染输出）。
-- **缓存分离**：E 输出可按局面哈希共享/去重（路径无关）；R 状态路径相关，**禁止按相同棋盘合并**（同 B_t 不同历史 → R 状态不同）。
-- **缓解**：控制并发树数/sims；cache 放 CPU pinned 内存按需交换；深层节点从根前缀重放（算力换显存）。
-- 节点扩展流程：规则引擎推进 B → E 单步（带 E 缓存查询）→ R 单步 → f 出 (p, v)；PUCT 沿用现有实现。
-- 无搜索模式（网站人类化）：每步一次递推 + policy 采样 + Elo 条件 token。
-
----
-
-## 10. 验证与门禁
-
-### 10.1 阶段 0 验收测试（全部通过才进 Stage A）
-
-1. 动作空间双射：1936 id ↔ (from,to,promo) 全覆盖、含全部升变、与坐标约定一致；
-2. 特征往返：随机合法局面 B → 特征 → 手工解码一致；
-3. **整序列 vs 逐步递推一致性**：同一棋谱整段前向与逐步单步前向的 logits 差 < 1e-4（fp32 口径）；
-4. 分支缓存隔离：同一节点复制出的两个子树互不影响输出；
-5. 合法 mask：随机局面 mask 与规则引擎 legal_moves 完全一致；
-6. 单 batch 过拟合：固定一小 batch 训练百步，总损失显著下降、无 NaN；
-7. 价值符号与 moves_left 方向的单元测试。
-
-### 10.2 冒烟门禁（训练中持续）
-
-| 指标 | 口径 |
-|---|---|
-| recon | per-square 与**整盘完全一致率**双记录（0.999⁶⁴≈93.8%，勿混淆）；诊断用，不设硬门槛 |
-| dyn 健康 | 相对误差 `E‖Δ̂−Δ‖²/(E‖Δ‖²+ε)` 显著 <1 且持续下降（优于"恒预测零变化"基线）；嵌入方差非零；Δ̂ 随动作变化 |
-| 非法着 | 推理有 mask 恒为 0（无信息量）；记录 **mask 前非法倾向**（argmax 非法频率）作诊断 |
-| puzzle | 分层准确率建档，供阶段间对比 |
+- **状态记录**：由于早期远端仓库执行过 Git Rebase，早期文档广泛记录的提交哈希（如 `8d14a58`, `784dc64`, `154d673`, `f1146ac`, `2c12930`, `8331930`）已成为悬空提交（不可从 HEAD 祖先追溯）。
+- **代码状态**：所有对应缺陷的真实代码修复均已完整合入主分支并受单元测试保护（真实对应提交分别为 `6cde89b`, `dd620d5`, `b423ede`, `4835b79`, `45fc1b6`, `ee0801b`）。设计说明书已彻底解耦对悬空哈希的依赖，仅以当前实际源码与行为合约为准。
 
 ---
-
-## 11. 监控
-
-分模块 grad norm（E/R/f/D/g 各自）、五损失分量曲线、recon 双口径、dyn 相对误差、mask 前非法倾向、arena（固定 sims / 固定时间双口径）。grad norm 突增 >10× 中位数 → 告警并回滚检查点。
-
----
-
-## 12. 风险登记册
-
-| 风险 | 等级 | 缓解 |
-|---|---|---|
-| 组合无完全一致的公开棋力验证 | 中 | 28M 小规模 + 门禁；不达标回退纯 Transformer 主干（E/管线不变，只换 R） |
-| MCTS 缓存显存 | 中高 | §9 公式预估 + 并发控制 + CPU pinned/前缀重放 |
-| 训练成本估计偏差 | 中 | 以实测有效局面/秒为准 |
-| 多损失失衡 | 中 | §6 统一归约 + 梯度范数校准 |
-| 表示坍缩 | 中 | §7.2 缓解组合 + §10.2 相对误差监控 |
-| 自对弈分布漂移 | 中 | replay 窗口 + champion 门控（已有） |
-
----
-
-## 13. 实施约束（交接给实现方）
-
-1. 代码落在 WSL `/home/jeefy/UniChess` 新目录（建议 `model/stateseq/` + `tools/stateseq_*`），**不得修改**现有 autoloop/server/tunnel 的运行配置；
-2. 5070 Ti 上现有服务（autoloop actors/learner、网站、隧道）持续运行，新训练先小步验证吞吐再放大；
-3. PRO 6000 为共享主机：仅用空闲窗口、项目目录内操作、依赖装项目本地 pylibs；
-4. 不确定处回到本文档作者确认，不要自行变更 D1–D10。
-
----
-
-## 附录 A · 否决与缓行路线（含理由）
-
-**A.1 已否决（有明确理由，不建议重开）**
-
-| 路线 | 否决理由 |
-|---|---|
-| Stockfish 蒸馏（继续现有路线） | 项目目标即摆脱蒸馏；预热改用人类棋谱 BC |
-| 字符级 PGN token | Karvonen Chess-GPT 实证：50M 字符级仅 ~1300–1500 Elo，token 效率低一个量级 |
-| 纯 UCI 走子序列 + 纯 Mamba | 状态追踪=精确回忆任务，SSM 有损压缩结构性错配；Toshniwal：全注意力是追踪的必要条件；且 ~170 步序列吃不到线性复杂度红利（本方案改为显式局面输入后 Mamba 才重新成立） |
-| 经典 LSTM/GRU 主干 | 长链梯度衰减，棋谱状态追踪实证远弱于注意力 |
-| RWKV / xLSTM 主干 | 无任何公开象棋棋力实证，风险不对等 |
-| Jamba 式混合（当前） | 实现复杂度高；先基础 Mamba，留作 R 不达标时的后备 |
-| E-linear 无损线性投影 | 被格子级 Transformer 取代：局面内棋子关联需要注意力建模 |
-| D 用 cross-attention 解码 | K/V 仅单 latent 时 softmax 恒为 1，退化为按 query 查表；改 MLP 更简 |
-| searchless_chess BC 数据集 | 标签口径有争议（疑为引擎 oracle 动作），且为 FEN→动作记录、不含完整序列/条件信息 |
-| BatchNorm | 批次依赖统计、train/eval 不一致、自对弈期漂移 |
-| 指数 Elo 加权（r=200）/ 过滤低分局 | dual-capability 实证：摧毁追踪多样性，非法着率翻倍（对走子序列模型；本方案降为可调初始值） |
-| 时间维折中（近期 k 步精确 + 远期摘要） | 用户明确否决；全历史完整输入 |
-| GNN（棋子为节点） | 无公开强棋力实证，工程生态成本高 |
-| NNUE | 评估函数而非策略模型，物种不同；可作对照组不进主线 |
-| 4096/4672 全铺开动作空间 | softmax 成本；选 1936 紧凑编码 |
-| 投降机制 | 采用 KataGo 式不投降 + 访问数退火替代，避免弱模型投降偏置污染标签 |
-
-**A.2 缓行（非否决，Stage C/D 再评估）**
-
-| 路线 | 缓行理由 |
-|---|---|
-| Gumbel MCTS | 低 sims 策略改进保证，Stage B 稳定后再引入 |
-| League/exploiter 对手池 | 先单 champion 门控跑通 |
-| DAG 转置表 | 历史相关的 R 状态禁止按局面合并；至多合并 E 缓存 |
-| L_aux（合法着/攻击格/对手下一着辅助头） | 首版简化，Stage C 视瓶颈追加 |
-| 潜在空间 rollout（g 参与推理） | 远期期权；规则引擎即完美动力学，当前无必要 |
-| 模型放大（>28M） | 待 28M 门禁与瓶颈证据 |
-| MoE / 多 token 预测头 | 与主干正交的增强，首版不引入 |
-
-## 附录 B · 参考资料
-
-**本会话检索核验**：
-- Dual-Capability Bottleneck（2026-03）https://arxiv.org/html/2603.29761v1 —— 人类棋谱 BC 配方、Elo 加权、T/Q 框架、Pre-RMSNorm、28M/120M 训练配置
-- Chessformer（2026-05）https://arxiv.org/html/2605.19091v1 —— 格子 token、GAB、注意力策略头、Lc0 +100 Elo
-- ChessMimic（2026-06）https://arxiv.org/html/2606.04473v1 —— 紧凑动作空间、FEN token 化
-- KataGo https://arxiv.org/pdf/1902.10565 与 https://github.com/lightvector/KataGo/blob/master/docs/KataGoMethods.md —— playout cap randomization、forced playouts、辅助目标
-- Lc0 https://lczero.org/blog/2024/02/transformer-progress/ 与 https://github.com/leelachesszero/lc0/releases —— transformer 化 +270 Elo、WDL/moves-left 头
-- Drama https://arxiv.org/html/2410.08893v1 —— Mamba 世界模型
-- Chess-GPT 世界模型探针 https://adamkarvonen.github.io/machine_learning/2024/01/03/chess-world-models.html
-
-**评审文件提供（未逐一亲自核验）**：
-- SPR https://arxiv.org/html/2007.05929v3 —— 动力学仅作辅助训练的先例（本方案 g 的定位）
-- EfficientZero https://arxiv.org/html/2111.00210v2 ；MuZero https://arxiv.org/abs/1911.08265
-- Chess-World-Model https://arxiv.org/html/2605.30100v1 —— Mamba-2/3 象棋状态追踪基准
-- Recurrent-Depth https://arxiv.org/abs/2502.05171 ；SimSiam https://arxiv.org/abs/2011.10566
-- Lichess Database https://database.lichess.org/ ；python-chess https://python-chess.readthedocs.io/en/latest/core.html
-
-**凭文献记忆（实现前需复核）**：Gumbel AlphaZero（ICLR 2022）；Jamba（AI21）；Mamba-2（SSD, Dao & Gu 2024）。
+*(说明书完结)*
