@@ -2,9 +2,9 @@
 # Stage A vs 旧 small champion 同口径 arena（pairs=4 冒烟；正式跑用 run_arena.sh）
 set -u
 PAIRS=${PAIRS:-4}
-OUT=${OUT:-/home/jeefy/UniChessSSM/runs/stage_a_20260915/arena_vs_smallchampion_smoke.json}
-LOG=${LOG:-/home/jeefy/UniChessSSM/runs/stage_a_20260915/arena_smoke.log}
-SSM=/home/jeefy/UniChessSSM
+OUT=${OUT:-/home/jeefy/UniChess/SSM/runs/stage_a_20260915/arena_vs_smallchampion_smoke.json}
+LOG=${LOG:-/home/jeefy/UniChess/SSM/runs/stage_a_20260915/arena_smoke.log}
+SSM=/home/jeefy/UniChess/SSM
 RUNS=$SSM/runs/stage_a_20260915
 SOCK=${UNICHESS_SSM_SOCK:-/tmp/unichess-ssm-infer.sock}
 READY=$SOCK.ready

@@ -3,8 +3,8 @@
 # 用法: nohup bash tools/run_arena.sh > runs/stage_a_20260915/arena.out 2>&1 &
 set -u
 PAIRS=${PAIRS:-50}
-OUT=${OUT:-/home/jeefy/UniChessSSM/runs/stage_a_20260915/arena_vs_smallchampion.json}
-SSM=/home/jeefy/UniChessSSM
+OUT=${OUT:-/home/jeefy/UniChess/SSM/runs/stage_a_20260915/arena_vs_smallchampion.json}
+SSM=/home/jeefy/UniChess/SSM
 RUNS=$SSM/runs/stage_a_20260915
 SOCK=${UNICHESS_SSM_SOCK:-/tmp/unichess-ssm-infer.sock}
 READY=$SOCK.ready

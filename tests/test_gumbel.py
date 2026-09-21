@@ -297,7 +297,9 @@ class PerNodeQNormalizationTest(unittest.TestCase):
         self.assertAlmostEqual(float(s[1]), 51.0, places=3)
 
         # σ 展幅 51 > ℓ 差 7 ⇒ π′ 必须偏向 Q 更高的 a1
-        pp = pi_prime(node)
+        # 本用例的算术钉在 c_scale=1.0（展幅 51）上，必须显式传参：
+        # 否则会随模块默认值（现为 0.1，展幅 5.1 < ℓ 差 7）漂移而失败。
+        pp = pi_prime(node, c_visit=50.0, c_scale=1.0)
         self.assertGreater(float(pp[1]), float(pp[0]))
         self.assertEqual(int(np.argmax(pp)), 1)
 

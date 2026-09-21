@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -25,7 +26,7 @@ import chess.pgn
 import numpy as np
 import torch
 
-sys.stdout.reconfigure(line_buffering=True)
+sys.stdout.reconfigure(line_buffering=True, encoding="utf-8")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from stateseq.actions import move_to_action
@@ -298,7 +299,7 @@ def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
     }
 
 
-def _aggregate_results(games_log, half, args) -> dict:
+def _aggregate_results(games_log, half, args, sprt_info=None) -> dict:
     wins_a = 0
     wins_b = 0
     draws = 0
@@ -319,7 +320,7 @@ def _aggregate_results(games_log, half, args) -> dict:
         term_counts[t] = term_counts.get(t, 0) + 1
     truncated = term_counts.get("truncated", 0)
     anomalies = sum(1 for g in games_log if g["anomaly"])
-    return {
+    res = {
         "ckpt_a": args.ckpt_a, "ckpt_b": args.ckpt_b,
         "c_visit": args.c_visit, "c_scale_a": args.c_scale_a, "c_scale_b": args.c_scale_b,
         "total_games": len(games_log),
@@ -332,6 +333,9 @@ def _aggregate_results(games_log, half, args) -> dict:
         "truncated_rate": truncated / max(len(games_log), 1),
         "anomalies": anomalies,
     }
+    if sprt_info:
+        res["sprt"] = sprt_info
+    return res
 
 
 def main():
@@ -349,6 +353,10 @@ def main():
     ap.add_argument("--c_visit", type=float, default=C_VISIT, help="双方共用的 c_visit")
     ap.add_argument("--c_scale_a", type=float, default=C_SCALE, help="A 侧 c_scale")
     ap.add_argument("--c_scale_b", type=float, default=C_SCALE, help="B 侧 c_scale")
+    ap.add_argument("--sprt", action="store_true", help="启用 Wald SPRT 早期停止（针对落后候选）")
+    ap.add_argument("--sprt-min-games", type=int, default=64, help="SPRT 判决最少局数（成对边界）")
+    ap.add_argument("--sprt-alpha", type=float, default=0.05, help="SPRT Type I error (False Positive) bound")
+    ap.add_argument("--sprt-beta", type=float, default=0.05, help="SPRT Type II error (False Negative) bound")
     args = ap.parse_args()
 
     if args.test_scoring:
@@ -387,8 +395,9 @@ def main():
         json.dump(model_ids, fh, indent=1)
     print("A hash=%s B hash=%s same=%s policy_diff=%.2e" % (id_a, id_b, id_a == id_b, policy_diff))
 
-    # 运行对局
-    half = args.games // 2
+    # 运行对局：成对开局与颜色互换
+    # pair i 包含 2 局：第 1 局 A 白 B 黑，第 2 局 B 白 A 黑（复用相同开局）
+    num_pairs = args.games // 2
     cfg = lambda: None
     cfg.n_sims = args.n_sims
     cfg.m0 = args.m0
@@ -402,26 +411,75 @@ def main():
     t0 = time.time()
     n_openings = min(args.pairs, len(OPENINGS))
 
-    for g in range(half):
-        oi = g % n_openings
-        gd = play_one_game(model_a, model_b, cfg, opening_san=OPENINGS[oi], opening_id=oi)
-        gd["game_idx"] = g; gd["white_ckpt_side"] = "A"; gd["black_ckpt_side"] = "B"
-        games_log.append(gd)
-        if (g + 1) % 8 == 0:
-            print("  [%.0fs] game %d/%d" % (time.time() - t0, g + 1, half))
+    # SPRT 参数与阈值
+    # H0: p <= 0.50 vs H1: p >= 0.55
+    p0, p1 = 0.50, 0.55
+    bound_b = math.log(args.sprt_beta / (1.0 - args.sprt_alpha))  # ~ -2.944 (落后时提前拒绝 H1)
+    log_p1_p0 = math.log(p1 / p0)
+    log_1p1_1p0 = math.log((1.0 - p1) / (1.0 - p0))
 
-    for g in range(half):
-        oi = g % n_openings
-        gd = play_one_game(model_b, model_a, cfg, opening_san=OPENINGS[oi], opening_id=oi)
-        r = gd["arena_result"]
-        gd["arena_result"] = 0 if r == 2 else 2 if r == 0 else 1
-        gd["game_idx"] = half + g; gd["white_ckpt_side"] = "B"; gd["black_ckpt_side"] = "A"
-        games_log.append(gd)
-        if (g + 1) % 8 == 0:
-            print("  [%.0fs] game %d/%d (swapped)" % (time.time() - t0, half + g + 1, args.games))
+    sprt_stopped = False
+    sprt_info = None
+
+    for pair_idx in range(num_pairs):
+        oi = pair_idx % n_openings
+        opening_san = OPENINGS[oi]
+
+        # 局 1: A 白 B 黑
+        g1_idx = len(games_log)
+        gd1 = play_one_game(model_a, model_b, cfg, opening_san=opening_san, opening_id=oi)
+        gd1["game_idx"] = g1_idx
+        gd1["pair_idx"] = pair_idx
+        gd1["white_ckpt_side"] = "A"
+        gd1["black_ckpt_side"] = "B"
+        games_log.append(gd1)
+
+        # 局 2: B 白 A 黑
+        g2_idx = len(games_log)
+        gd2 = play_one_game(model_b, model_a, cfg, opening_san=opening_san, opening_id=oi)
+        r2 = gd2["arena_result"]
+        # 对齐到 A 视角：原结果 0(白胜/B胜) -> 2(A负), 2(黑胜/A胜) -> 0(A胜), 1 -> 1
+        gd2["arena_result"] = 0 if r2 == 2 else 2 if r2 == 0 else 1
+        gd2["game_idx"] = g2_idx
+        gd2["pair_idx"] = pair_idx
+        gd2["white_ckpt_side"] = "B"
+        gd2["black_ckpt_side"] = "A"
+        games_log.append(gd2)
+
+        if len(games_log) % 8 == 0 or len(games_log) == args.games:
+            print("  [%.0fs] games %d/%d (pair %d/%d)" % (
+                time.time() - t0, len(games_log), args.games, pair_idx + 1, num_pairs))
+
+        # 成对边界处检查 SPRT 早停（候选为 A）
+        current_n = len(games_log)
+        if args.sprt and current_n >= args.sprt_min_games and current_n < args.games:
+            s_a = sum(1.0 if g["arena_result"] == 0 else 0.5 if g["arena_result"] == 1 else 0.0
+                      for g in games_log)
+            llr = s_a * log_p1_p0 + (current_n - s_a) * log_1p1_1p0
+            if llr <= bound_b:
+                saved_games = args.games - current_n
+                saved_pct = saved_games / args.games * 100.0
+                sprt_stopped = True
+                sprt_info = {
+                    "early_stopped": True,
+                    "stop_reason": "sprt_reject_h1",
+                    "llr": float(llr),
+                    "llr_bound": float(bound_b),
+                    "alpha": float(args.sprt_alpha),
+                    "beta": float(args.sprt_beta),
+                    "p0": float(p0),
+                    "p1": float(p1),
+                    "games_played": current_n,
+                    "games_planned": args.games,
+                    "compute_saved_games": saved_games,
+                    "compute_saved_percent": saved_pct,
+                }
+                print(f"\n[SPRT Early Stop Triggered] LLR={llr:.3f} <= bound={bound_b:.3f} at game {current_n}/{args.games}")
+                print(f"Candidate rejected early. Compute saved: {saved_games} games ({saved_pct:.1f}%)\n")
+                break
 
     elapsed = time.time() - t0
-    manifest = _aggregate_results(games_log, half, args)
+    manifest = _aggregate_results(games_log, len(games_log) // 2, args, sprt_info=sprt_info)
     manifest["elapsed_s"] = elapsed
 
     with open(os.path.join(args.out, "arena.json"), "w") as fh:

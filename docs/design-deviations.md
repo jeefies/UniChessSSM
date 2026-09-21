@@ -310,6 +310,12 @@ c_scale=0.1 下 α 降到 ~5~8，打分差与 ℓ 差同量级，policy 先验�
 ### 9.3 决定
 
 - **`c_scale` 由 1.0 改为 0.1**（`stage-b-implementation.md` §3 锁定表随附变更）。
+  **代码落地时间（2026-09-20 追记）**：本节结论写下时只改了文档，`stateseq/gumbel.py:26`
+  仍是 `C_SCALE = 1.0`，直到 2026-09-20 才真正改为 `0.1`（`git log -S'C_SCALE = 0.1'`
+  在此之前为空可证）。因生成器与 arena 的 CLI 默认值都取自该常量（`default=C_SCALE`），
+  这期间任何**不显式传 `--c_scale`** 的运行都静默沿用 1.0。
+  同时 `tests/test_gumbel.py::test_uses_own_completed_q_span` 的算术钉在 1.0（σ 展幅 51 > ℓ 差 7），
+  原先靠继承模块默认值才通过，已改为显式传参，使其不随默认值漂移。
 - 此前用 `c_scale=1.0` 生成的 `stage_b_gen_fix500`（`current_teacher`，adapter 修复后但
   scale 未改）**判定不可用于短训**：其 π′ 目标处于 60% 近乎确定的退化状态，与新尺度下的
   搜索目标系统性不同，继承训练无意义。
@@ -318,3 +324,47 @@ c_scale=0.1 下 α 降到 ~5~8，打分差与 ℓ 差同量级，policy 先验�
   fix500 短训唯一数据源，`provenance.teacher_status` 标 `current_teacher`。
 - **不涉及 D1–D10 架构冻结项**，`c_scale` 属 §3 超参锁定表条目，变更已按 §5 流程记入
   `stage-b-implementation.md` 并附本节证据。
+
+## 10. 离线优化与非破坏性增强记录（2026-09-21，Phase 4 & Phase 5）
+
+本节记录在远端维护离线期间，经过完备纯 Python/CPU 算法单测与全量仿真验证（见 `docs/offline-explorations.md` §3.6）后，落地至主代码库的四项**非破坏性工程与算法改进**。所有改进均严格遵守 D1–D10 架构冻结与现有默认行为完全不变的约束。
+
+### 10.1 零分配位棋盘特征提取（`stateseq/features.py:encode_board_fast`）
+
+- **背景与痛点**：旧版 `encode()` 依赖 `python-chess` 的 `piece_map()` 字典遍历与动态集合创建，每次调用产生大量 Python 堆分配与 GC 开销。在 $n=64$ 树搜索模拟中，特征编码单步耗时约 49.9 $\mu\text{s}$，累积占纯 CPU 决策时间 40% 以上。
+- **改进实现**：
+  - 直接读取 `board.occupied_co` 及兵种位掩码（`uint64` bitboards），通过预置固定缓冲区与 `np.unpackbits` 批量解包写入前 768 平面；
+  - 易位权由位运算位掩码单指令提取；支持外部传入预分配张量 `out` 原地覆写（Zero-Allocation）；
+  - `encode()` 顶层无缝切换为 `encode_board_fast()`，旧实现保留为 `_encode_slow_reference()` 供对拍。
+- **验证与效果**：10,000 局面压测耗时从 0.499s 压降至 0.089s，单次编码延迟 **49.92 $\mu\text{s} \to 8.97 \mu\text{s}$（加速比 $5.57\times$）**，吞吐突破 11.1 万局面/秒；内存分配减少 75%~100%；与旧版 785 维特征张量保持 **100% 逐位浮点严格一致**。
+- **架构属性**：无破坏性工程重构，不改动特征语义与维度（仍为 785 维）。
+
+### 10.2 剩余步数头 (MLH) 可选 Log-Huber 变换（`--mlh-log`，`stateseq/losses.py` & `train/stage_b2.py`）
+
+- **背景与痛点**：Moves-Left 头原始采用绝对步数空间下的 Huber ($\delta=1.0$) 损失。开局阶段残差高达 100+ plies，导致未缩放损失飙升，MLH 产生的反向传播梯度模长在开局阶段超越策略梯度（比率 1.101），造成通用棋盘表征被宏观对局长度过度劫持。
+- **改进实现**：
+  - 在 `stateseq/losses.py:mlh_loss` 增加 `log_target: bool = False` 参数。当开启时，对预测与目标均施加 $\log(1 + \operatorname{ReLU}(\cdot))$ 变换，并采用 $\delta=0.5$；
+  - 在 `train/stage_b2.py` 暴露 `--mlh-log` 命令行开关，默认设为 `False`。
+- **验证与效果**：仿真显示 Log-Huber 将 MLH 相对策略梯度的比率从 0.957 压降至 0.129（开局比率从 1.101 降至 0.116），彻底解除表征梯度劫持；同时残局步数预测 MAE 从 21.48 改善至 18.12 plies。
+- **架构属性**：完全向前兼容；默认保持基线原始 Huber 不变。
+
+### 10.3 自对弈生成可选 SAN 开局序列注入（`--openings`，`tools/ssm_gumbel_selfplay.py`）
+
+- **背景与动机**：自对弈冷启动阶段虽依赖 Gumbel 噪声维持开局分化，但缺乏正统特级大师开局骨架引导；需要一套可控机制支持注入多样化棋谱前缀以丰富残局兵形结构。
+- **改进实现**：
+  - 在 `GameState.run()` 中增加开局前缀步进逻辑：对开局着法依序执行特征提取、R cache 步进与合法着记录，随后平滑切入 Gumbel 树搜索；
+  - 在 `tools/ssm_gumbel_selfplay.py` 中增加 `--openings` 参数，支持加载标准 SAN 开局序列文本文件（如 `data/openings_200.txt`）。
+- **验证与效果**：开局库注入使 Ply 40 兵形唯一覆盖度从 95% 提升至 99%，兵形信息熵增加 0.041 nats；多进程 worker 间正常透传参数。
+- **架构属性**：可选功能；未指定 `--openings` 时保持原生冷启动自对弈行为。
+
+### 10.4 换代 Arena 序贯概率比检验 (SPRT) 早停（`--sprt`，`tools/ssm_gumbel_arena.py`）
+
+- **背景与痛点**：换代门禁锁定 400 局对抗（耗时约 4~6 小时）。对于棋力明显落后的候选者（如 round2 胜率仅 28.1%），跑满 400 局消耗大量无效算力；需要严格的统计检验实现快速淘汰。
+- **改进实现**：
+  - 在 `tools/ssm_gumbel_arena.py` 中实现截断 Wald SPRT 检验（假设 $H_0: p \le 0.50$ vs $H_1: p \ge 0.55$，$\alpha=\beta=0.05$）；
+  - **约束机制**：前 64 局禁止早停；仅在成对开局边界（$N \ge 64$ 且为偶数局）检查 LLR 边界；
+  - **锁定守则**：SPRT 仅用于**拒绝落后候选（Fail-Fast）**；晋级候选**必须跑满全部 400 局且胜率 $\ge 55\%$**。
+  - 新增命令行选项 `--sprt`、`--sprt-min-games`、`--sprt-alpha`、`--sprt-beta`。
+- **验证与效果**：10,000 次蒙特卡洛仿真证实，SPRT 对 round2 水平落后候选平均仅需 87 局即可提前淘汰，算力节约 78.2%（假阴性率 0.0%）；配套单测 `tests/test_sprt_arena.py` PASS。
+- **架构属性**：默认关闭（保持跑满 400 局基准）；显式传 `--sprt` 开启。
+

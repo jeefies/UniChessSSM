@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e -o pipefail
-cd /home/jeefy/UniChessSSM
+cd /home/jeefy/UniChess/SSM
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONUNBUFFERED=1
 mkdir -p runs/stage_b_training_round2

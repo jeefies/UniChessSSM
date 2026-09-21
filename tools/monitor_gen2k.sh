@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # 远端子进程监控：检测 gen2k 完成后自动执行后续步骤
 set -u -o pipefail
-SSM=/home/jeefy/UniChessSSM
+SSM=/home/jeefy/UniChess/SSM
 PY=/home/jeefy/miniconda3/envs/unichess/bin/python
-MONITOR_LOG=/home/jeefy/UniChessSSM/runs/stage_b_gen2k/monitor.log
+MONITOR_LOG=/home/jeefy/UniChess/SSM/runs/stage_b_gen2k/monitor.log
 
 exec > "$MONITOR_LOG" 2>&1
 

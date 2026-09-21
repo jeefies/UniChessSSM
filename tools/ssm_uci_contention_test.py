@@ -65,7 +65,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--procs", type=int, default=4)
     ap.add_argument("--moves", type=int, default=12)
-    ap.add_argument("--engine", default="/home/jeefy/UniChessSSM/tools/ssm_uci.sh")
+    ap.add_argument("--engine", default="/home/jeefy/UniChess/SSM/tools/ssm_uci.sh")
     ap.add_argument("--fen", default="r1bqkbnr/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4")
     args = ap.parse_args()
 

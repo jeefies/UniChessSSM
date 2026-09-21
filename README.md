@@ -11,6 +11,6 @@ UniChess 新架构：状态序列模型（格子级 Transformer E → 12 层 Mam
 ## 快速开始（远端 5070 Ti）
 
 ```bash
-cd /home/jeefy/UniChessSSM
+cd /home/jeefy/UniChess/SSM
 /home/jeefy/miniconda3/envs/unichess/bin/python -m unittest discover -s tests -v
 ```

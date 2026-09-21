@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Step 1: 综合验证脚本（终止原因核对 + 重建四格对照 + π′ 熵/KL + ID 集合一致性）
 set -u -o pipefail
-SSM=/home/jeefy/UniChessSSM
+SSM=/home/jeefy/UniChess/SSM
 PY=/home/jeefy/miniconda3/envs/unichess/bin/python
 cd "$SSM"
 mkdir -p /tmp/stage_b_verify
@@ -12,11 +12,11 @@ exec > >(tee "$LOG") 2>&1
 echo "=== [1/4] 终止原因交叉核对 ==="
 $PY -c '
 import sys, json, chess, collections
-sys.path.insert(0, "/home/jeefy/UniChessSSM")
+sys.path.insert(0, "/home/jeefy/UniChess/SSM")
 from stateseq.data.gshards import V3ShardReader
 from stateseq.actions import move_to_action
 
-r = V3ShardReader("/home/jeefy/UniChessSSM/runs/stage_b_smoke")
+r = V3ShardReader("/home/jeefy/UniChess/SSM/runs/stage_b_smoke")
 n = len(r.meta_all)
 assert n == 1000, f"expected 1000 games, got {n}"
 
@@ -98,7 +98,7 @@ print(f"总ply: {total_plies}, 封顶ply: {cap_plies}, 占比: {cap_plies/max(to
 echo "=== [2/4] 重建四格对照 ==="
 $PY -c '
 import sys, json, numpy as np, torch
-sys.path.insert(0, "/home/jeefy/UniChessSSM")
+sys.path.insert(0, "/home/jeefy/UniChess/SSM")
 from stateseq.model import SeqModel
 from stateseq import losses
 from stateseq.data.dataset import SequenceDataset
@@ -147,10 +147,10 @@ except Exception as e:
 echo "=== [3/4] π′ 目标熵与 KL 分解 ==="
 $PY -c '
 import sys, numpy as np, math
-sys.path.insert(0, "/home/jeefy/UniChessSSM")
+sys.path.insert(0, "/home/jeefy/UniChess/SSM")
 from stateseq.data.gshards import V3ShardReader
 
-r = V3ShardReader("/home/jeefy/UniChessSSM/runs/stage_b_smoke")
+r = V3ShardReader("/home/jeefy/UniChess/SSM/runs/stage_b_smoke")
 n = min(100, len(r.meta_all))
 all_entropies = []
 all_ce = []
@@ -194,11 +194,11 @@ print(f"ID 重复批: {n_bad}/{len(all_ids)}")
 echo "=== [4/4] 动作 ID 集合一致性 ==="
 $PY -c '
 import sys, chess, numpy as np
-sys.path.insert(0, "/home/jeefy/UniChessSSM")
+sys.path.insert(0, "/home/jeefy/UniChess/SSM")
 from stateseq.data.gshards import V3ShardReader
 from stateseq.actions import move_to_action, NUM_ACTIONS
 
-r = V3ShardReader("/home/jeefy/UniChessSSM/runs/stage_b_smoke")
+r = V3ShardReader("/home/jeefy/UniChess/SSM/runs/stage_b_smoke")
 n = min(200, len(r.meta_all))
 bad = 0
 total_ply = 0

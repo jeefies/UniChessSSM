@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 评审待办④：SSM 自对照 arena —— MCTS-400(baseline) vs 变体（纯 policy / 屏蔽 value）
 #
-# 用法（在 /home/jeefy/UniChessSSM 下）：
+# 用法（在 /home/jeefy/UniChess/SSM 下）：
 #   MODE=pure   PAIRS=16 nohup bash tools/run_arena_selfplay.sh > runs/stage_a_20260915/arena_mcts_vs_pure.out 2>&1 &
 #   MODE=neutral PAIRS=16 nohup bash tools/run_arena_selfplay.sh > runs/stage_a_20260915/arena_mcts_vs_neutral.out 2>&1 &
 #
@@ -12,7 +12,7 @@
 set -u
 MODE=${MODE:?用法: MODE=pure|neutral PAIRS=N bash tools/run_arena_selfplay.sh}
 PAIRS=${PAIRS:-16}
-SSM=/home/jeefy/UniChessSSM
+SSM=/home/jeefy/UniChess/SSM
 RUNS=$SSM/runs/stage_a_20260915
 SOCK=${UNICHESS_SSM_SOCK:-/tmp/unichess-ssm-infer.sock}
 READY=$SOCK.ready

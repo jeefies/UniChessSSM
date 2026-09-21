@@ -71,6 +71,7 @@ class SelfPlayConfig:
     elo: float = 2567.5
     tc_bucket: TimeControlBucket = TimeControlBucket.RAPID
     gumbel_g: float = 1.0  # Gumbel 噪声尺度；评测/换代 arena 用 g=0
+    openings_path: str = ""
 
 
 def _legal_actions_of(board: chess.Board) -> list[int]:
@@ -163,7 +164,7 @@ class GameState:
     """
 
     def __init__(self, game_idx: int, model: ModelWrapper, cfg: SelfPlayConfig,
-                 seed_seq: np.random.SeedSequence):
+                 seed_seq: np.random.SeedSequence, opening_moves: list[str] | None = None):
         self.game_idx = game_idx
         self.model = model
         self.cfg = cfg
@@ -174,6 +175,7 @@ class GameState:
         self.pipol_actions: list[np.ndarray] = []
         self.pipol_probs: list[np.ndarray] = []
         self.rng = np.random.default_rng(seed_seq)
+        self.opening_moves = opening_moves or []
         self.n_nodes_total = 0
         self.n_terminal_total = 0
         self.sims_total = 0
@@ -187,7 +189,39 @@ class GameState:
     # ---- 顶层：整局 ----
 
     def run(self):
-        for _ in range(self.cfg.max_plies):
+        # 若指定开局着法，在 Gumbel 搜索前先依序注入：
+        # 对每个局面 encode-before-move，将特征与当前 cache 步进送入模型，
+        # 记录实战 action，更新 occurrence 与 root_cache，再 push_san。
+        for san in self.opening_moves:
+            if self.board.is_game_over(claim_draw=True):
+                return None
+            key = _board_key(self.board)
+            occ = self.occurrence.get(key, 0)
+            color = 1 if self.board.turn == chess.WHITE else 0
+            feats_root, tc_root, elo_root, _ = encode_board(self.board, occ)
+            logits_np, wdl_np, mlh_np, x_np, cache_new = yield (
+                feats_root, int(tc_root), float(elo_root), color, self.root_cache)
+            self.root_cache = cache_new
+            self._update_occurrence()
+            mv = self.board.parse_san(san)
+            act = move_to_action(mv)
+            if act is None:
+                raise RuntimeError(f"开局着法 {san} 在 {self.board.fen()} 上无法映射到 action")
+            self.actions.append(int(act))
+            # 开局步也记录变长合法着和 uniform/one-hot 或纯空 pipol 还是？
+            # 规格与 v3 约束：pipol 记录每个实战步的 π′。
+            # 对于开局注入着法，合法着空间上构建 one-hot 目标（或基于 logits 的先验目标）
+            legal_actions = _legal_actions_of(self.board)
+            legal_arr = np.array(legal_actions, dtype=np.uint16)
+            probs = np.zeros(len(legal_arr), dtype=np.float32)
+            act_match = np.flatnonzero(legal_arr == act)
+            if len(act_match) > 0:
+                probs[act_match[0]] = 1.0
+            self.pipol_actions.append(legal_arr)
+            self.pipol_probs.append(probs)
+            self.board.push(mv)
+
+        for _ in range(self.cfg.max_plies - len(self.opening_moves)):
             cont = yield from self._play_ply()
             if not cont:
                 break
@@ -377,10 +411,12 @@ class GameState:
 # ------------------------- 驱动器：跨局拼批 + 槽位复用 -------------------------
 
 class Driver:
-    def __init__(self, model: ModelWrapper, cfg: SelfPlayConfig, writer: V3ShardWriter):
+    def __init__(self, model: ModelWrapper, cfg: SelfPlayConfig, writer: V3ShardWriter,
+                 openings: list[list[str]] | None = None):
         self.model = model
         self.cfg = cfg
         self.writer = writer
+        self.openings = openings or []
         seed_seq = np.random.SeedSequence(cfg.seed)
         self.child_seeds = seed_seq.spawn(cfg.num_games)
         self.next_idx = 0
@@ -398,7 +434,11 @@ class Driver:
     def _new_game(self) -> GameState | None:
         if self.next_idx >= self.cfg.num_games:
             return None
-        game = GameState(self.next_idx, self.model, self.cfg, self.child_seeds[self.next_idx])
+        opening_moves = None
+        if self.openings:
+            opening_moves = self.openings[self.next_idx % len(self.openings)]
+        game = GameState(self.next_idx, self.model, self.cfg, self.child_seeds[self.next_idx],
+                         opening_moves=opening_moves)
         self.next_idx += 1
         return game
 
@@ -478,12 +518,23 @@ class Driver:
                       f"batch={len(active)}，{self.games_done / max(elapsed, 1e-6):.3f} games/s")
 
 
+def load_openings(openings_path: str) -> list[list[str]]:
+    """从 SAN 开局文件读取开局着法列表（每行空格分隔 SAN 着法）。"""
+    if not openings_path or not os.path.exists(openings_path):
+        return []
+    with open(openings_path, "r", encoding="utf-8") as f:
+        return [line.strip().split() for line in f if line.strip()]
+
+
 # ------------------------- 生成主循环 -------------------------
 
 def generate(cfg: SelfPlayConfig) -> dict:
     writer = V3ShardWriter(cfg.out_dir, cfg.tag)
     model = ModelWrapper(cfg.ckpt, cfg.device)
-    driver = Driver(model, cfg, writer)
+    openings = load_openings(cfg.openings_path)
+    if cfg.openings_path:
+        print(f"已加载 {len(openings)} 条开局（来自 {cfg.openings_path}）")
+    driver = Driver(model, cfg, writer, openings=openings)
 
     t0 = time.time()
     driver.run()
@@ -509,6 +560,9 @@ def generate(cfg: SelfPlayConfig) -> dict:
         "ckpt_step": cfg.ckpt_step,
         "c_visit": cfg.c_visit,
         "c_scale": cfg.c_scale,
+        # seed 必须入账：worker 种子由 SeedSequence(seed).spawn(workers) 派生，
+        # 复现"相同种子与开局分布"需要 seed + workers + games 三者齐全。
+        "seed": cfg.seed,
     }
     manifest_path = os.path.join(cfg.out_dir, "manifest.json")
     try:
@@ -534,7 +588,8 @@ def generate(cfg: SelfPlayConfig) -> dict:
 # 每个进程内部仍用上面的单进程 Driver 逻辑，各分到 games/N 局、独立 tag 与解耦的随机种子；
 # 全部结束后把各进程产出的分片文件搬回顶层目录并合并 manifest。
 
-def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: float) -> dict:
+def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: float,
+                          args: argparse.Namespace) -> dict:
     combined_shards: list[str] = []
     total_games = total_steps = total_skipped = 0
     total_plies = total_nodes = total_terminal = total_sims = 0
@@ -566,7 +621,7 @@ def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: fl
         for k, v in gen.get("termination_reason_counts", {}).items():
             term_counts[TERM_CODES.index(k)] += v
         truncated_games += round(gen.get("truncated_rate", 0.0) * gen.get("games", 0))
-        last_cfg = {k: gen.get(k) for k in ("n_sims", "m0", "gen_id", "ckpt_step", "c_visit", "c_scale") if k in gen}
+        last_cfg = {k: gen.get(k) for k in ("concurrency", "n_sims", "m0", "gen_id", "ckpt_step", "c_visit", "c_scale") if k in gen}
         shutil.rmtree(wd, ignore_errors=True)
 
     stats = {
@@ -582,6 +637,7 @@ def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: fl
         "termination_reason_counts": dict(zip(TERM_CODES, term_counts)),
         "truncated_rate": truncated_games / max(total_games, 1),
         "workers": len(worker_dirs),
+        "seed": getattr(args, "seed", None),
         **last_cfg,
     }
     manifest = {"shards": combined_shards, "months": [], "games": total_games,
@@ -614,6 +670,8 @@ def run_workers(args: argparse.Namespace) -> None:
                "--gen_id", str(args.gen_id), "--ckpt_step", str(args.ckpt_step),
                "--g", str(args.g),
                "--c_visit", str(args.c_visit), "--c_scale", str(args.c_scale)]
+        if args.openings:
+            cmd.extend(["--openings", args.openings])
         log_path = os.path.join(wdir, "worker.log")
         log_fh = open(log_path, "w", encoding="utf-8")
         proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT,
@@ -633,7 +691,7 @@ def run_workers(args: argparse.Namespace) -> None:
                            f"不合并已产出的部分分片（避免正式数据混入未验证的失败批次）")
 
     elapsed = time.time() - t0
-    stats = _merge_worker_outputs(args.out, [wd for _, _, wd in procs], elapsed)
+    stats = _merge_worker_outputs(args.out, [wd for _, _, wd in procs], elapsed, args)
     print(f"[全部 worker 完成] {n} 进程，{stats['games']} 局，{elapsed:.1f}s，"
           f"{stats['games_per_s']:.3f} games/s，{stats['plies_per_s']:.2f} plies/s，"
           f"封顶率 {stats['truncated_rate']:.1%}", flush=True)
@@ -659,6 +717,8 @@ def main() -> None:
                     help="σ 展幅常数 c_visit；搜索与 π′ 导出共用同一值")
     ap.add_argument("--c_scale", type=float, default=C_SCALE,
                     help="σ 展幅常数 c_scale；搜索与 π′ 导出共用同一值")
+    ap.add_argument("--openings", default="",
+                    help="开局着法文件路径（每行 SAN 着法序列，如 data/openings_200.txt）")
     args = ap.parse_args()
 
     if args.workers > 1:
@@ -679,6 +739,7 @@ def main() -> None:
         gumbel_g=args.g,
         c_visit=args.c_visit,
         c_scale=args.c_scale,
+        openings_path=args.openings,
     )
     generate(cfg)
 

@@ -1,9 +1,9 @@
 #define main pgn2shards_main
-#include "/home/jeefy/UniChessSSM/cpp/pgn2shards.cpp"
+#include "/home/jeefy/UniChess/SSM/cpp/pgn2shards.cpp"
 #undef main
 int main() {
     static ActionTables T;
-    FILE* fh = fopen("/home/jeefy/UniChessSSM/data/tmp_probe/bench.pgn", "rb");
+    FILE* fh = fopen("/home/jeefy/UniChess/SSM/data/tmp_probe/bench.pgn", "rb");
     fseek(fh, 0, SEEK_END); long sz = ftell(fh); fseek(fh, 0, SEEK_SET);
     char* buf = (char*)malloc(sz + 1); fread(buf, 1, sz, fh); buf[sz] = 0; fclose(fh);
     Cursor cur(buf, sz, 0);

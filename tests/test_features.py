@@ -9,6 +9,7 @@ import random
 import unittest
 
 import chess
+import numpy as np
 
 from stateseq.features import FEATURE_DIM, decode, encode
 
@@ -66,6 +67,28 @@ class FeatureRoundtripTest(unittest.TestCase):
         self.assertFalse(decode(encode(board, 0)).rep_is1)
         self.assertTrue(decode(encode(board, 1)).rep_is1)
         self.assertTrue(decode(encode(board, 2)).rep_is2)
+
+    def test_encode_board_fast_identity(self):
+        """验证 encode_board_fast 与 baseline encode 严格等价。"""
+        from stateseq.features import encode_board_fast, _encode_slow_reference
+
+        out_buf = np.zeros(785, dtype=np.float32)
+        fens = [
+            chess.STARTING_FEN,
+            "rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        ]
+        for fen in fens:
+            board = chess.Board(fen)
+            for occ in (0, 1, 2):
+                want = _encode_slow_reference(board, occurrence=occ)
+                got_alloc = encode_board_fast(board, occurrence=occ)
+                got_zero = encode_board_fast(board, occurrence=occ, out=out_buf)
+                got_encode = encode(board, occurrence=occ)
+                np.testing.assert_array_equal(got_alloc, want)
+                np.testing.assert_array_equal(got_zero, want)
+                np.testing.assert_array_equal(got_encode, want)
 
 
 if __name__ == "__main__":

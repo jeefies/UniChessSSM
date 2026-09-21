@@ -11,8 +11,14 @@ from __future__ import annotations
 from enum import IntEnum
 
 import numpy as np
-import torch
-import torch.nn as nn
+try:
+    import torch
+    import torch.nn as nn
+    _HAS_TORCH = True
+except ImportError:
+    torch = None  # type: ignore
+    nn = None  # type: ignore
+    _HAS_TORCH = False
 
 D_MODEL = 512
 
@@ -69,10 +75,15 @@ class EloStandardizer:
         return (np.asarray(elo, dtype=np.float64) - self.mean) / self.std
 
 
-class ConditionEmbedder(nn.Module):
+_NN_BASE = nn.Module if _HAS_TORCH else object
+
+
+class ConditionEmbedder(_NN_BASE):
     """三个条件向量各投影到 R^512 相加（tc embedding / elo 线性 / color embedding）。"""
 
     def __init__(self, d_model: int = D_MODEL):
+        if not _HAS_TORCH:
+            raise RuntimeError("ConditionEmbedder requires torch to be installed.")
         super().__init__()
         self.tc_emb = nn.Embedding(NUM_TC_BUCKETS, d_model)
         self.elo_proj = nn.Linear(1, d_model)

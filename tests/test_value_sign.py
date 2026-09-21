@@ -65,6 +65,26 @@ class ValueSignTest(unittest.TestCase):
         self.assertEqual(ml, [6, 5, 4, 3, 2, 1])
         self.assertTrue(all(m <= T_MAX for m in ml))
 
+    def test_mlh_loss_log_target(self):
+        """验证 mlh_loss 的 log_target=True 支持及其变换行为。"""
+        import torch
+        import torch.nn.functional as F
+        from stateseq.losses import mlh_loss
+
+        pred = torch.tensor([0.0, 5.0, 10.0, 50.0], dtype=torch.float32)
+        target = torch.tensor([0.0, 4.0, 15.0, 60.0], dtype=torch.float32)
+        # 默认模式 delta=1.0
+        l_default = mlh_loss(pred, target, log_target=False)
+        expected_default = F.huber_loss(pred, target, delta=1.0, reduction="mean")
+        self.assertAlmostEqual(float(l_default), float(expected_default), places=6)
+
+        # log_target 模式：log1p(relu), delta=0.5
+        l_log = mlh_loss(pred, target, log_target=True)
+        pred_log = torch.log1p(F.relu(pred))
+        target_log = torch.log1p(F.relu(target))
+        expected_log = F.huber_loss(pred_log, target_log, delta=0.5, reduction="mean")
+        self.assertAlmostEqual(float(l_log), float(expected_log), places=6)
+
     def test_long_game_cap(self):
         """构造 250 ply 长局：moves_left 截断 200。"""
         import random

@@ -1,6 +1,6 @@
 $remoteUser = "jeefy"
 $remoteHost = "172.16.2.12"
-$genDir = "/home/jeefy/UniChessSSM/runs/stage_b_gen_round2"
+$genDir = "/home/jeefy/UniChess/SSM/runs/stage_b_gen_round2"
 $checkCmd = "test -f $genDir/manifest.json && cat $genDir/manifest.json || echo 'NOT_DONE'"
 $pollSeconds = 120
 

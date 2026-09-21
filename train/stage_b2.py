@@ -83,6 +83,7 @@ def main() -> None:
     # AdamW 的自适应分母会抵消梯度的统一缩放（m/√v 对 g→cg 不变），实际影响还受
     # 裁剪、ε 与解耦 weight decay 干扰。本轮保留 0.85/0.10，不补偿 LR，不为凑 1 强行接谜题。
     ap.add_argument("--w-human", type=float, default=0.10, help="来源权重（§2.6 锁定 0.10；谜题 0.05 plumbing 未接入，暂不参与）")
+    ap.add_argument("--mlh-log", action="store_true", default=False, help="启用 mlh Log-Huber 变换 (torch.log1p(F.relu(...)), delta=0.5)")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -159,7 +160,8 @@ def main() -> None:
         for vb in human_ds.val_batch(args.val_batches, args.microbatch, device):
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                 _, m = model.forward_train(vb["batch"], weights, step=0, total_steps=steps_total,
-                                           valid_mask=vb["valid"])
+                                           valid_mask=vb["valid"],
+                                           log_target=args.mlh_log)
             for k, v in m.items():
                 if k.startswith("loss_") or k in ("recon_whole_board_acc", "dyn_rel_err"):
                     agg.setdefault(f"human_{k}", []).append(v)
@@ -168,7 +170,8 @@ def main() -> None:
                 _, m = model.forward_train(vb["batch"], weights, step=0, total_steps=steps_total,
                                            valid_mask=vb["valid"],
                                            policy_soft_target=vb["policy_soft_target"],
-                                           mlh_valid_mask=vb["mlh_valid"])
+                                           mlh_valid_mask=vb["mlh_valid"],
+                                           log_target=args.mlh_log)
             for k, v in m.items():
                 if k.startswith("loss_") or k in ("recon_whole_board_acc", "dyn_rel_err"):
                     agg.setdefault(f"selfplay_{k}", []).append(v)
@@ -211,11 +214,13 @@ def main() -> None:
             # 按来源分别归约损失，再显式加权求和（§2.6；不是按样本条数占比）。
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 total_h, m_h = model.forward_train(h_item["batch"], weights, step, steps_total,
-                                                   valid_mask=h_item["valid"])
+                                                   valid_mask=h_item["valid"],
+                                                   log_target=args.mlh_log)
                 total_sp, m_sp = model.forward_train(sp_item["batch"], weights, step, steps_total,
                                                      valid_mask=sp_item["valid"],
                                                      policy_soft_target=sp_item["policy_soft_target"],
-                                                     mlh_valid_mask=sp_item["mlh_valid"])
+                                                     mlh_valid_mask=sp_item["mlh_valid"],
+                                                     log_target=args.mlh_log)
                 total = args.w_selfplay * total_sp + args.w_human * total_h
             (total / args.accum).backward()
             pos_seen += int(h_item["valid"].sum()) + int(sp_item["valid"].sum())

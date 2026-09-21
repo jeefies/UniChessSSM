@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e -o pipefail
-cd /home/jeefy/UniChessSSM
+cd /home/jeefy/UniChess/SSM
 export PYTHONUNBUFFERED=1
 mkdir -p runs/arena_round2
 /home/jeefy/miniconda3/envs/unichess/bin/python \

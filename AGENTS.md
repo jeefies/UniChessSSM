@@ -1,6 +1,6 @@
 # UniChessSSM AGENTS.md
 
-> 本文件面向 AI 编码 agent。最后更新：2026-09-16。
+> 本文件面向 AI 编码 agent。最后更新：2026-09-20。
 
 ## 1. 项目概述
 
@@ -14,10 +14,39 @@ g（残差动力学）不参与推理。预热用 Lichess 人类棋谱行为克�
 **Stage B 实施规格**：`docs/stage-b-implementation.md`（唯一规格来源，与 handoff 冲突时以规格为准）。
 **阶段交接**：`docs/stage-b-handoff.md`（阶段① 实现+算法单测；A 组全过前禁止生成正式训练数据）。
 
-**当前状态（2026-09-16）**：Stage A 已验收通过（policy CE 1.864、value CE 0.767、held-out value_gain 0.100）；
+**当前状态（2026-09-20）**：Stage A 已验收通过（policy CE 1.864、value CE 0.767、held-out value_gain 0.100）；
 B0 链路审计全 PASS（对拍 fp32 逐位一致、WDL 符号正确、80 局 0 超时负）；
 归因明确：−880 Elo 来自网络本身棋力不足，非链路 bug。
-**当前阶段**：Stage B 阶段① — 实现 Gumbel 自对弈生成器 + v3 分片 + 训练器改造 + A/B 组单测。
+
+**当前阶段**：Stage B 阶段① 代码已落地（生成器 / v3 分片 / `train/stage_b2.py` / arena 全部存在，
+单测 14 个文件 74/74 PASS），正在做首轮小规模教师数据闭环，**尚未进入阶段② 2k–5k 局闭环**。
+
+已跑闭环：round1 小规模；round2（2,500 局 → 14 步训练 → 64 局 arena，28.1% 未达换代门槛，
+保留为诊断检查点，不为落后候选消耗 400 局预算）。
+
+**四轮审查修复（均为真 bug，勿回退）**：`6cde89b` 生成器 `occ_root` NameError + arena 换色胜者归属；
+`dd620d5` 终局分类与 `claim_draw=True` 差一 ply（真实封顶率 15.9% 而非 54.2%），统一到
+`adapter.classify_final_board` 唯一裁决入口；`b423ede` Q 归一化改为**逐节点** completed-Q 量程
+（全树 qbox 会被其他节点撑大而压缩价值差权重）；`b274360` `c_scale` 配置贯通至 π′ 导出与 arena 两侧。
+
+**历史哈希已失效（2026-09-20 核实）**：早期文档广泛引用的 `8d14a58`/`784dc64`/`154d673`/`f1146ac`/
+`2c12930`/`8331930` 均为 rebase 前的**悬空提交**，在两个 clone 里都**不可从 HEAD 到达**
+（远端 objects 仍在故 `git cat-file` 可解析，易误判为"存在"；判据用
+`git merge-base --is-ancestor <h> HEAD`）。对应的真实提交：`8d14a58`→`6cde89b`、
+`784dc64`→`dd620d5`、`154d673`→`b423ede`、`f1146ac`→`4835b79`、`2c12930`→`45fc1b6`；
+`8331930` 实为 `ee0801b`（只新增 `tools/compare_c_scale.py`，**未改任何默认值**）。
+修复本身都在代码里，只有哈希失效。`docs/` 下仍有约 24 处旧哈希引用未改（见 §13）。
+
+**数据可用性定级（重要）**：`stage_b_smoke`/`val64`/`gen2k`/`gen_round2` 四个分片的 π′ 均为
+`legacy_teacher`（生成于 `4835b79` adapter 修复前），`actions`/`z`/修复后 meta 可用，
+**`pi_prime` 不可用作搜索目标**；`stage_b_gen_fix500` 虽在修复后生成，但用了 c_scale=1.0，
+**降级为诊断数据集**。方法论教训：`result 修正数 = 0` 只证明 z 在重新裁决前后相同，
+**不证明搜索目标正确**。
+
+**当前待办（阶段① 收尾）**：用 c_scale=0.1 重生成 500 局教师数据（`stage_b_gen_fix500_cs01`，
+复用相同种子与开局分布），作为 fix500 短训唯一数据源，`provenance.teacher_status` 标
+`current_teacher`。2026-09-20 13:15 首次尝试因 CUDA OOM 全部 worker 失败（原因见 §4 并发陷阱），
+产出目录只剩 worker.log，需重跑。
 
 **Stage A 产物**：`runs/stage_a_20260915/` 含 `best.pt`（step 37758）与 `latest.pt`（step 37000）。
 
@@ -28,8 +57,14 @@ B0 链路审计全 PASS（对拍 fp32 逐位一致、WDL 符号正确、80 局 0
 
 | 设备 | 路径 | 用途 |
 |---|---|---|
-| Windows 本机 | `C:\Users\jeefy\Documents\ChatGPT\UniChessSSM` | 代码编辑、文档、CPU 单测；**不在本机训练** |
-| 远端 5070 Ti 主机（`jeefy@172.16.2.12`，SSH 免密） | `/home/jeefy/UniChessSSM`（工作 clone）+ `/home/jeefy/UniChessSSM.git`（bare 中枢） | GPU 训练、评测、单测实际运行 |
+| Windows 本机 | `C:\Users\jeefy\Documents\UniChess\SSM` | 代码编辑、文档、CPU 单测；**不在本机训练** |
+| 远端 5070 Ti 主机（`jeefy@172.16.2.12`，SSH 免密） | `/home/jeefy/UniChess/SSM`（工作 clone）+ `/home/jeefy/UniChess/SSM.git`（bare 中枢 `origin`） | GPU 训练、评测、单测实际运行 |
+
+**路径迁移（2026-09-20，已核实）**：远端工作 clone 从 `/home/jeefy/UniChessSSM` 迁到
+`/home/jeefy/UniChess/SSM`，**旧路径已不存在**。根目录 `run_round2_*.sh`、`tools/*.sh`、
+`tools/stage_b_verify.sh` 等脚本硬编码旧路径已统一修复完成。迁移只动目录位置，未改动"与原项目隔离"约束：
+`/home/jeefy/UniChess` 下除 `SSM/` 与 `SSM.git/` 外一切仍是只读。
+GitHub 远端为 `gh` → `git@github.com:jeefies/UniChessSSM.git`。
 
 - git 同步：本地 commit → push 到远端 bare → 远端工作目录 `git pull`。
 - 远端 conda 环境（与原项目共用，**复用不改动**）：
@@ -61,8 +96,8 @@ UniChessSSM/
 ├── cpp/
 │   └── pgn2shards.cpp   # C++ 多进程 PGN→分片构建器（16 进程）
 ├── train/
-│   └── stage_a.py       # Stage A 训练器（§7.3 锁定超参；原子检查点；SIGTERM）
-│   # Stage B 目标：train/stage_b2.py（改自 stage_a.py）
+│   ├── stage_a.py       # Stage A 训练器（§7.3 锁定超参；原子检查点；SIGTERM）
+│   └── stage_b2.py      # Stage B 训练器（改自 stage_a.py；已落地）
 ├── tools/               # 冒烟与运维脚本
 │   ├── stateseq_download.py    # 双路径下载看门狗
 │   ├── stateseq_build_shards.py # .pgn.zst → 动作列表分片
@@ -74,7 +109,11 @@ UniChessSSM/
 │   ├── ssm_uci_test.py   # 映射自测 a/b/c
 │   ├── ssm_path_audit.py     # 推理链路端到端对拍（fp32 逐位一致）
 │   ├── ssm_wdl_sign_audit.py # WDL→Q 符号审计
-│   ├── ssm_gumbel_selfplay.py # Stage B Gumbel 自对弈生成器（待实现）
+│   ├── ssm_gumbel_selfplay.py # Stage B Gumbel 自对弈生成器（多进程 + 槽位复用）
+│   ├── ssm_gumbel_arena.py    # Stage B 换代 arena（复用 order_halving，g=0）
+│   ├── compare_c_scale.py     # 固定局面机制对照（c_scale 尺度诊断）
+│   ├── repair_v3_meta.py      # v3 meta 终局语义修复（只改 meta 不重跑生成）
+│   ├── align_pipol.py / trace_pipol.py # π′ 对齐与 σ/Q 追踪
 │   └── run_arena*.sh     # arena 启动器（自动起/停推理服务器）
 ├── tests/               # unittest 单测
 │   ├── test_actions.py
@@ -84,7 +123,10 @@ UniChessSSM/
 │   ├── test_overfit.py
 │   ├── test_g_alignment.py # g 动作对齐断言（5/5 通过）
 │   ├── test_cache_isolation.py # 分支缓存隔离（需 CUDA）
-│   └── test_value_sign.py # WDL→Q 符号单测
+│   ├── test_value_sign.py # WDL→Q 符号单测
+│   ├── test_gumbel.py / test_gshards_v3.py # 搜索算法 + v3 分片往返
+│   ├── test_termination_classify.py # 终局裁决唯一入口
+│   └── test_soft_policy_integration.py / test_arena_expand.py / test_board_key_consistency.py
 ├── data/  runs/         # 运行时产物（gitignore；常驻 ≤10 GB，临时 ≤50 GB）
 └── docs/                # 权威设计文档 / design-deviations.md / stage-a-experiment.md / stage-b-*
 ```
@@ -102,6 +144,14 @@ UniChessSSM/
 - **Stage B A 组单测**：必须在生成正式训练数据前全过；对拍脚手架复用 `tools/ssm_path_audit.py`。
   `stateseq/gumbel.py` 是纯 numpy 实现，可在无 GPU 环境下做算法单测。
 
+**并发陷阱（2026-09-20 实测，OOM 根因）**：`ssm_gumbel_selfplay.py` 的 `--concurrency`
+是**每 worker** 的并发局数，`run_workers` 原样透传给每个子进程（`tools/ssm_gumbel_selfplay.py:611`），
+且每进程各建独立 CUDA context。`--workers 3 --concurrency 128`（默认 concurrency）会让 3 个进程
+各占约 5 GiB，合计 ~15 GiB 撞满 15.51 GiB 显存 → 全部 worker `torch.OutOfMemoryError` 退出码 1。
+已验证可行档位：round2 用 `--concurrency 24 --workers 4`（GPU 利用率 97%）；成功的 fix500 用
+`workers=4`，0.427 games/s（500 局约 20 分钟）。**显存预算按 workers × concurrency 算，不是 concurrency**。
+失败时生成器**故意不合并**已产出的部分分片，避免未验证批次混入正式数据。
+
 ## 5. Stage B 硬约束（阶段① 实现+单测）
 
 **违反即返工，不得自行调整后继续，确认的变更须记入 `docs/stage-b-implementation.md` §5 变更表。**
@@ -111,6 +161,12 @@ UniChessSSM/
 - 条件输入锁定（规格 §0.2）：自对弈 Elo=2567.5 + RAPID 桶；人类混批保留原始条件；谜题固定 2567.5 + unknown 桶。
 - 架构 D1–D10 冻结；不做消融实验。
 - 超参以 `docs/stage-b-implementation.md` §3 锁定表为准。
+- **换代门槛【锁定】**：challenger vs champion **400 局 ≥55%**（和计 0.5），Gumbel `g=0`、`n=64`，
+  配对开局 + 交换颜色，记录完整 W/D/L 并按开局对看波动；**连续 3 代失败即暂停，不放宽门槛**。
+  未达门槛的候选不消耗 400 局预算（round2 用 32/64 局对照即判定落后并留作诊断）。
+- **learner 连续性**：权重与优化器状态跨代持续，**不随换代成败回滚**；champion 仅在晋级时替换。
+- 阶段推进：阶段② 首轮闭环 2k–5k 局 → 阶段③ 主循环 25k 局/代 + 最近 10 代 replay buffer
+  （按代均匀采样）。单卡**分时**：生成窗口与训练窗口交替，不并行争显存。
 
 ## 6. Stage B 交付物（阶段①）
 
@@ -140,6 +196,16 @@ UniChessSSM/
 - **价值口径【锁定】**：节点 q 一律存**该行棋方视角** `q = pW − pL ∈ [−1,1]`，和棋=0；跨边取负（零和）。
   与 WDL 训练标签（行棋方归一）一致，且与 B0 核对的 `Q=wdl[0]−wdl[2]` 合约同构。
 - **根节点选择**：Gumbel-Top-k 取 top-m₀=16 候选，顺序减半分配 n=64 模拟（4 轮 16→8→4→2→1）。
+- **σ 常数【锁定】**：`σ(q̂) = (c_visit + max_b N(b)) · c_scale · q̂`，`c_visit=50`、**`c_scale=0.1`**
+  （决定见 `design-deviations.md` §9.3；**代码默认值直到 2026-09-20 本次才真正落到
+  `stateseq/gumbel.py:26`** —— 此前 3 天里文档写 0.1、代码仍是 `C_SCALE = 1.0`，
+  `git log -S'C_SCALE = 0.1'` 为空可证。生成器 CLI 是 `default=C_SCALE`
+  （`tools/ssm_gumbel_selfplay.py:660`），**不显式传 `--c_scale` 就会静默沿用旧值**，
+  这正是 fix500 被降级的那个设置）。判据不是"熵要高"，而是**价值分辨力与打分幅度是否匹配**：
+  c_scale=1.0 时 α≈50~80 把仅 ~0.03 的 Q 差放大成 18 logit 差，60.3% 局面目标退化为近乎确定选择
+  （KL(π′‖π)=2.195 反超原始 policy 熵 1.811）；32 局同权重对抗 c_scale=0.1 胜 65.6%（21:11，0 和棋）。
+- **Q 归一化【锁定】**：`gumbel.qtransform_completed` 是唯一变换，按**逐节点** completed-Q 量程归一，
+  根评分 / 非根选择 / π′ 导出三处共用；**不得用全树 qbox**。
 - **非根节点【锁定】**：`π_imp = softmax(ℓ + σ(completedQ))`，选择 `argmax[π_imp − N/(1+ΣN)]`。
   "无 UCB" 不等于 "不考虑访问次数"。
 - **补全 Q【锁定】**：`completedQ = q`（已访问）/ `v_mix`（未访问）；`v_mix` 端点保护（零访问退化为 v̂，分母加 ε）。

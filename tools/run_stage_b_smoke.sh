@@ -2,7 +2,7 @@
 set -u
 set -o pipefail
 
-SSM=/home/jeefy/UniChessSSM
+SSM=/home/jeefy/UniChess/SSM
 RUNS=$SSM/runs/stage_b_smoke
 PY=${PYTHON:-/home/jeefy/miniconda3/envs/unichess/bin/python}
 GAMES=${GAMES:-1000}

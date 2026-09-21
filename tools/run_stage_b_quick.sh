@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -u -o pipefail
-SSM=/home/jeefy/UniChessSSM
+SSM=/home/jeefy/UniChess/SSM
 PY=/home/jeefy/miniconda3/envs/unichess/bin/python
 cd "$SSM"
 

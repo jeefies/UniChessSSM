@@ -65,9 +65,20 @@ def value_loss(wdl_logits: torch.Tensor, result: torch.Tensor,
 
 
 def mlh_loss(mlh_pred: torch.Tensor, moves_left: torch.Tensor,
-             pos_mask: torch.Tensor | None = None) -> torch.Tensor:
-    """Huber(δ=1) 于剩余 ply 预测；moves_left 以 ply 计、截断到 T_max=200。"""
-    h = F.huber_loss(mlh_pred.reshape(-1).float(), moves_left.reshape(-1).float(), delta=1.0, reduction="none")
+             pos_mask: torch.Tensor | None = None,
+             log_target: bool = False) -> torch.Tensor:
+    """Huber(δ=1，或 log_target 时 δ=0.5) 于剩余 ply 预测；moves_left 以 ply 计、截断到 T_max=200/300。
+    当 log_target 为 True 时，对预测值与目标值施加 torch.log1p(F.relu(...)) 变换，采用 delta=0.5。
+    """
+    pred = mlh_pred.reshape(-1).float()
+    target = moves_left.reshape(-1).float()
+    if log_target:
+        pred = torch.log1p(F.relu(pred))
+        target = torch.log1p(F.relu(target))
+        delta = 0.5
+    else:
+        delta = 1.0
+    h = F.huber_loss(pred, target, delta=delta, reduction="none")
     w = torch.ones_like(h) if pos_mask is None else pos_mask.reshape(-1).float()
     return (h * w).sum() / w.sum().clamp(min=1e-8)
 

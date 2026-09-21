@@ -5,6 +5,8 @@
 - shards.py：分片二进制存储（memmap）+ 按 game_id 哈希划分 train/val（同局不跨集）。
 """
 
-from .sequences import StepRecord, game_to_sequence
-
-__all__ = ["StepRecord", "game_to_sequence"]
+try:
+    from .sequences import StepRecord, game_to_sequence
+    __all__ = ["StepRecord", "game_to_sequence"]
+except (ImportError, ModuleNotFoundError):
+    __all__ = []

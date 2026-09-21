@@ -33,6 +33,9 @@ _PIECE_TO_PLANE = {
     (chess.BLACK, chess.QUEEN): 10, (chess.BLACK, chess.KING): 11,
 }
 
+_MASKS_SCRATCH = np.empty(PIECE_PLANES, dtype=np.uint64)
+_MASKS_U8_VIEW = _MASKS_SCRATCH.view(np.uint8)
+
 
 @dataclass(frozen=True)
 class BoardFields:
@@ -48,11 +51,83 @@ class BoardFields:
     rep_is2: bool
 
 
-def encode(board: chess.Board, occurrence: int = 0) -> np.ndarray:
-    """局面 → 785 维特征。
+def encode_board_fast(
+    board: chess.Board,
+    occurrence: int = 0,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
+    """零分配/位棋盘优化版 encode_board。
 
-    occurrence：当前局面在本局此前出现的次数（0/1/≥2），由调用方沿棋谱统计（参考特征）。
+    - 支持外部预分配 buffer (out: float32, 长度 785)，无内存分配与 GC 压力；
+    - 直接读取 python-chess 内部 uint64 bitboard，免除 piece_map() 字典与 Piece 对象创建；
+    - 位棋盘解包使用 np.unpackbits 向量化写入前 768 平面；
+    - 位掩码快速提取易位权、合法过路兵、时钟及重复标记；
+    - 结果与 encode() 保证 100% 逐位浮点严格一致。
     """
+    if out is None:
+        out = np.zeros(FEATURE_DIM, dtype=np.float32)
+    else:
+        out.fill(0.0)
+
+    w = board.occupied_co[chess.WHITE]
+    b = board.occupied_co[chess.BLACK]
+
+    _MASKS_SCRATCH[0] = board.pawns & w
+    _MASKS_SCRATCH[1] = board.knights & w
+    _MASKS_SCRATCH[2] = board.bishops & w
+    _MASKS_SCRATCH[3] = board.rooks & w
+    _MASKS_SCRATCH[4] = board.queens & w
+    _MASKS_SCRATCH[5] = board.kings & w
+    _MASKS_SCRATCH[6] = board.pawns & b
+    _MASKS_SCRATCH[7] = board.knights & b
+    _MASKS_SCRATCH[8] = board.bishops & b
+    _MASKS_SCRATCH[9] = board.rooks & b
+    _MASKS_SCRATCH[10] = board.queens & b
+    _MASKS_SCRATCH[11] = board.kings & b
+
+    out[:768] = np.unpackbits(_MASKS_U8_VIEW, bitorder="little")
+
+    # 走子方
+    if board.turn == chess.WHITE:
+        out[768] = 1.0
+
+    # 易位权位运算优化（与 board.has_*_castling_rights 逐位一致）
+    clean = board.clean_castling_rights()
+    w_king = board.kings & w & chess.BB_RANK_1 & ~board.promoted
+    if w_king:
+        w_cr = clean & chess.BB_RANK_1
+        if w_cr & ~(w_king | (w_king - 1)):
+            out[769] = 1.0
+        if w_cr & (w_king - 1):
+            out[770] = 1.0
+
+    b_king = board.kings & b & chess.BB_RANK_8 & ~board.promoted
+    if b_king:
+        b_cr = clean & chess.BB_RANK_8
+        if b_cr & ~(b_king | (b_king - 1)):
+            out[771] = 1.0
+        if b_cr & (b_king - 1):
+            out[772] = 1.0
+
+    # 过路兵 file（仅当存在合法吃过路兵）
+    if board.ep_square is not None and board.has_legal_en_passant():
+        out[773 + chess.square_file(board.ep_square)] = 1.0
+
+    # 计数
+    out[781] = min(board.halfmove_clock, 100) / 100.0
+    out[782] = min(board.fullmove_number / 200.0, 1.0)
+
+    # 重复计数
+    if occurrence == 1:
+        out[783] = 1.0
+    elif occurrence >= 2:
+        out[784] = 1.0
+
+    return out
+
+
+def _encode_slow_reference(board: chess.Board, occurrence: int = 0) -> np.ndarray:
+    """慢速基准参考实现（供单测逐位对拍基准用）。"""
     feat = np.zeros(FEATURE_DIM, dtype=np.float32)
 
     # 棋子平面
@@ -79,6 +154,15 @@ def encode(board: chess.Board, occurrence: int = 0) -> np.ndarray:
     feat[783] = 1.0 if occurrence == 1 else 0.0
     feat[784] = 1.0 if occurrence >= 2 else 0.0
     return feat
+
+
+def encode(board: chess.Board, occurrence: int = 0) -> np.ndarray:
+    """局面 → 785 维特征。
+
+    occurrence：当前局面在本局此前出现的次数（0/1/≥2），由调用方沿棋谱统计（参考特征）。
+    直接复用 encode_board_fast 实现，保证 100% 逐位浮点严格一致。
+    """
+    return encode_board_fast(board, occurrence=occurrence)
 
 
 def decode(feat: np.ndarray) -> BoardFields:

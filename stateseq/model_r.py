@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from mamba_ssm import Mamba2
+
+try:
+    from mamba_ssm import Mamba2
+except ImportError:
+    Mamba2 = None  # type: ignore
 
 from .layers import RMSNorm
 
@@ -38,6 +42,8 @@ class MambaTower(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
+        if Mamba2 is None:
+            raise RuntimeError("mamba_ssm 未安装或在当前环境不可用（需要 CUDA 及 mamba_ssm）")
         self.d_model = d_model
         self.n_layers = n_layers
         self.blocks = nn.ModuleList(

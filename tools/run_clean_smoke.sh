@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -u -o pipefail
-SSM=/home/jeefy/UniChessSSM
+SSM=/home/jeefy/UniChess/SSM
 PY=/home/jeefy/miniconda3/envs/unichess/bin/python
 cd "$SSM"
 
@@ -21,11 +21,11 @@ echo "[$(date)] 生成退出码 $GENRC"
 echo "[$(date)] 验证 1000 局回放"
 cat > /tmp/val.py << 'PYEOF'
 import sys
-sys.path.insert(0, "/home/jeefy/UniChessSSM")
+sys.path.insert(0, "/home/jeefy/UniChess/SSM")
 import chess
 from stateseq.data.gshards import V3ShardReader
 from stateseq.actions import move_to_action
-r = V3ShardReader("/home/jeefy/UniChessSSM/runs/stage_b_smoke")
+r = V3ShardReader("/home/jeefy/UniChess/SSM/runs/stage_b_smoke")
 bad = 0
 for i in range(len(r.meta_all)):
     g = r.game(i)

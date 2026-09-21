@@ -71,7 +71,8 @@ class SeqModel(nn.Module):
     def forward_train(self, batch: TrainBatch, weights: losses.LossWeights, step: int, total_steps: int,
                       valid_mask: torch.Tensor | None = None,
                       policy_soft_target: torch.Tensor | None = None,
-                      mlh_valid_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, dict[str, float]]:
+                      mlh_valid_mask: torch.Tensor | None = None,
+                      log_target: bool = False) -> tuple[torch.Tensor, dict[str, float]]:
         """整序列前向 + 五损失；valid_mask (B,T) 屏蔽填充步。返回 (总损失, 指标 dict)。
 
         policy_soft_target (B,T,NUM_ACTIONS)：Stage B 自对弈 π′ 软目标（§2.2 修正②，
@@ -80,6 +81,7 @@ class SeqModel(nn.Module):
         dyn 仍用实战 batch.actions（§2.6：value/recon/dyn/mlh 代码零改动，只换 policy 监督）。
         mlh_valid_mask：默认等于 valid_mask；封顶截断局无真实终局，"剩余 ply"无定义，
         §2.5 要求整局剔除 mlh——调用方对截断局传入全 False 的行即可，其余损失不受影响。
+        log_target：是否对 mlh 启用 Log-Huber 变换（torch.log1p(F.relu(...)), delta=0.5）。
         """
         bsz, seqlen, _ = batch.features.shape
         x = self.encode(batch.features)                                   # (B, T, 512)
@@ -101,7 +103,9 @@ class SeqModel(nn.Module):
             l_pol = losses.policy_loss(policy_logits_masked, batch.actions,
                                        batch.elo_weight.unsqueeze(1).expand(bsz, seqlen), valid_mask)
         l_val = losses.value_loss(wdl_logits, batch.results, valid_mask)
-        l_mlh = losses.mlh_loss(mlh, batch.moves_left, mlh_valid_mask if mlh_valid_mask is not None else valid_mask)
+        l_mlh = losses.mlh_loss(mlh, batch.moves_left,
+                                mlh_valid_mask if mlh_valid_mask is not None else valid_mask,
+                                log_target=log_target)
 
         d_out = self.d(x)
         l_rec, diag_rec = losses.recon_loss(d_out, batch.features, valid_mask)
