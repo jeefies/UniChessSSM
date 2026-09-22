@@ -194,14 +194,26 @@ class TestOpeningLossWeightPlumbing(unittest.TestCase):
         soft[:, :, :n_legal] = 1.0 / n_legal
         return batch, soft
 
+    def _cpu_model(self):
+        """构造可跑 CPU 的模型：Mamba trunk（causal_conv1d）需 CUDA，替换为零张量假实现。
+
+        只关心 policy 损失权重管线，trunk 输出恒零不影响该验证。
+        """
+        import torch
+
+        from stateseq.model import SeqModel
+
+        model = SeqModel(dropout=0.0).eval()
+        model.trunk = lambda x: torch.zeros_like(x)
+        return model
+
     def test_weights_reach_policy_soft_loss(self):
         import torch
         from unittest.mock import patch
 
         from stateseq import losses
-        from stateseq.model import SeqModel
 
-        model = SeqModel(dropout=0.0).eval()
+        model = self._cpu_model()
         batch, soft = self._make_batch(2, 8)
         valid = torch.ones(2, 8, dtype=torch.bool)
         book_mask = torch.zeros(2, 8, dtype=torch.bool)
@@ -233,9 +245,8 @@ class TestOpeningLossWeightPlumbing(unittest.TestCase):
         from unittest.mock import patch
 
         from stateseq import losses
-        from stateseq.model import SeqModel
 
-        model = SeqModel(dropout=0.0).eval()
+        model = self._cpu_model()
         batch, soft = self._make_batch(1, 6)
         valid = torch.ones(1, 6, dtype=torch.bool)
         captured = {}
