@@ -780,11 +780,13 @@ class BatchedArenaDriver:
     """跨局攒批驱动器：并发跑 N 局协程，按模型槽位分组批处理前向。"""
 
     def __init__(self, games: list[BatchedArenaGame], concurrency: int, args,
-                 progress_every: int = 8):
+                 progress_every: int = 8, internal_sprt: bool = True, stop_check=None):
         self.games = games
         self.concurrency = max(1, concurrency)
         self.args = args
         self.progress_every = progress_every
+        self.internal_sprt = internal_sprt
+        self.stop_check = stop_check  # 外部早停信号（父进程 SPRT），None=不检查
         self.results: list[dict] = []
         self.sprt_info = None
         self.t0 = time.time()
@@ -818,7 +820,7 @@ class BatchedArenaDriver:
 
     def _sprt_check(self) -> None:
         """成对边界处检查 Wald 早停（候选落后则拒绝 H1，省算力）。"""
-        if not self.args.sprt or self.sprt_info is not None:
+        if not self.internal_sprt or not self.args.sprt or self.sprt_info is not None:
             return
         n = len(self.results)
         if n < self.args.sprt_min_games or n >= self.args.games:
@@ -865,6 +867,9 @@ class BatchedArenaDriver:
                 flush=True)
 
     def _start_slot(self, i: int, queue: list) -> None:
+        if self._stop_queue or (self.stop_check is not None and self.stop_check()):
+            self.slots[i] = None
+            return
         while queue and not self._stop_queue:
             game = queue.pop(0)
             gen = game.run()
@@ -931,6 +936,167 @@ def run_batched_arena(args: argparse.Namespace, num_pairs: int, n_openings: int,
     return driver.results, driver.sprt_info
 
 
+# ---- 批量 + 多进程 arena（资源调度优化）----
+#
+# 单进程攒批的瓶颈在 Python 树逻辑（~400 节点/秒/核，GPU 常年空闲）；生成器的经验是
+# 多进程各自攒批才能同时喂满 GPU。因此批量模式同样支持 --workers N：N 个进程各自加载
+# 双模型、以 concurrency 局攒批跑分到的开局对，父进程收集结果并按成对边界做 SPRT。
+
+
+def _batched_worker_fn(worker_id: int, assigned_pairs: list[tuple[int, int, str]],
+                       args: argparse.Namespace, result_queue, stop_event) -> None:
+    try:
+        models = [ArenaModel(args.ckpt_a), ArenaModel(args.ckpt_b)]
+        models[0].c_visit = models[1].c_visit = args.c_visit
+        models[0].c_scale = args.c_scale_a
+        models[1].c_scale = args.c_scale_b
+
+        cfg = lambda: None
+        cfg.n_sims = args.n_sims
+        cfg.m0 = args.m0
+        cfg.max_plies = args.max_plies
+        cfg.c_visit = args.c_visit
+        cfg.c_scale = C_SCALE
+
+        # 该 worker 的全部对局放进同一个驱动器：批大小≈concurrency（不是每对 2 局）
+        games: list[BatchedArenaGame] = []
+        for pair_idx, oi, opening_san in assigned_pairs:
+            for a_is_white in (True, False):
+                games.append(BatchedArenaGame(
+                    game_idx=0, pair_idx=pair_idx, models=models, a_is_white=a_is_white,
+                    cfg=cfg, opening_san=opening_san, opening_id=oi,
+                    seed=args.seed + worker_id * 1000 + pair_idx * 2 + (0 if a_is_white else 1)))
+        driver = BatchedArenaDriver(games, concurrency=args.concurrency, args=args,
+                                    internal_sprt=False,
+                                    stop_check=lambda: stop_event.is_set(),
+                                    progress_every=4)
+        driver.run()
+
+        by_pair: dict[int, list[dict]] = {}
+        for gd in driver.results:
+            by_pair.setdefault(gd["pair_idx"], []).append(gd)
+        for pair_idx in sorted(by_pair):
+            gds = sorted(by_pair[pair_idx],
+                         key=lambda g: 0 if g["white_ckpt_side"] == "A" else 1)
+            for j, gd in enumerate(gds):
+                gd["game_idx"] = pair_idx * 2 + j
+                gd["worker_id"] = worker_id
+            result_queue.put(("game_pair", (pair_idx, gds)))
+        result_queue.put(("worker_done", worker_id))
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        result_queue.put(("worker_error", (worker_id, str(e), traceback.format_exc())))
+
+
+def run_batched_parallel_arena(args: argparse.Namespace, num_pairs: int, n_openings: int,
+                               t0: float) -> tuple[list[dict], dict | None]:
+    """批量 + 多进程：round-robin 分配开局对，父进程收集并按成对边界做 SPRT 早停。"""
+    n_workers = min(args.workers, num_pairs)
+    worker_pairs: list[list[tuple[int, int, str]]] = [[] for _ in range(n_workers)]
+    for pair_idx in range(num_pairs):
+        oi = pair_idx % n_openings
+        worker_pairs[pair_idx % n_workers].append((pair_idx, oi, OPENINGS[oi]))
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    stop_event = ctx.Event()
+    workers = []
+    for wid in range(n_workers):
+        p = ctx.Process(target=_batched_worker_fn,
+                        args=(wid, worker_pairs[wid], args, result_queue, stop_event),
+                        daemon=True)
+        p.start()
+        workers.append(p)
+        print(f"[worker {wid}] 启动 pid={p.pid} pairs={len(worker_pairs[wid])}", flush=True)
+
+    p0, p1 = 0.50, 0.55
+    bound_b = math.log(args.sprt_beta / (1.0 - args.sprt_alpha))
+    log_p1_p0 = math.log(p1 / p0)
+    log_1p1_1p0 = math.log((1.0 - p1) / (1.0 - p0))
+
+    received_pairs: dict[int, list[dict]] = {}
+    completed_workers = 0
+    sprt_info = None
+
+    while completed_workers < n_workers:
+        try:
+            msg_type, payload = result_queue.get(timeout=1.0)
+        except Exception:
+            dead = [i for i, p in enumerate(workers) if not p.is_alive()]
+            if dead and completed_workers + len(dead) >= n_workers:
+                while not result_queue.empty():
+                    msg_type, payload = result_queue.get_nowait()
+                    if msg_type == "game_pair":
+                        pair_idx, games = payload
+                        received_pairs[pair_idx] = games
+                    elif msg_type == "worker_done":
+                        completed_workers += 1
+                break
+            continue
+
+        if msg_type == "game_pair":
+            pair_idx, games = payload
+            received_pairs[pair_idx] = games
+            total_games_so_far = sum(len(g) for g in received_pairs.values())
+            if len(received_pairs) % 4 == 0 or len(received_pairs) == num_pairs:
+                print("  [%.0fs] games %d/%d (pair %d/%d)" % (
+                    time.time() - t0, total_games_so_far, args.games,
+                    len(received_pairs), num_pairs), flush=True)
+            if (args.sprt and total_games_so_far >= args.sprt_min_games
+                    and total_games_so_far < args.games and not stop_event.is_set()):
+                all_current = []
+                for p_idx in sorted(received_pairs.keys()):
+                    all_current.extend(received_pairs[p_idx])
+                cur_n = len(all_current)
+                s_a = sum(1.0 if g["arena_result"] == 0 else 0.5 if g["arena_result"] == 1 else 0.0
+                          for g in all_current)
+                llr = s_a * log_p1_p0 + (cur_n - s_a) * log_1p1_1p0
+                if llr <= bound_b:
+                    saved_games = args.games - cur_n
+                    sprt_info = {
+                        "early_stopped": True, "stop_reason": "sprt_reject_h1",
+                        "llr": float(llr), "llr_bound": float(bound_b),
+                        "alpha": args.sprt_alpha, "beta": args.sprt_beta,
+                        "p0": p0, "p1": p1, "games_played": cur_n,
+                        "games_planned": args.games, "compute_saved_games": saved_games,
+                        "compute_saved_percent": saved_games / args.games * 100,
+                    }
+                    stop_event.set()
+                    print(f"\n[SPRT Early Stop Triggered] LLR={llr:.3f} <= bound={bound_b:.3f} "
+                          f"at game {cur_n}/{args.games}", flush=True)
+                    print(f"Candidate rejected early. Compute saved: {saved_games} games "
+                          f"({saved_games / args.games * 100:.1f}%)\n", flush=True)
+        elif msg_type == "worker_done":
+            completed_workers += 1
+        elif msg_type == "worker_error":
+            wid, err_str, tb_str = payload
+            stop_event.set()
+            print(f"[worker {wid} ERROR]: {err_str}\n{tb_str}", file=sys.stderr, flush=True)
+            raise RuntimeError(f"Worker {wid} failed with error: {err_str}")
+
+    if stop_event.is_set():
+        time.sleep(0.5)
+        while not result_queue.empty():
+            try:
+                msg_type, payload = result_queue.get_nowait()
+                if msg_type == "game_pair":
+                    pair_idx, games = payload
+                    if pair_idx not in received_pairs:
+                        received_pairs[pair_idx] = games
+            except Exception:
+                break
+
+    for p in workers:
+        p.join(timeout=5.0)
+
+    all_games_log = []
+    for p_idx in sorted(received_pairs.keys()):
+        all_games_log.extend(received_pairs[p_idx])
+    for i, gd in enumerate(all_games_log):
+        gd["game_idx"] = i
+    return all_games_log, sprt_info
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt-a")
@@ -944,10 +1110,10 @@ def main():
     ap.add_argument("--seed", type=int, default=20260917)
     ap.add_argument("--workers", type=int, default=1, help="并行工作进程数（默认 1：串行运行）")
     ap.add_argument("--batched", action="store_true",
-                    help="跨局攒批模式（推荐）：单进程并发多局，前向按模型槽位拼批，"
-                         "吞吐较 batch=1 提升约一个数量级；与 --workers 互斥")
+                    help="跨局攒批模式（推荐）：每进程并发多局、前向按模型槽位拼批；"
+                         "配合 --workers N 做多进程×进程内攒批，兼顾 GPU 批量与树逻辑并行")
     ap.add_argument("--concurrency", type=int, default=24,
-                    help="--batched 模式的并发局数（批大小≈该值，默认 24）")
+                    help="--batched 模式每进程的并发局数（批大小≈该值×模型数，默认 24）")
     ap.add_argument("--test-scoring", action="store_true")
     ap.add_argument("--c_visit", type=float, default=C_VISIT, help="双方共用的 c_visit")
     ap.add_argument("--c_scale_a", type=float, default=C_SCALE, help="A 侧 c_scale")
@@ -1007,23 +1173,25 @@ def main():
 
     if args.batched:
         if args.workers > 1:
-            raise SystemExit("--batched 与 --workers>1 互斥：批量模式靠单进程跨局攒批，"
-                             "加进程只会各自 batch=1")
-        # 模型身份验证（哈希已在上面算过；这里补一次前向比较，顺带把模型传给批量运行）
-        model_a = ArenaModel(args.ckpt_a)
-        model_b = ArenaModel(args.ckpt_b)
-        dummy_feats = np.zeros((1, 785), dtype=np.float32)
-        la, wa, _, _, _ = model_a.step(dummy_feats, [2], [float(standardize_elo(2567.5))], [1],
-                                       model_a.initial_cache(1))
-        lb, wb, _, _, _ = model_b.step(dummy_feats, [2], [float(standardize_elo(2567.5))], [1],
-                                       model_b.initial_cache(1))
-        import torch.nn.functional as F
-        policy_diff = float(np.max(np.abs(
-            F.softmax(torch.from_numpy(la[0]), dim=0).numpy()
-            - F.softmax(torch.from_numpy(lb[0]), dim=0).numpy())))
-        print("A hash=%s B hash=%s same=%s policy_diff=%.2e" % (id_a, id_b, id_a == id_b, policy_diff))
-        games_log, sprt_info = run_batched_arena(args, num_pairs, n_openings, t0,
-                                                 models=[model_a, model_b])
+            # 批量 + 多进程：N 进程各自攒批跑分到的开局对（树逻辑并行 + GPU 批量兼得）
+            games_log, sprt_info = run_batched_parallel_arena(args, num_pairs, n_openings, t0)
+        else:
+            # 单进程跨局攒批（batch≈并发局数）
+            model_a = ArenaModel(args.ckpt_a)
+            model_b = ArenaModel(args.ckpt_b)
+            dummy_feats = np.zeros((1, 785), dtype=np.float32)
+            la, wa, _, _, _ = model_a.step(dummy_feats, [2], [float(standardize_elo(2567.5))], [1],
+                                           model_a.initial_cache(1))
+            lb, wb, _, _, _ = model_b.step(dummy_feats, [2], [float(standardize_elo(2567.5))], [1],
+                                           model_b.initial_cache(1))
+            import torch.nn.functional as F
+            policy_diff = float(np.max(np.abs(
+                F.softmax(torch.from_numpy(la[0]), dim=0).numpy()
+                - F.softmax(torch.from_numpy(lb[0]), dim=0).numpy())))
+            print("A hash=%s B hash=%s same=%s policy_diff=%.2e" % (
+                id_a, id_b, id_a == id_b, policy_diff))
+            games_log, sprt_info = run_batched_arena(args, num_pairs, n_openings, t0,
+                                                     models=[model_a, model_b])
     elif args.workers > 1:
         # 多进程并行模式
         games_log, sprt_info = run_parallel_arena(args, num_pairs, n_openings, t0)
