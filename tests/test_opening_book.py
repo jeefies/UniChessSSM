@@ -34,6 +34,8 @@ except ImportError:  # pragma: no cover - 本机（Windows）无 torch
 def _load_tool():
     spec = importlib.util.spec_from_file_location("ssm_gumbel_selfplay_under_test", _TOOL_PATH)
     mod = importlib.util.module_from_spec(spec)
+    # dataclass 处理需要通过 sys.modules[cls.__module__] 反查命名空间，必须先注册
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 
