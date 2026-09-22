@@ -818,6 +818,8 @@ class BatchedArenaDriver:
         self.results: list[dict] = []
         self.sprt_info = None
         self.t0 = time.time()
+        self.n_forwards = 0
+        self.n_plies = 0
         # SPRT 参数（H0: p<=0.50 vs H1: p>=0.55；候选为 A）
         self._p0, self._p1 = 0.50, 0.55
         self._bound_b = math.log(args.sprt_beta / (1.0 - args.sprt_alpha))
@@ -829,6 +831,7 @@ class BatchedArenaDriver:
 
     def _model_step(self, reqs: list):
         """reqs: [(game, (slot, feats, tc, elo, color, cache)] → [(game, result)]（同序）。"""
+        self.n_forwards += len(reqs)
         groups: dict[int, list[int]] = {}
         for idx, (_game, req) in enumerate(reqs):
             groups.setdefault(req[0], []).append(idx)
@@ -880,6 +883,7 @@ class BatchedArenaDriver:
 
     def _finish(self, game: BatchedArenaGame, gd: dict) -> None:
         gd["game_idx"] = len(self.results)
+        self.n_plies += int(gd.get("n_plies", 0))
         gd["pair_idx"] = game.pair_idx
         gd["white_ckpt_side"] = "A" if game.slot[chess.WHITE] == 0 else "B"
         gd["black_ckpt_side"] = "B" if game.slot[chess.WHITE] == 0 else "A"
@@ -929,6 +933,11 @@ class BatchedArenaDriver:
                 except StopIteration as e:
                     self._finish(game, e.value)
                     self._start_slot(i, queue)
+        el = time.time() - self.t0
+        print("[driver] %d 局 %d ply %d 前向，%.0fs → %.2f ply/s，%.0f 前向/s，"
+              "%.0f 前向/ply" % (len(self.results), self.n_plies, self.n_forwards, el,
+                            self.n_plies / max(el, 1e-6), self.n_forwards / max(el, 1e-6),
+                            self.n_forwards / max(self.n_plies, 1)), flush=True)
 
 
 def run_batched_arena(args: argparse.Namespace, num_pairs: int, n_openings: int,
