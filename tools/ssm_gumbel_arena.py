@@ -603,7 +603,7 @@ class BatchedArenaGame:
         key = _board_key(board)
         occ = self.occurrence.get(key, 0)
         feats, tc_val, elo_std, color = encode_board(board, occ)
-        feats_np = np.asarray(feats, dtype=np.float32).reshape(1, -1)
+        feats_np = np.asarray(feats, dtype=np.float32).reshape(-1)
         mover_logits = None
         mover_wdl = None
         for side in (chess.WHITE, chess.BLACK):
@@ -632,7 +632,7 @@ class BatchedArenaGame:
             key = _board_key(board)
             feats, tc_val, elo_std, color = encode_board(board, occ.get(key, 0))
             _, _, _, _, cache = yield (
-                slot, np.asarray(feats, dtype=np.float32).reshape(1, -1),
+                slot, np.asarray(feats, dtype=np.float32).reshape(-1),
                 int(tc_val), float(elo_std), int(color), cache)
             occ[key] = occ.get(key, 0) + 1
         mv = _resolve_move(action, board)
@@ -646,7 +646,7 @@ class BatchedArenaGame:
         key = _board_key(board)
         feats, tc_val, elo_std, color = encode_board(board, occ.get(key, 0))
         lc, wc, _, _, _ = yield (
-            slot, np.asarray(feats, dtype=np.float32).reshape(1, -1),
+            slot, np.asarray(feats, dtype=np.float32).reshape(-1),
             int(tc_val), float(elo_std), int(color), cache)
         occ[key] = occ.get(key, 0) + 1
         q_c = wdl_logits_to_q(wc)
