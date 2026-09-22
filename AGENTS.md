@@ -196,6 +196,9 @@ UniChessSSM/
 - **价值口径【锁定】**：节点 q 一律存**该行棋方视角** `q = pW − pL ∈ [−1,1]`，和棋=0；跨边取负（零和）。
   与 WDL 训练标签（行棋方归一）一致，且与 B0 核对的 `Q=wdl[0]−wdl[2]` 合约同构。
 - **根节点选择**：Gumbel-Top-k 取 top-m₀=16 候选，顺序减半分配 n=64 模拟（4 轮 16→8→4→2→1）。
+  **2026-09-22 变更：n_sims 默认值 64→256**（`stateseq/gumbel.py:29` 及两个工具 CLI，
+  用户确认，依据 `docs/ssm_vs_transformer_analysis.md` §9.1——64 sims 对中盘防御过浅）。
+  代价：生成吞吐约 ÷3.5。变更已记入 `docs/stage-b-implementation.md` §5。
 - **σ 常数【锁定】**：`σ(q̂) = (c_visit + max_b N(b)) · c_scale · q̂`，`c_visit=50`、**`c_scale=0.1`**
   （决定见 `design-deviations.md` §9.3；**代码默认值直到 2026-09-20 本次才真正落到
   `stateseq/gumbel.py:26`** —— 此前 3 天里文档写 0.1、代码仍是 `C_SCALE = 1.0`，
@@ -239,6 +242,11 @@ UniChessSSM/
 - `*.actions.bin`：uint16 实战着法
 - `*.pipol.bin`：**变长**——每 ply 存 `u16 legal_count + legal_count × (u16 action_id + f16 prob)`
   即 π′ 在全部合法着上的目标；各 ply 偏移表随分片索引存。
+- **flags（2026-09-22 启用，原保留字段）= 本局开局注入 ply 数**（0=无开局库）。
+  生成器对前 `book_plies`（默认 6）ply 走 book 着法但 π′ 由搜索产生（P1-2），搜索结果按
+  (seed, 开局序号, ply) 跨局共享（P1-1，manifest 记 book_memo_hit_rate）；
+  训练侧据此对 book ply 的 policy 软 CE 降权（`--opening-loss-weight`，默认 0.25，P1-3）。
+  旧分片 flags=0 ⇒ 无 book 段 ⇒ 行为不变。
 
 **终局语义必须可分**：自然终局/规则申和/封顶截断在 meta 分开记录。
 截断局（is_truncated=1）z 按约定记和，**mlh 损失整局剔除**。

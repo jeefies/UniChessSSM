@@ -164,5 +164,93 @@ class TestGameStateBookFields(unittest.TestCase):
         self.assertIsInstance(gs.board, chess.Board)
 
 
+@unittest.skipUnless(_HAS_TORCH, "需要 torch（远端全量单测环境）")
+class TestOpeningLossWeightPlumbing(unittest.TestCase):
+    """P1-3：policy_weights 经 forward_train 正确传入 policy 软 CE。"""
+
+    def _make_batch(self, b: int, t: int, n_legal: int = 5):
+        import torch
+
+        from stateseq.actions import NUM_ACTIONS
+        from stateseq.features import FEATURE_DIM
+        from stateseq.model import TrainBatch
+
+        torch.manual_seed(0)
+        feats = torch.randn(b, t, FEATURE_DIM) * 0.1
+        legal = torch.zeros(b, t, NUM_ACTIONS, dtype=torch.bool)
+        # 每步固定取前 n_legal 个动作作合法着（确定性，便于构造软目标）
+        for i in range(n_legal):
+            legal[:, :, i] = True
+        actions = torch.zeros(b, t, dtype=torch.int64)
+        results = torch.ones(b, t, dtype=torch.int64)  # 全和棋
+        moves_left = torch.arange(t, dtype=torch.float32).unsqueeze(0).expand(b, t).contiguous()
+        elo_w = torch.ones(b)
+        tc = torch.zeros(b, dtype=torch.int64)
+        elo_std = torch.zeros(b)
+        color = torch.ones(b, t, dtype=torch.int64)
+        batch = TrainBatch(feats, actions, legal, results, moves_left, elo_w, tc, elo_std, color)
+        # 均匀软目标（支持集 = 合法着）
+        soft = torch.zeros(b, t, NUM_ACTIONS)
+        soft[:, :, :n_legal] = 1.0 / n_legal
+        return batch, soft
+
+    def test_weights_reach_policy_soft_loss(self):
+        import torch
+        from unittest.mock import patch
+
+        from stateseq import losses
+        from stateseq.model import SeqModel
+
+        model = SeqModel(dropout=0.0).eval()
+        batch, soft = self._make_batch(2, 8)
+        valid = torch.ones(2, 8, dtype=torch.bool)
+        book_mask = torch.zeros(2, 8, dtype=torch.bool)
+        book_mask[:, :3] = True  # 前 3 ply 为 book 段
+        pw = torch.where(book_mask, torch.full((2, 8), 0.25), torch.ones(2, 8))
+
+        captured = {}
+        real = losses.policy_soft_loss
+
+        def spy(logits, target_probs, weights, pos_mask=None, eps=1e-8):
+            captured["weights"] = weights.detach().clone()
+            return real(logits, target_probs, weights, pos_mask, eps)
+
+        with patch.object(losses, "policy_soft_loss", side_effect=spy):
+            with torch.no_grad():
+                total, metrics = model.forward_train(
+                    batch, losses.LossWeights(), step=0, total_steps=10,
+                    valid_mask=valid, policy_soft_target=soft, policy_weights=pw)
+
+        w = captured["weights"]
+        self.assertEqual(tuple(w.shape), (2, 8))
+        self.assertTrue(torch.allclose(w[:, :3], torch.full((2, 3), 0.25)))
+        self.assertTrue(torch.allclose(w[:, 3:], torch.ones(2, 5)))
+        self.assertIn("loss_policy", metrics)
+        self.assertTrue(torch.isfinite(torch.tensor(metrics["loss_policy"])))
+
+    def test_no_weights_means_all_ones(self):
+        import torch
+        from unittest.mock import patch
+
+        from stateseq import losses
+        from stateseq.model import SeqModel
+
+        model = SeqModel(dropout=0.0).eval()
+        batch, soft = self._make_batch(1, 6)
+        valid = torch.ones(1, 6, dtype=torch.bool)
+        captured = {}
+        real = losses.policy_soft_loss
+
+        def spy(logits, target_probs, weights, pos_mask=None, eps=1e-8):
+            captured["weights"] = weights.detach().clone()
+            return real(logits, target_probs, weights, pos_mask, eps)
+
+        with patch.object(losses, "policy_soft_loss", side_effect=spy):
+            with torch.no_grad():
+                model.forward_train(batch, losses.LossWeights(), step=0, total_steps=10,
+                                    valid_mask=valid, policy_soft_target=soft)
+        self.assertTrue(torch.allclose(captured["weights"], torch.ones(1, 6)))
+
+
 if __name__ == "__main__":
     unittest.main()
