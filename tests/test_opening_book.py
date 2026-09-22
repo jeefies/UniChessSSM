@@ -61,7 +61,7 @@ class TestLoadOpenings(unittest.TestCase):
         for line in ops:
             self.assertEqual(len(line), 6)
         self.assertEqual(ops[0], ["e4", "e5", "Nf3", "Nc6", "Bb5", "a6"])
-        self.assertEqual(ops[1], ["d4", "d5", "c4", "e6", "Nc3", "Nf3"])
+        self.assertEqual(ops[1], ["d4", "d5", "c4", "e6", "Nc3", "Nf6"])
 
     def test_short_line_kept_as_is(self):
         path = self._write("e4 e5 Nf3\n")
@@ -115,7 +115,7 @@ class TestBuildBookMask(unittest.TestCase):
     def setUpClass(cls):
         from stateseq.data.dataset_selfplay import build_book_mask
 
-        cls.fn = build_book_mask
+        cls.fn = staticmethod(build_book_mask)
 
     def test_basic(self):
         m = self.fn([10, 8], [6, 0], t=10)
