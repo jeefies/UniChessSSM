@@ -139,19 +139,47 @@ class ArenaModel:
         self.seq = SeqModel(dropout=0.0)
         self.seq.load_state_dict(sd)
         self.seq.to(device).eval()
+        # 条件张量缓存：arena 的 tc/elo 全局固定，按 (标量值, 批大小) 缓存，
+        # 避免每次前向都 torch.tensor([...]) 重建（profile 显示这是最大单项开销）。
+        self._tc_cache: dict = {}
+        self._elo_cache: dict = {}
 
     def initial_cache(self, b: int = 1):
         return self.seq.initial_cache(b, device=self.device, dtype=torch.float32)
 
+    def _scalar_tensor(self, cache: dict, kind: str, val, n: int) -> torch.Tensor:
+        key = (val, n)
+        t = cache.get(key)
+        if t is None:
+            t = (torch.full((n,), int(val), dtype=torch.long, device=self.device)
+                 if kind == "long" else
+                 torch.full((n,), float(val), dtype=torch.float32, device=self.device))
+            cache[key] = t
+        return t
+
     @torch.no_grad()
-    def step(self, feats, tc, elo, color, cache):
+    def step(self, feats, tc, elo, color, cache, need_extra: bool = False):
+        """单步前向。
+
+        need_extra=False（arena 搜索默认）：不回传 mlh 与 x 的 CPU 副本——二者在
+        搜索路径上无人消费，省掉 2/5 的 D2H 同步传输。
+        """
         f_t = torch.from_numpy(feats).float().to(self.device)
-        tc_t = torch.tensor(tc, dtype=torch.long, device=self.device)
-        elo_t = torch.tensor(elo, dtype=torch.float32, device=self.device)
-        color_t = torch.tensor(color, dtype=torch.long, device=self.device)
+        n = len(tc)
+        if len(set(tc)) == 1:
+            tc_t = self._scalar_tensor(self._tc_cache, "long", tc[0], n)
+        else:
+            tc_t = torch.from_numpy(np.asarray(tc, dtype=np.int64)).to(self.device)
+        if len(set(elo)) == 1:
+            elo_t = self._scalar_tensor(self._elo_cache, "float", elo[0], n)
+        else:
+            elo_t = torch.from_numpy(np.asarray(elo, dtype=np.float32)).to(self.device)
+        color_t = torch.from_numpy(np.asarray(color, dtype=np.int64)).to(self.device)
         logits, wdl, mlh, x, cache_new = self.seq.step(f_t, tc_t, elo_t, color_t, cache)
-        return (logits.cpu().numpy(), wdl.cpu().numpy(),
-                mlh.cpu().numpy(), x.cpu().numpy(), cache_new)
+        if need_extra:
+            return (logits.cpu().numpy(), wdl.cpu().numpy(),
+                    mlh.cpu().numpy(), x.cpu().numpy(), cache_new)
+        return logits.cpu().numpy(), wdl.cpu().numpy(), None, None, cache_new
 
 
 # ---- 单局对弈（每方独立模型 + 完整历史 cache/occurrence）----

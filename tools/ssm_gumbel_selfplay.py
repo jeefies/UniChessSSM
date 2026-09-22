@@ -109,18 +109,40 @@ class ModelWrapper:
         self.seq = SeqModel(dropout=0.0)
         self.seq.load_state_dict(state_dict)
         self.seq.to(device).eval()
+        # 条件张量缓存（tc/elo 全局固定，见 step_batch 注释）
+        self._tc_cache: dict = {}
+        self._elo_cache: dict = {}
 
     def initial_cache(self, batch_size: int = 1):
         return self.seq.initial_cache(batch_size, device=self.device, dtype=torch.float32)
 
     @torch.no_grad()
     def step_batch(self, features: np.ndarray, tc: list[int], elo: list[float],
-                    color: list[int], cache):
-        """features (N,785)；返回 numpy (logits, wdl, mlh, x) + 新 batched cache。"""
+                   color: list[int], cache):
+        """features (N,785)；返回 numpy (logits, wdl, mlh, x) + 新 batched cache。
+
+        条件张量走 numpy 零拷贝构造，并对全局固定的 tc/elo 按 (值, 批大小) 缓存——
+        profile 显示 `torch.tensor([...])` 逐次重建是最大单项 CPU 开销（~0.4ms/次）。
+        """
         f_t = torch.from_numpy(features).float().to(self.device)
-        tc_t = torch.tensor(tc, dtype=torch.long, device=self.device)
-        elo_t = torch.tensor(elo, dtype=torch.float32, device=self.device)
-        color_t = torch.tensor(color, dtype=torch.long, device=self.device)
+        n = len(tc)
+        if len(set(tc)) == 1:
+            key = (tc[0], n)
+            tc_t = self._tc_cache.get(key)
+            if tc_t is None:
+                tc_t = torch.full((n,), int(tc[0]), dtype=torch.long, device=self.device)
+                self._tc_cache[key] = tc_t
+        else:
+            tc_t = torch.from_numpy(np.asarray(tc, dtype=np.int64)).to(self.device)
+        if len(set(elo)) == 1:
+            key = (elo[0], n)
+            elo_t = self._elo_cache.get(key)
+            if elo_t is None:
+                elo_t = torch.full((n,), float(elo[0]), dtype=torch.float32, device=self.device)
+                self._elo_cache[key] = elo_t
+        else:
+            elo_t = torch.from_numpy(np.asarray(elo, dtype=np.float32)).to(self.device)
+        color_t = torch.from_numpy(np.asarray(color, dtype=np.int64)).to(self.device)
         logits, wdl, mlh, x, cache_new = self.seq.step(f_t, tc_t, elo_t, color_t, cache)
         return (logits.detach().cpu().numpy(), wdl.detach().cpu().numpy(),
                 mlh.detach().cpu().numpy(), x.detach().cpu().numpy(), cache_new)
