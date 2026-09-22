@@ -182,6 +182,8 @@ class GameState:
         self.opening_idx = opening_idx
         self.pipol_memo = pipol_memo if pipol_memo is not None else {}
         self.n_book_plies = 0
+        self.book_memo_hits = 0
+        self.book_memo_misses = 0
         self.n_nodes_total = 0
         self.n_terminal_total = 0
         self.sims_total = 0
@@ -197,10 +199,13 @@ class GameState:
     def run(self):
         # 开局注入阶段（P1-2）：着法仍走 book（保开局多样性与正确性），但每个 book ply 的
         # π′ 目标由模型 Gumbel 搜索产生（而非 one-hot），目标与模型自身评估一致。
-        # P1-1 跨局共享：同一条开局的第 ply 个局面在所有局中逐位一致（棋盘/occurrence/
-        # R cache 均相同），搜索噪声只取决于 (seed, opening_idx, ply)（book_pipol_rng），
-        # 因此搜索结果可按 (opening_idx, ply) 跨局缓存——每个 worker 对每个
+        # P1-1 跨局共享：同一条开局的第 ply 个局面在所有局中**输入完全一致**（棋盘、
+        # occurrence、R cache 均相同，搜索噪声由 book_pipol_rng(seed, opening_idx, ply)
+        # 决定），因此搜索结果可按 (seed, opening_idx, ply) 跨局缓存——每个 worker 对每个
         # (开局, ply) 只搜一次，其余局直接复用，book ply 的净成本≈原来的 cache 推进。
+        # 注意：并发局若在同一 ply 竞态（都未命中），会各自搜索；二者输入一致但浮点结果
+        # 可能因拼批上下文有 ~1e-6 级差异（树在分数接近时可能分叉）——这是计算优化而非
+        # 正确性依赖，复用到的 π′ 始终是该局面的一次合法搜索结果。
         book_moves = self.opening_moves[:self.cfg.book_plies]
         for ply_idx, san in enumerate(book_moves):
             if self.board.is_game_over(claim_draw=True):
@@ -223,10 +228,7 @@ class GameState:
             cached = self.pipol_memo.get(memo_key) if memo_key is not None else None
             if cached is not None:
                 ids, probs, stats = cached
-                self.n_nodes_total += stats["n_nodes"]
-                self.n_terminal_total += stats["n_terminal"]
-                self.sims_total += stats["sims_used"]
-                self.max_depth_total += int(stats["max_depth"])
+                self.book_memo_hits += 1
             else:
                 q = wdl_logits_to_q(wdl_np)
                 legal_actions = _legal_actions_of(self.board)
@@ -243,14 +245,15 @@ class GameState:
                 ids, probs = export_pi_prime(root_node, self.cfg.c_visit, self.cfg.c_scale)
                 stats = {"n_nodes": result["n_nodes"], "n_terminal": result["n_terminal"],
                          "sims_used": result["sims_used"], "max_depth": result["max_depth"]}
-                self.n_nodes_total += stats["n_nodes"]
-                self.n_terminal_total += stats["n_terminal"]
-                self.sims_total += stats["sims_used"]
-                self.max_depth_total += int(stats["max_depth"])
-                if result["sims_used"] != self.cfg.n_sims:
-                    self.budget_violations += 1
+                self.book_memo_misses += 1
                 if memo_key is not None:
                     self.pipol_memo[memo_key] = (ids, probs, stats)
+                if stats["sims_used"] != self.cfg.n_sims:
+                    self.budget_violations += 1
+            self.n_nodes_total += stats["n_nodes"]
+            self.n_terminal_total += stats["n_terminal"]
+            self.sims_total += stats["sims_used"]
+            self.max_depth_total += int(stats["max_depth"])
 
             self.actions.append(int(act))
             self.pipol_actions.append(ids.astype(np.uint16))
@@ -471,6 +474,8 @@ class Driver:
         self.budget_violations = 0
         self.term_reason_counts = [0] * len(TERM_CODES)
         self.truncated_games = 0
+        self.book_memo_hits = 0
+        self.book_memo_misses = 0
         # 开局 ply 的 π′ 跨局共享缓存（P1-1）：键 (seed, opening_idx, ply) → (ids, probs, stats)。
         # 同一条开局在任意局中的前 book_plies 个局面逐位一致，搜索结果可安全复用。
         self.pipol_memo: dict = {}
@@ -531,6 +536,8 @@ class Driver:
         self.total_max_depth += game.max_depth_total
         self.budget_violations += game.budget_violations
         self.term_reason_counts[term_reason] += 1
+        self.book_memo_hits += game.book_memo_hits
+        self.book_memo_misses += game.book_memo_misses
         if is_truncated:
             self.truncated_games += 1
 
@@ -640,6 +647,9 @@ def generate(cfg: SelfPlayConfig) -> dict:
         "budget_violations": driver.budget_violations,
         "termination_reason_counts": dict(zip(TERM_CODES, driver.term_reason_counts)),
         "truncated_rate": driver.truncated_games / max(driver.games_done, 1),
+        "book_memo_hits": driver.book_memo_hits,
+        "book_memo_misses": driver.book_memo_misses,
+        "book_memo_hit_rate": driver.book_memo_hits / max(driver.book_memo_hits + driver.book_memo_misses, 1),
         "concurrency": cfg.concurrency,
         "n_sims": cfg.n_sims,
         "m0": cfg.m0,
@@ -685,6 +695,7 @@ def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: fl
     budget_violations = 0
     term_counts = [0] * len(TERM_CODES)
     truncated_games = 0
+    book_hits = book_misses = 0
     last_cfg: dict = {}
 
     for wd in worker_dirs:
@@ -709,6 +720,8 @@ def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: fl
         for k, v in gen.get("termination_reason_counts", {}).items():
             term_counts[TERM_CODES.index(k)] += v
         truncated_games += round(gen.get("truncated_rate", 0.0) * gen.get("games", 0))
+        book_hits += gen.get("book_memo_hits", 0)
+        book_misses += gen.get("book_memo_misses", 0)
         last_cfg = {k: gen.get(k) for k in ("concurrency", "n_sims", "m0", "gen_id", "ckpt_step",
                                             "c_visit", "c_scale", "book_plies") if k in gen}
         shutil.rmtree(wd, ignore_errors=True)
@@ -725,6 +738,9 @@ def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: fl
         "budget_violations": budget_violations,
         "termination_reason_counts": dict(zip(TERM_CODES, term_counts)),
         "truncated_rate": truncated_games / max(total_games, 1),
+        "book_memo_hits": book_hits,
+        "book_memo_misses": book_misses,
+        "book_memo_hit_rate": book_hits / max(book_hits + book_misses, 1),
         "workers": len(worker_dirs),
         "seed": getattr(args, "seed", None),
         **last_cfg,
