@@ -45,7 +45,21 @@ def _worker_build(index: int, t_max: int = B2_T_MAX):
     is_truncated = bool(meta["is_truncated"])
     # np.void structured scalar：只能按字段名取值（无 .get）
     elo_mean = float(meta["elo_mean"])
-    return index, data, tc, is_truncated, elo_mean
+    # flags = 本局开局注入 ply 数（旧分片为 0）；供拼批构造 book_mask（§P1-3 降权）
+    book_plies = int(meta["flags"]) if "flags" in meta.dtype.names else 0
+    return index, data, tc, is_truncated, elo_mean, book_plies
+
+
+def build_book_mask(lengths: "list[int] | np.ndarray", book_counts: "list[int] | np.ndarray",
+                    t: int) -> np.ndarray:
+    """(B,T) bool：第 i 局的前 book_counts[i] 个**有效** ply 为 True（开局注入段）。
+
+    同时受该局实际长度约束：超出 n_plies 或 t_max 的填充位一律 False。
+    旧分片 flags=0 ⇒ 全 False。
+    """
+    idx = np.arange(t)[None, :]
+    return (idx < np.asarray(book_counts, dtype=np.int64)[:, None]) & \
+           (idx < np.asarray(lengths, dtype=np.int64)[:, None])
 
 
 class SelfPlayDataset:
@@ -66,7 +80,8 @@ class SelfPlayDataset:
             self.val_indices = list(range(self.n_games - cut, self.n_games))
             self.train_indices = list(range(self.n_games - cut))
 
-    def _collate(self, items: list[tuple[int, dict, int, bool]]) -> dict[str, torch.Tensor]:
+    def _collate(self, items: list[tuple]) -> dict[str, torch.Tensor]:
+        """items: (index, data, tc, is_truncated, elo_mean, book_plies) 元组列表。"""
         items = sorted(items, key=lambda it: -len(it[1]["actions"]))
         b = len(items)
         t = max(len(it[1]["actions"]) for it in items)
@@ -103,6 +118,11 @@ class SelfPlayDataset:
 
         is_trunc = torch.tensor([it[3] for it in items], dtype=torch.bool)
         mlh_valid = valid & ~is_trunc.unsqueeze(1)
+        # 开局注入段掩码（B,T）：训练侧对 book ply 的 policy 软 CE 降权（§P1-3）。
+        # book 着法是分布外强制目标，且审计显示开局并非主要败因，降权让训练聚焦
+        # 模型自身搜索产生的 π′。旧分片 flags=0 ⇒ 全 False ⇒ 权重全 1，行为不变。
+        book_mask = torch.from_numpy(build_book_mask(
+            [len(it[1]["actions"]) for it in items], [it[5] for it in items], t))
 
         return {
             "batch": TrainBatch(features, actions, legal, results, moves_left,
@@ -110,6 +130,7 @@ class SelfPlayDataset:
             "valid": valid,
             "mlh_valid": mlh_valid,
             "policy_soft_target": torch.from_numpy(soft_target),
+            "book_mask": book_mask,
         }
 
     def epoch_batches(self, microbatch: int, device: str, shuffle: bool = True, prefetch: int = 3):
@@ -139,6 +160,7 @@ class SelfPlayDataset:
         out["valid"] = out["valid"].to(device, non_blocking=True)
         out["mlh_valid"] = out["mlh_valid"].to(device, non_blocking=True)
         out["policy_soft_target"] = out["policy_soft_target"].to(device, non_blocking=True)
+        out["book_mask"] = out["book_mask"].to(device, non_blocking=True)
         return out
 
     def val_batch(self, n_batches: int, microbatch: int, device: str, seed: int = 778):

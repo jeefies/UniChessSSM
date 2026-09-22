@@ -47,6 +47,8 @@ META_V2_DTYPE = np.dtype([
 # v3 扩展 meta：v2 的 16B + 16B 扩展
 # 扩展部分：u32 gen_id / u32 ckpt_step / u8 termination_reason / u8 is_truncated
 #          / u8 start_type / u8 flags / u32 pad
+# flags（2026-09-22 启用，原保留字段）：本局开局注入 ply 数（0=无开局库/未注入）。
+#         训练侧据此对 book ply 的 policy 软 CE 降权；旧分片该字段为 0，天然兼容。
 META_V3_EXT_DTYPE = np.dtype([
     ("gen_id", np.uint32),
     ("ckpt_step", np.uint32),

@@ -72,6 +72,7 @@ class SelfPlayConfig:
     tc_bucket: TimeControlBucket = TimeControlBucket.RAPID
     gumbel_g: float = 1.0  # Gumbel 噪声尺度；评测/换代 arena 用 g=0
     openings_path: str = ""
+    book_plies: int = 6  # 开局注入 ply 数（着法仍走 book，π′ 由搜索产生并跨局共享）
 
 
 def _legal_actions_of(board: chess.Board) -> list[int]:
@@ -164,7 +165,8 @@ class GameState:
     """
 
     def __init__(self, game_idx: int, model: ModelWrapper, cfg: SelfPlayConfig,
-                 seed_seq: np.random.SeedSequence, opening_moves: list[str] | None = None):
+                 seed_seq: np.random.SeedSequence, opening_moves: list[str] | None = None,
+                 opening_idx: int | None = None, pipol_memo: dict | None = None):
         self.game_idx = game_idx
         self.model = model
         self.cfg = cfg
@@ -176,6 +178,10 @@ class GameState:
         self.pipol_probs: list[np.ndarray] = []
         self.rng = np.random.default_rng(seed_seq)
         self.opening_moves = opening_moves or []
+        # 开局序号与跨局 π′ 缓存（Driver 级共享）：None/空表示无开局库，无共享
+        self.opening_idx = opening_idx
+        self.pipol_memo = pipol_memo if pipol_memo is not None else {}
+        self.n_book_plies = 0
         self.n_nodes_total = 0
         self.n_terminal_total = 0
         self.sims_total = 0
@@ -189,10 +195,14 @@ class GameState:
     # ---- 顶层：整局 ----
 
     def run(self):
-        # 若指定开局着法，在 Gumbel 搜索前先依序注入：
-        # 对每个局面 encode-before-move，将特征与当前 cache 步进送入模型，
-        # 记录实战 action，更新 occurrence 与 root_cache，再 push_san。
-        for san in self.opening_moves:
+        # 开局注入阶段（P1-2）：着法仍走 book（保开局多样性与正确性），但每个 book ply 的
+        # π′ 目标由模型 Gumbel 搜索产生（而非 one-hot），目标与模型自身评估一致。
+        # P1-1 跨局共享：同一条开局的第 ply 个局面在所有局中逐位一致（棋盘/occurrence/
+        # R cache 均相同），搜索噪声只取决于 (seed, opening_idx, ply)（book_pipol_rng），
+        # 因此搜索结果可按 (opening_idx, ply) 跨局缓存——每个 worker 对每个
+        # (开局, ply) 只搜一次，其余局直接复用，book ply 的净成本≈原来的 cache 推进。
+        book_moves = self.opening_moves[:self.cfg.book_plies]
+        for ply_idx, san in enumerate(book_moves):
             if self.board.is_game_over(claim_draw=True):
                 return None
             key = _board_key(self.board)
@@ -207,21 +217,48 @@ class GameState:
             act = move_to_action(mv)
             if act is None:
                 raise RuntimeError(f"开局着法 {san} 在 {self.board.fen()} 上无法映射到 action")
+
+            memo_key = ((self.cfg.seed, self.opening_idx, ply_idx)
+                        if self.opening_idx is not None else None)
+            cached = self.pipol_memo.get(memo_key) if memo_key is not None else None
+            if cached is not None:
+                ids, probs, stats = cached
+                self.n_nodes_total += stats["n_nodes"]
+                self.n_terminal_total += stats["n_terminal"]
+                self.sims_total += stats["sims_used"]
+                self.max_depth_total += int(stats["max_depth"])
+            else:
+                q = wdl_logits_to_q(wdl_np)
+                legal_actions = _legal_actions_of(self.board)
+                legal_arr = np.array(legal_actions, dtype=np.int64)
+                logits_full = np.full(1936, -3e4, dtype=np.float32)
+                logits_full[legal_arr] = logits_np[legal_arr]
+                root_node = Node(legal=legal_arr, logits=logits_full[legal_arr],
+                                 q=q, depth=0, path=())
+                book_rng = (book_pipol_rng(self.cfg.seed, self.opening_idx, ply_idx)
+                            if memo_key is not None else self.rng)
+                result = yield from self._order_halving_gen(root_node, rng=book_rng)
+                if result["action"] is None:
+                    return False
+                ids, probs = export_pi_prime(root_node, self.cfg.c_visit, self.cfg.c_scale)
+                stats = {"n_nodes": result["n_nodes"], "n_terminal": result["n_terminal"],
+                         "sims_used": result["sims_used"], "max_depth": result["max_depth"]}
+                self.n_nodes_total += stats["n_nodes"]
+                self.n_terminal_total += stats["n_terminal"]
+                self.sims_total += stats["sims_used"]
+                self.max_depth_total += int(stats["max_depth"])
+                if result["sims_used"] != self.cfg.n_sims:
+                    self.budget_violations += 1
+                if memo_key is not None:
+                    self.pipol_memo[memo_key] = (ids, probs, stats)
+
             self.actions.append(int(act))
-            # 开局步也记录变长合法着和 uniform/one-hot 或纯空 pipol 还是？
-            # 规格与 v3 约束：pipol 记录每个实战步的 π′。
-            # 对于开局注入着法，合法着空间上构建 one-hot 目标（或基于 logits 的先验目标）
-            legal_actions = _legal_actions_of(self.board)
-            legal_arr = np.array(legal_actions, dtype=np.uint16)
-            probs = np.zeros(len(legal_arr), dtype=np.float32)
-            act_match = np.flatnonzero(legal_arr == act)
-            if len(act_match) > 0:
-                probs[act_match[0]] = 1.0
-            self.pipol_actions.append(legal_arr)
-            self.pipol_probs.append(probs)
+            self.pipol_actions.append(ids.astype(np.uint16))
+            self.pipol_probs.append(probs.astype(np.float32))
+            self.n_book_plies += 1
             self.board.push(mv)
 
-        for _ in range(self.cfg.max_plies - len(self.opening_moves)):
+        for _ in range(self.cfg.max_plies - self.n_book_plies):
             cont = yield from self._play_ply()
             if not cont:
                 break
@@ -336,14 +373,18 @@ class GameState:
         node.record_child(edge_idx, val)
         return val
 
-    def _order_halving_gen(self, root: Node):
+    def _order_halving_gen(self, root: Node, rng: np.random.Generator | None = None):
+        """顺序减半搜索。``rng`` 为 None 时用本局的 ``self.rng``（每局独立噪声）；
+        开局 ply 传入 ``book_pipol_rng(...)`` 使同开局的搜索树跨局一致（π′ 可共享）。"""
         cfg = self.cfg
+        if rng is None:
+            rng = self.rng
         if root.is_terminal:
             return {"action": None, "qmin": None, "qmax": None, "n_nodes": 0,
                     "n_terminal": 0, "sims_used": 0, "max_depth": 0}
 
         m0 = min(cfg.m0, len(root.legal))
-        cands = gumbel_topm(root, m0=m0, rng=self.rng, g=self.cfg.gumbel_g)
+        cands = gumbel_topm(root, m0=m0, rng=rng, g=cfg.gumbel_g)
         m = len(cands)
         rounds = _n_rounds(m)
         surv = [_Candidate(action=a, noise=ns) for a, ns in cands]
@@ -430,15 +471,21 @@ class Driver:
         self.budget_violations = 0
         self.term_reason_counts = [0] * len(TERM_CODES)
         self.truncated_games = 0
+        # 开局 ply 的 π′ 跨局共享缓存（P1-1）：键 (seed, opening_idx, ply) → (ids, probs, stats)。
+        # 同一条开局在任意局中的前 book_plies 个局面逐位一致，搜索结果可安全复用。
+        self.pipol_memo: dict = {}
 
     def _new_game(self) -> GameState | None:
         if self.next_idx >= self.cfg.num_games:
             return None
         opening_moves = None
+        opening_idx = None
         if self.openings:
-            opening_moves = self.openings[self.next_idx % len(self.openings)]
+            opening_idx = self.next_idx % len(self.openings)
+            opening_moves = self.openings[opening_idx]
         game = GameState(self.next_idx, self.model, self.cfg, self.child_seeds[self.next_idx],
-                         opening_moves=opening_moves)
+                         opening_moves=opening_moves, opening_idx=opening_idx,
+                         pipol_memo=self.pipol_memo)
         self.next_idx += 1
         return game
 
@@ -469,6 +516,9 @@ class Driver:
         meta["ckpt_step"] = self.cfg.ckpt_step
         meta["termination_reason"] = term_reason
         meta["is_truncated"] = 1 if is_truncated else 0
+        # flags（原保留字段，2026-09-22 启用）= 本局开局注入 ply 数；训练侧据此对
+        # book ply 的 policy 损失降权（§P1-3）。无开局库的旧分片该字段为 0，天然兼容。
+        meta["flags"] = int(game.n_book_plies)
         pipol = encode_v3_pipol(game.pipol_actions, game.pipol_probs)
         poff = _compute_pipol_byte_offsets(game.pipol_actions)
         self.writer.add(meta, np.array(game.actions, dtype=np.uint16), pipol, poff)
@@ -518,12 +568,48 @@ class Driver:
                       f"batch={len(active)}，{self.games_done / max(elapsed, 1e-6):.3f} games/s")
 
 
-def load_openings(openings_path: str) -> list[list[str]]:
-    """从 SAN 开局文件读取开局着法列表（每行空格分隔 SAN 着法）。"""
+def load_openings(openings_path: str, book_plies: int = 6) -> list[list[str]]:
+    """从 SAN 开局文件读取开局着法列表（每行空格分隔 SAN 着法）。
+
+    每条线裁到 ``book_plies`` 个 ply，并在全新棋盘上逐着验证合法性——非法线直接
+    丢弃（打印计数）。这样同一条开局在所有局中的前 ``book_plies`` 个局面完全一致，
+    是 π′ 跨局共享（``pipol_memo``）正确性的前提。
+    """
     if not openings_path or not os.path.exists(openings_path):
         return []
+    raw: list[list[str]] = []
     with open(openings_path, "r", encoding="utf-8") as f:
-        return [line.strip().split() for line in f if line.strip()]
+        for line in f:
+            toks = line.strip().split()
+            if toks:
+                raw.append(toks[:book_plies])
+    openings: list[list[str]] = []
+    dropped = 0
+    for toks in raw:
+        board = chess.Board()
+        ok = True
+        for san in toks:
+            try:
+                board.push_san(san)
+            except (ValueError, AssertionError):
+                ok = False
+                break
+        if ok:
+            openings.append(toks)
+        else:
+            dropped += 1
+    if dropped:
+        print(f"警告：{dropped}/{len(raw)} 条开局线含非法着法，已丢弃")
+    return openings
+
+
+def book_pipol_rng(seed: int, opening_idx: int, ply: int) -> np.random.Generator:
+    """开局 ply 的搜索噪声 RNG：只取决于 (seed, 开局序号, ply)，与具体局次无关。
+
+    同一条开局在所有局中的第 ply 个局面完全相同（book 着法序列一致 ⇒ 棋盘、occurrence、
+    R cache 全部一致），因此该 RNG 保证这些局的搜索树逐位一致，π′ 可跨局共享。
+    """
+    return np.random.default_rng(np.random.SeedSequence([int(seed), int(opening_idx), int(ply)]))
 
 
 # ------------------------- 生成主循环 -------------------------
@@ -531,9 +617,10 @@ def load_openings(openings_path: str) -> list[list[str]]:
 def generate(cfg: SelfPlayConfig) -> dict:
     writer = V3ShardWriter(cfg.out_dir, cfg.tag)
     model = ModelWrapper(cfg.ckpt, cfg.device)
-    openings = load_openings(cfg.openings_path)
+    openings = load_openings(cfg.openings_path, cfg.book_plies)
     if cfg.openings_path:
-        print(f"已加载 {len(openings)} 条开局（来自 {cfg.openings_path}）")
+        print(f"已加载 {len(openings)} 条开局（来自 {cfg.openings_path}，每条裁至 "
+              f"{cfg.book_plies} ply，π′ 按 (开局, ply) 跨局共享）")
     driver = Driver(model, cfg, writer, openings=openings)
 
     t0 = time.time()
@@ -560,6 +647,7 @@ def generate(cfg: SelfPlayConfig) -> dict:
         "ckpt_step": cfg.ckpt_step,
         "c_visit": cfg.c_visit,
         "c_scale": cfg.c_scale,
+        "book_plies": cfg.book_plies,
         # seed 必须入账：worker 种子由 SeedSequence(seed).spawn(workers) 派生，
         # 复现"相同种子与开局分布"需要 seed + workers + games 三者齐全。
         "seed": cfg.seed,
@@ -621,7 +709,8 @@ def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: fl
         for k, v in gen.get("termination_reason_counts", {}).items():
             term_counts[TERM_CODES.index(k)] += v
         truncated_games += round(gen.get("truncated_rate", 0.0) * gen.get("games", 0))
-        last_cfg = {k: gen.get(k) for k in ("concurrency", "n_sims", "m0", "gen_id", "ckpt_step", "c_visit", "c_scale") if k in gen}
+        last_cfg = {k: gen.get(k) for k in ("concurrency", "n_sims", "m0", "gen_id", "ckpt_step",
+                                            "c_visit", "c_scale", "book_plies") if k in gen}
         shutil.rmtree(wd, ignore_errors=True)
 
     stats = {
@@ -669,9 +758,11 @@ def run_workers(args: argparse.Namespace) -> None:
                "--seed", str(int(worker_seeds[i].generate_state(1)[0])),
                "--gen_id", str(args.gen_id), "--ckpt_step", str(args.ckpt_step),
                "--g", str(args.g),
-               "--c_visit", str(args.c_visit), "--c_scale", str(args.c_scale)]
+                "--c_visit", str(args.c_visit), "--c_scale", str(args.c_scale)]
         if args.openings:
             cmd.extend(["--openings", args.openings])
+        if getattr(args, "book_plies", 0):
+            cmd.extend(["--book-plies", str(args.book_plies)])
         log_path = os.path.join(wdir, "worker.log")
         log_fh = open(log_path, "w", encoding="utf-8")
         proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT,
@@ -719,6 +810,8 @@ def main() -> None:
                     help="σ 展幅常数 c_scale；搜索与 π′ 导出共用同一值")
     ap.add_argument("--openings", default="",
                     help="开局着法文件路径（每行 SAN 着法序列，如 data/openings_200.txt）")
+    ap.add_argument("--book-plies", type=int, default=6,
+                    help="开局注入 ply 数：着法走 book，π′ 由搜索产生并按 (开局, ply) 跨局共享")
     args = ap.parse_args()
 
     if args.workers > 1:
@@ -740,6 +833,7 @@ def main() -> None:
         c_visit=args.c_visit,
         c_scale=args.c_scale,
         openings_path=args.openings,
+        book_plies=args.book_plies,
     )
     generate(cfg)
 

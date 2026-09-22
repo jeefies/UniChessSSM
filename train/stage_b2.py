@@ -86,6 +86,9 @@ def main() -> None:
     # 裁剪、ε 与解耦 weight decay 干扰。本轮保留 0.85/0.10，不补偿 LR，不为凑 1 强行接谜题。
     ap.add_argument("--w-human", type=float, default=0.10, help="来源权重（§2.6 锁定 0.10；谜题 0.05 plumbing 未接入，暂不参与）")
     ap.add_argument("--mlh-log", action="store_true", default=False, help="启用 mlh Log-Huber 变换 (torch.log1p(F.relu(...)), delta=0.5)")
+    ap.add_argument("--opening-loss-weight", type=float, default=0.25,
+                    help="开局注入 ply（meta flags 记录）的 policy 软 CE 权重（§P1-3）；"
+                         "book 着法是分布外强制目标，降权使训练聚焦模型自搜 π′。1.0=关闭")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -117,10 +120,20 @@ def main() -> None:
         raise RuntimeError(f"遍历预算不足 1 步（buffer {buffer_games} 局 / 有效 batch {eff_batch}）——"
                            f"请增大 replay buffer 或减小 microbatch×accum")
     warmup = min(200, int(steps_total * 0.1)) if args.warmup == 0 else args.warmup
+    opening_w = float(args.opening_loss_weight)
+
+    def sp_policy_weights(item: dict) -> torch.Tensor:
+        """自对弈 policy 逐位置权重：book ply × opening_w，其余 ×1，填充位 ×0。"""
+        w = torch.where(item["book_mask"],
+                        torch.full_like(item["valid"], opening_w, dtype=torch.float32),
+                        torch.ones_like(item["valid"], dtype=torch.float32))
+        return w * item["valid"].float()
+
     print(f"训练局数 human={len(human_ds.train_indices)} selfplay={len(sp_ds.train_indices)}；"
           f"有效 batch {eff_batch}；总步数 {steps_total}；warmup {warmup}；"
           f"来源权重 w_selfplay={args.w_selfplay} w_human={args.w_human} w_puzzle=0 "
-          f"active_source_weight_sum={args.w_selfplay + args.w_human:.2f}", flush=True)
+          f"active_source_weight_sum={args.w_selfplay + args.w_human:.2f}；"
+          f"开局 ply policy 权重 {opening_w}", flush=True)
 
     model = SeqModel(dropout=0.1).to(device)
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
@@ -181,6 +194,7 @@ def main() -> None:
                                            valid_mask=vb["valid"],
                                            policy_soft_target=vb["policy_soft_target"],
                                            mlh_valid_mask=vb["mlh_valid"],
+                                           policy_weights=sp_policy_weights(vb),
                                            log_target=args.mlh_log)
             for k, v in m.items():
                 if k.startswith("loss_") or k in ("recon_whole_board_acc", "dyn_rel_err"):
@@ -227,10 +241,11 @@ def main() -> None:
                                                    valid_mask=h_item["valid"],
                                                    log_target=args.mlh_log)
                 total_sp, m_sp = model.forward_train(sp_item["batch"], weights, step, steps_total,
-                                                     valid_mask=sp_item["valid"],
-                                                     policy_soft_target=sp_item["policy_soft_target"],
-                                                     mlh_valid_mask=sp_item["mlh_valid"],
-                                                     log_target=args.mlh_log)
+                                                      valid_mask=sp_item["valid"],
+                                                      policy_soft_target=sp_item["policy_soft_target"],
+                                                      mlh_valid_mask=sp_item["mlh_valid"],
+                                                      policy_weights=sp_policy_weights(sp_item),
+                                                      log_target=args.mlh_log)
                 total = args.w_selfplay * total_sp + args.w_human * total_h
             (total / args.accum).backward()
             pos_seen += int(h_item["valid"].sum()) + int(sp_item["valid"].sum())
