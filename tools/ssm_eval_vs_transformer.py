@@ -306,9 +306,22 @@ def create_opponent_engine(
         if transformer_root not in sys.path:
             sys.path.insert(0, transformer_root)
         from engine.engine import TransformerEngine
+        from model.transformer import ChessTransformer, TransformerConfig, stratified_20m
+
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        preset = ckpt.get("preset", None) if isinstance(ckpt, dict) else None
+        cfg_dict = ckpt.get("cfg", {}) if isinstance(ckpt, dict) else {}
+        state_dict = ckpt.get("model", ckpt.get("state_dict", ckpt)) if isinstance(ckpt, dict) else ckpt
+
+        if preset == "stratified_20m" or (isinstance(state_dict, dict) and any(k.startswith("experts.") for k in state_dict.keys())):
+            model = stratified_20m()
+        else:
+            cfg = TransformerConfig.from_dict(cfg_dict) if cfg_dict else TransformerConfig()
+            model = ChessTransformer(cfg)
+        model.load_state_dict(state_dict, strict=False)
 
         return TransformerEngine(
-            ckpt_path,
+            model,
             device=device,
             precision=precision,
             mcts_sims=mcts_sims,
