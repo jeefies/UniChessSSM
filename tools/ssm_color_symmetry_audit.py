@@ -133,7 +133,9 @@ def run_mirror_game(seq, device: str, book_line: list[str], book_plies: int,
             "color1": 1 if b1.turn == chess.WHITE else 0,
             "q1": float(q1),
             "q2": float(q2),
-            "q_asym": float(q1 + q2),
+            # 镜像变换 = 同一局棋换色重命名：行棋方视角的价值应被保留（q2 ≈ q1），
+            # 策略分布互为镜像（p1(a) ≈ p2(flip(a))）。
+            "q_diff": float(q1 - q2),
             "policy_l1": float(0.5 * np.abs(probs1 - probs2).sum()),
             "top1_match": bool(_flip_action(int(acts1[int(np.argmax(probs1))]))
                                == int(max(p2, key=p2.get))),
@@ -288,28 +290,30 @@ def main() -> int:
             all_records.extend(recs)
             print(f"  [mirror] game {g + 1}/{args.games}: {len(recs)} plies", flush=True)
 
-    q_asym = np.array([r["q_asym"] for r in all_records])
+    q_diff = np.array([r["q_diff"] for r in all_records])
     pol_l1 = np.array([r["policy_l1"] for r in all_records])
     top1 = np.array([r["top1_match"] for r in all_records])
     wq = np.array([r["q1"] for r in all_records if r["color1"] == 1])
     bq = np.array([r["q1"] for r in all_records if r["color1"] == 0])
-    wq_m = np.array([r["q2"] for r in all_records if r["color1"] == 1])
+    wdiff = np.array([r["q_diff"] for r in all_records if r["color1"] == 1])
+    bdiff = np.array([r["q_diff"] for r in all_records if r["color1"] == 0])
 
     summary = {
         "ckpt": args.ckpt,
         "games": args.games,
         "plies": int(len(all_records)),
         "mirror_symmetry": {
-            "q_asym_abs_mean": float(np.abs(q_asym).mean()),
-            "q_asym_abs_p95": float(np.percentile(np.abs(q_asym), 95)),
-            "q_asym_abs_max": float(np.abs(q_asym).max()),
-            "q_asym_signed_mean": float(q_asym.mean()),
+            "q_diff_abs_mean": float(np.abs(q_diff).mean()),
+            "q_diff_abs_p95": float(np.percentile(np.abs(q_diff), 95)),
+            "q_diff_abs_max": float(np.abs(q_diff).max()),
+            "q_diff_signed_mean": float(q_diff.mean()),
+            "q_diff_signed_mean_white_to_move": float(wdiff.mean()) if len(wdiff) else None,
+            "q_diff_signed_mean_black_to_move": float(bdiff.mean()) if len(bdiff) else None,
             "policy_l1_mean": float(pol_l1.mean()),
             "policy_l1_p95": float(np.percentile(pol_l1, 95)),
             "top1_match_rate": float(top1.mean()),
             "white_to_move_q_mean": float(wq.mean()) if len(wq) else None,
             "black_to_move_q_mean": float(bq.mean()) if len(bq) else None,
-            "color_prior_gap": float(wq.mean() + wq_m.mean()) if len(wq) else None,
         },
     }
 
@@ -328,8 +332,8 @@ def main() -> int:
 
     ms = summary["mirror_symmetry"]
     verdict = {
-        "value_color_bias": bool(ms["q_asym_abs_mean"] > 0.05
-                                 or abs(ms["color_prior_gap"] or 0.0) > 0.05),
+        "value_color_bias": bool(ms["q_diff_abs_mean"] > 0.05
+                                 or abs(ms["q_diff_signed_mean"]) > 0.05),
         "policy_color_bias": bool(ms["policy_l1_mean"] > 0.05 or ms["top1_match_rate"] < 0.90),
     }
     summary["verdict"] = verdict
