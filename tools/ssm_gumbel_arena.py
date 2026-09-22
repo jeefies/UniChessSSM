@@ -924,6 +924,10 @@ def run_batched_arena(args: argparse.Namespace, num_pairs: int, n_openings: int,
 
     driver = BatchedArenaDriver(games, concurrency=args.concurrency, args=args)
     driver.run()
+    # 按 (pair, 局序) 排序输出：协程完成顺序不固定，排序后与串行模式的 games.jsonl 逐行可比
+    driver.results.sort(key=lambda g: (g["pair_idx"], 0 if g["white_ckpt_side"] == "A" else 1))
+    for i, gd in enumerate(driver.results):
+        gd["game_idx"] = i
     return driver.results, driver.sprt_info
 
 
