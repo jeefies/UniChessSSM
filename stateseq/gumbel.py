@@ -26,7 +26,7 @@ C_VISIT = 50.0          # σ 的访问数偏置
 C_SCALE = 0.1           # σ 的价值缩放（2026-09-20 由 1.0 改，见 design-deviations.md §9.3）
 EPS = 1e-8              # 分母保护
 NEG_LOGIT = -3e4        # 非法动作的**有限**大负数（软 CE 数值安全，§2.6 / A#6）
-N_SIMS = 64             # 根节点顺序减半总预算
+N_SIMS = 256            # 根节点顺序减半总预算
 M0 = 16                 # 根节点候选数上界
 
 # 终止原因编码（§2.5 v3 meta.termination_reason）

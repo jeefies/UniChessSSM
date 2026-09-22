@@ -540,7 +540,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--games", type=int, default=64)
     ap.add_argument("--pairs", type=int, default=8)
-    ap.add_argument("--n_sims", type=int, default=64)
+    ap.add_argument("--n_sims", type=int, default=256)
     ap.add_argument("--m0", type=int, default=16)
     ap.add_argument("--max_plies", type=int, default=300)
     ap.add_argument("--seed", type=int, default=20260917)

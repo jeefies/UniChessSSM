@@ -59,7 +59,7 @@ class SelfPlayConfig:
     tag: str
     num_games: int = 2000
     concurrency: int = 128
-    n_sims: int = 64
+    n_sims: int = 256
     m0: int = 16
     seed: int = 42
     c_visit: float = C_VISIT
@@ -704,7 +704,7 @@ def main() -> None:
     ap.add_argument("--tag", default="stage_b")
     ap.add_argument("--games", type=int, default=2000)
     ap.add_argument("--concurrency", type=int, default=128)
-    ap.add_argument("--n_sims", type=int, default=64)
+    ap.add_argument("--n_sims", type=int, default=256)
     ap.add_argument("--m0", type=int, default=16)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--gen_id", type=int, default=1)
