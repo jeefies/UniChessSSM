@@ -218,11 +218,6 @@ class ShardReader:
         counts = [len(m) for m in self.metas]
         self.shard_of = np.repeat(np.arange(len(counts)), counts)
         self._cumcounts = np.concatenate([[0], np.cumsum(counts)])
-        self.meta_all = np.concatenate(self.metas)
-        self.is_val_arr = np.concatenate(is_val_parts)
-        counts = [len(m) for m in self.metas]
-        self.shard_of = np.repeat(np.arange(len(counts)), counts)
-        self._cumcounts = np.concatenate([[0], np.cumsum(counts)])
 
     def game(self, global_index: int) -> tuple[np.ndarray, np.ndarray]:
         """→ (meta 标量, 动作 uint16 数组)。"""

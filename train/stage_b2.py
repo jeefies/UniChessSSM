@@ -102,6 +102,8 @@ def main() -> None:
     # 数据源：完整 300 ply（§2.6 不得静默继承 Stage A 的 T_MAX=200）
     human_ds = SequenceDataset(args.data, workers=args.workers, t_max=B2_T_MAX)
     sp_ds = SelfPlayDataset(args.selfplay, workers=args.workers, t_max=B2_T_MAX)
+    if args.limit_games:
+        human_ds.train_indices = human_ds.train_indices[:args.limit_games]
     if not sp_ds.train_indices:
         raise RuntimeError(f"自对弈分片 {args.selfplay} 无可训练局——Stage B2 的核心监督来源缺失，"
                            f"不应静默退化为纯人类数据训练，请检查生成产物")

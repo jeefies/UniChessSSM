@@ -84,6 +84,54 @@ def run_command(cmd: list[str], log_file_path: Path | None = None, cwd: Path | N
             log_fh.close()
 
 
+def cleanup_training_artifacts(train_dir: Path, keep_best_only: bool = True) -> int:
+    """Clean up intermediate/non-essential checkpoints and temp files in a training directory.
+
+    Returns the number of bytes reclaimed.
+    """
+    reclaimed_bytes = 0
+    if not train_dir.is_dir():
+        return reclaimed_bytes
+
+    best_pt = train_dir / "best.pt"
+    for item in train_dir.iterdir():
+        if not item.is_file():
+            continue
+        # If keep_best_only is True, remove latest.pt, step_*.pt, tmp checkpoints
+        if keep_best_only and best_pt.is_file():
+            if item.name == "latest.pt" or (item.name.startswith("step_") and item.suffix == ".pt") or item.name.endswith(".tmp.pt") or item.name.endswith(".tmp"):
+                try:
+                    size = item.stat().st_size
+                    item.unlink()
+                    reclaimed_bytes += size
+                    log(f"Cleaned intermediate training artifact: {item.name} ({size / (1024*1024):.1f} MB)")
+                except Exception as e:
+                    log(f"Failed to remove {item}: {e}")
+    return reclaimed_bytes
+
+
+def cleanup_generation_workers(gen_dir: Path) -> int:
+    """Clean up temporary worker directories and worker logs in gen_dir after shard merge.
+
+    Returns the number of bytes reclaimed.
+    """
+    reclaimed_bytes = 0
+    if not gen_dir.is_dir():
+        return reclaimed_bytes
+
+    # Clean up worker directories _w* if left behind
+    for item in list(gen_dir.iterdir()):
+        if item.is_dir() and item.name.startswith("_w"):
+            try:
+                dir_size = sum(f.stat().st_size for f in item.rglob("*") if f.is_file())
+                shutil.rmtree(item, ignore_errors=True)
+                reclaimed_bytes += dir_size
+                log(f"Cleaned leftover worker dir: {item.name} ({dir_size / 1024:.1f} KB)")
+            except Exception as e:
+                log(f"Failed to remove worker dir {item}: {e}")
+    return reclaimed_bytes
+
+
 def stage1_wait_for_generation(gen_dir: Path, poll_interval_s: int = 30) -> dict:
     log(f"=== Stage 1: Monitoring selfplay generation in {gen_dir} ===")
     manifest_path = gen_dir / "manifest.json"
@@ -100,6 +148,8 @@ def stage1_wait_for_generation(gen_dir: Path, poll_interval_s: int = 30) -> dict
                 shards = manifest.get("shards", [])
                 if games_count > 0 and len(shards) > 0:
                     log(f"Generation complete! manifest.json verified: games={games_count}, shards={len(shards)}")
+                    # Clean up worker directories and logs if any remain
+                    cleanup_generation_workers(gen_dir)
                     return manifest
             except Exception as e:
                 log(f"manifest.json exists but error reading ({e}), waiting...")
@@ -182,6 +232,9 @@ def stage2_run_training(
             shutil.copy(latest_pt, best_pt)
         else:
             raise FileNotFoundError(f"Neither best.pt nor latest.pt found in {out_dir}")
+
+    # Automatic cleanup of intermediate latest.pt and non-essential checkpoints in out_dir
+    cleanup_training_artifacts(out_dir, keep_best_only=True)
 
     log(f"Training completed successfully! Model saved at {best_pt}")
     return best_pt
@@ -311,7 +364,7 @@ def stage4_analyze_and_advance(
     log(f"Baseline Matchup Result: {wins_a}W - {draws}D - {wins_b}L ({score_pct:.1f}%) over {total_games} games")
 
     if summary_transformer:
-        tf_score_pct = summary_transformer.get("score_percentage", 0.0)
+        tf_score_pct = summary_transformer.get("score_pct", summary_transformer.get("score_percentage", 0.0))
         tf_wins = summary_transformer.get("wins", 0)
         tf_draws = summary_transformer.get("draws", 0)
         tf_losses = summary_transformer.get("losses", 0)
@@ -341,7 +394,7 @@ def stage4_analyze_and_advance(
             "wins_baseline": wins_b,
             "draws": draws,
             "total_games": total_games,
-            "sprt": summary_baseline.get("sprt_info"),
+            "sprt": summary_baseline.get("sprt", summary_baseline.get("sprt_info")),
         },
         "transformer_arena": summary_transformer,
     }
@@ -394,6 +447,32 @@ def stage5_launch_gen2_if_permitted(
     log(f"Starting Gen-2 selfplay generation...")
     ret = run_command(cmd, log_file_path=gen2_log, cwd=root_dir)
     log(f"Gen-2 selfplay exited with returncode {ret}")
+    if ret == 0:
+        cleanup_generation_workers(gen2_dir)
+
+
+def cleanup_all_historical_intermediate_checkpoints(root_dir: Path) -> int:
+    """Sweep through runs/ directory and remove non-essential intermediate checkpoints.
+
+    Leaves best.pt intact in each training folder, and removes latest.pt and step_*.pt
+    when best.pt exists.
+    """
+    total_reclaimed = 0
+    runs_dir = root_dir / "runs"
+    if not runs_dir.is_dir():
+        return 0
+
+    log("Performing sweep of historical runs for redundant intermediate checkpoints...")
+    for d in runs_dir.iterdir():
+        if d.is_dir():
+            # Skip actively running generation directory
+            if d.name == "stage_b_gen_1500_gen1":
+                continue
+            total_reclaimed += cleanup_training_artifacts(d, keep_best_only=True)
+            total_reclaimed += cleanup_generation_workers(d)
+
+    log(f"Sweep complete. Reclaimed {total_reclaimed / (1024 * 1024):.1f} MB.")
+    return total_reclaimed
 
 
 def main() -> None:
@@ -459,6 +538,9 @@ def main() -> None:
     log(f"Baseline evaluation ckpt: {baseline_ckpt}")
     log("=" * 60)
 
+    # Initial sweep of historical runs for redundant intermediate checkpoints
+    cleanup_all_historical_intermediate_checkpoints(root_dir)
+
     # Stage 1: Monitor Gen-1 selfplay
     stage1_wait_for_generation(gen1_dir)
 
@@ -503,7 +585,8 @@ def main() -> None:
     if args.auto_gen2:
         champion_to_use = root_dir / "runs" / "champion.pt"
         if not champion_to_use.is_file():
-            champion_to_use = candidate_best_pt
+            # If no champion.pt exists yet (e.g. baseline or initial checkpoint)
+            champion_to_use = candidate_best_pt if candidate_best_pt.is_file() else init_ckpt
         stage5_launch_gen2_if_permitted(
             python_bin=python_bin,
             root_dir=root_dir,
