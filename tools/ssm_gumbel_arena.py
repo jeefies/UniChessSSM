@@ -34,7 +34,10 @@ from stateseq.actions import move_to_action
 from stateseq.data.sequences import _board_key
 from stateseq.model import SeqModel
 from stateseq.model_r import clone_cache
-from stateseq.gumbel import C_SCALE, C_VISIT, Node, order_halving
+from stateseq.gumbel import (
+    C_SCALE, C_VISIT, Node, order_halving, gumbel_topm, qtransform_completed,
+    select_action, _Candidate, _n_rounds,
+)
 from stateseq.adapter import (
     encode_board, standardize_elo, wdl_logits_to_q,
     get_terminal_q, classify_final_board,
@@ -533,6 +536,397 @@ def run_parallel_arena(args: argparse.Namespace, num_pairs: int, n_openings: int
     return all_games_log, sprt_info
 
 
+# ---- 批量推理 arena（单进程跨局攒批）----
+#
+# 动机：原 play_one_game 用同步递归搜索，每次模型前向 batch=1（~2k 前向/秒/进程），
+# 256 sims 下 64 局需 ~3.7 小时、400 局换代门槛需 ~23 小时，不可用。
+# 本模式把对局改成生成器协程（与 ssm_gumbel_selfplay.py 的 Driver 同机制）：
+# 任一局需要前向时 yield (模型槽位, 特征, tc, elo, color, cache)，驱动器把同一模型的
+# 请求拼成 batch 一次性上 GPU——batch≈并发局数，吞吐提升到 ~15-20k 前向/秒。
+# 算法与原版逐条对应：双方模型每 ply 各进一步、occurrence 全局面共享、
+# encode-before-move、开局 SAN 步进、g=0 确定性搜索、终局裁决共用 classify_final_board。
+
+
+def _concat_caches(caches: list) -> list:
+    """把 N 份 batch=1 的 Cache 沿 batch 维拼成一份 batch=N。"""
+    n_layers = len(caches[0])
+    out = []
+    for li in range(n_layers):
+        conv = torch.cat([c[li][0] for c in caches], dim=0)
+        ssm = torch.cat([c[li][1] for c in caches], dim=0)
+        out.append((conv, ssm))
+    return out
+
+
+def _split_cache(cache: list, n: int) -> list:
+    """把 batch=N 的 Cache 拆回 N 份 batch=1（model_r.step 内部会 clone）。"""
+    out = [[] for _ in range(n)]
+    for conv, ssm in cache:
+        for i in range(n):
+            out[i].append((conv[i:i + 1], ssm[i:i + 1]))
+    return out
+
+
+class BatchedArenaGame:
+    """一局对弈协程：双方模型各自维护 R cache，每 ply 双方各进一步，行棋方搜索。
+
+    与原 ``play_one_game`` 的语义逐条对应，唯一差别是搜索改为生成器形式以便跨局攒批。
+    ``models`` 为 [wrapperA, wrapperB]；``a_is_white`` 决定哪方执白。
+    """
+
+    def __init__(self, game_idx: int, pair_idx: int, models: list, a_is_white: bool, cfg,
+                 opening_san: str, opening_id: int, seed: int):
+        self.game_idx = game_idx
+        self.pair_idx = pair_idx
+        self.models = models                      # [A, B]
+        self.cfg = cfg
+        self.opening_san = opening_san
+        self.opening_id = opening_id
+        self.seed = seed
+        self.board = chess.Board()
+        self.occurrence: dict = {}
+        self.actions: list[int] = []
+        # 执子方 → 模型槽位 / σ 常数（σ 绑定模型侧，支持 A/B 不同 c_scale 对照）
+        self.slot = {chess.WHITE: 0 if a_is_white else 1,
+                     chess.BLACK: 1 if a_is_white else 0}
+        self.caches = {side: models[self.slot[side]].initial_cache(1) for side in self.slot}
+        self.scales = {side: (getattr(models[self.slot[side]], "c_visit", cfg.c_visit),
+                              getattr(models[self.slot[side]], "c_scale", cfg.c_scale))
+                       for side in self.slot}
+        self.rng = np.random.default_rng(seed)
+        self.anomaly = None
+
+    # ---- 前向请求：当前局面双方模型各进一步 ----
+
+    def _advance_both(self):
+        board = self.board
+        key = _board_key(board)
+        occ = self.occurrence.get(key, 0)
+        feats, tc_val, elo_std, color = encode_board(board, occ)
+        feats_np = np.asarray(feats, dtype=np.float32).reshape(1, -1)
+        mover_logits = None
+        mover_wdl = None
+        for side in (chess.WHITE, chess.BLACK):
+            slot = self.slot[side]
+            lg, wd, _mlh, _x, cache_new = yield (
+                slot, feats_np, int(tc_val), float(elo_std), int(color), self.caches[side])
+            self.caches[side] = cache_new
+            if side == board.turn:
+                mover_logits, mover_wdl = lg, wd
+        self.occurrence[key] = occ + 1
+        return mover_logits, mover_wdl
+
+    # ---- 搜索：顺序减半（g=0），展开走本方根快照路径重算 ----
+
+    def _expand_gen(self, node: Node, action: int, side):
+        board = self.board.copy()
+        cache = clone_cache(self.caches[side])
+        occ = dict(self.occurrence)
+        slot = self.slot[side]
+        new_path = node.path + (action,)
+        for a in node.path:
+            mv = _resolve_move(a, board)
+            if mv is None:
+                raise RuntimeError(f"路径重放动作 {a} 在 {board.fen()} 上不合法")
+            board.push(mv)
+            key = _board_key(board)
+            feats, tc_val, elo_std, color = encode_board(board, occ.get(key, 0))
+            _, _, _, _, cache = yield (
+                slot, np.asarray(feats, dtype=np.float32).reshape(1, -1),
+                int(tc_val), float(elo_std), int(color), cache)
+            occ[key] = occ.get(key, 0) + 1
+        mv = _resolve_move(action, board)
+        if mv is None:
+            raise RuntimeError(f"动作 {action} 在 {board.fen()} 上不合法")
+        board.push(mv)
+        if board.is_game_over(claim_draw=True) or not list(board.legal_moves):
+            return Node(np.array([], dtype=np.int64), np.array([], dtype=np.float32),
+                        get_terminal_q(board), depth=node.depth + 1, action=action,
+                        path=new_path, terminal=True)
+        key = _board_key(board)
+        feats, tc_val, elo_std, color = encode_board(board, occ.get(key, 0))
+        lc, wc, _, _, _ = yield (
+            slot, np.asarray(feats, dtype=np.float32).reshape(1, -1),
+            int(tc_val), float(elo_std), int(color), cache)
+        occ[key] = occ.get(key, 0) + 1
+        q_c = wdl_logits_to_q(wc)
+        legal_c = _legal_actions_of(board)
+        lc_np = lc
+        lc_masked = np.full(1936, -3e4, dtype=np.float32)
+        lc_masked[legal_c] = lc_np[legal_c]
+        return Node(np.array(legal_c, dtype=np.int64),
+                    lc_masked[np.array(legal_c)].astype(np.float32),
+                    q_c, depth=node.depth + 1, action=action, path=new_path)
+
+    def _simulate_gen(self, node: Node, side):
+        if node.is_terminal:
+            return float(node.q)
+        c_visit, c_scale = self.scales[side]
+        a = select_action(node, c_visit, c_scale)
+        edge_idx = int(np.flatnonzero(node.legal == a)[0])
+        key = int(a)
+        child = node.children.get(key)
+        if child is None:
+            child = yield from self._expand_gen(node, a, side)
+            node.children[key] = child
+            val = -float(child.q)
+        else:
+            val = -(yield from self._simulate_gen(child, side))
+        node.record_child(edge_idx, val)
+        return val
+
+    def _order_halving_gen(self, root: Node, side):
+        cfg = self.cfg
+        if root.is_terminal:
+            return None
+        c_visit, c_scale = self.scales[side]
+        m0 = min(cfg.m0, len(root.legal))
+        cands = gumbel_topm(root, m0=m0, rng=self.rng, g=0.0)
+        m = len(cands)
+        rounds = _n_rounds(m)
+        surv = [_Candidate(action=a, noise=ns) for a, ns in cands]
+        base, rem = divmod(cfg.n_sims, rounds)
+        budget_per_round = [base + (1 if i < rem else 0) for i in range(rounds)]
+
+        def do_sim_root(c: _Candidate):
+            if c.child is None:
+                child = yield from self._expand_gen(root, c.action, side)
+                c.child = child
+                val = -float(child.q)
+            elif c.child.is_terminal:
+                val = -float(c.child.q)
+            else:
+                val = -(yield from self._simulate_gen(c.child, side))
+            idx = int(np.flatnonzero(root.legal == c.action)[0])
+            root.record_child(idx, val)
+
+        sims_used = 0
+        for r, budget in enumerate(budget_per_round):
+            if len(surv) == 1:
+                budget = sum(budget_per_round[r:])
+            per_base, per_rem = divmod(budget, len(surv))
+            for i, c in enumerate(surv):
+                k = per_base + (1 if i < per_rem else 0)
+                for _ in range(k):
+                    yield from do_sim_root(c)
+                    sims_used += 1
+            if len(surv) == 1:
+                break
+            l_root = {int(a): float(x) for a, x in zip(root.legal, root.logits)}
+            s_root_vals = qtransform_completed(root, c_visit, c_scale)
+            s_map = {int(a): float(x) for a, x in zip(root.legal, s_root_vals)}
+            scored = sorted(((c.noise + l_root[c.action] + s_map[c.action], c) for c in surv),
+                            key=lambda t: -t[0])
+            keep = max(1, (len(surv) + 1) // 2)
+            surv = [c for _, c in scored[:keep]]
+        return int(surv[0].action)
+
+    # ---- 主流程 ----
+
+    def run(self):
+        cfg = self.cfg
+        board = self.board
+
+        if self.opening_san:
+            for token in self.opening_san.split():
+                if board.is_game_over(claim_draw=True):
+                    break
+                yield from self._advance_both()
+                board.push_san(token)
+
+        for _ply in range(cfg.max_plies):
+            if board.is_game_over(claim_draw=True):
+                break
+            turn = board.turn
+            logits_np, wdl_np = yield from self._advance_both()
+            legal_actions = _legal_actions_of(board)
+            if not legal_actions:
+                break
+            q_root = wdl_logits_to_q(wdl_np)
+            legal_arr = np.array(legal_actions, dtype=np.int64)
+            logits_legal = logits_np[legal_arr].astype(np.float32)
+            root = Node(legal=legal_arr.copy(), logits=logits_legal.copy(), q=q_root)
+
+            chosen = yield from self._order_halving_gen(root, turn)
+            if chosen is None:
+                self.anomaly = "order_halving returned None"
+                break
+            self.actions.append(int(chosen))
+            mv = _resolve_move(chosen, board)
+            if mv is None:
+                self.anomaly = f"chosen action resolves to None: {chosen}"
+                break
+            board.push(mv)
+
+        our_result, term_reason, is_truncated = classify_final_board(board)
+        result_str = _result_str(board)
+        game_pgn = chess.pgn.Game.from_board(board)
+        return {
+            "opening_id": self.opening_id,
+            "seed": self.seed,
+            "ckpt_white": self.models[self.slot[chess.WHITE]].ckpt_path,
+            "ckpt_black": self.models[self.slot[chess.BLACK]].ckpt_path,
+            "n_plies": len(self.actions),
+            "termination_reason": term_reason,
+            "is_truncated": is_truncated,
+            "board_result": result_str,
+            "arena_result": our_result,
+            "anomaly": self.anomaly,
+            "pgn": str(game_pgn) if game_pgn is not None else "",
+        }
+
+
+class BatchedArenaDriver:
+    """跨局攒批驱动器：并发跑 N 局协程，按模型槽位分组批处理前向。"""
+
+    def __init__(self, games: list[BatchedArenaGame], concurrency: int, args,
+                 progress_every: int = 8):
+        self.games = games
+        self.concurrency = max(1, concurrency)
+        self.args = args
+        self.progress_every = progress_every
+        self.results: list[dict] = []
+        self.sprt_info = None
+        self.t0 = time.time()
+        # SPRT 参数（H0: p<=0.50 vs H1: p>=0.55；候选为 A）
+        self._p0, self._p1 = 0.50, 0.55
+        self._bound_b = math.log(args.sprt_beta / (1.0 - args.sprt_alpha))
+        self._log_p1_p0 = math.log(self._p1 / self._p0)
+        self._log_1p1_1p0 = math.log((1.0 - self._p1) / (1.0 - self._p0))
+        self._pairs_done = 0
+        self._num_pairs = max(1, len(games) // 2)
+        self._stop_queue = False
+
+    def _model_step(self, reqs: list):
+        """reqs: [(game, (slot, feats, tc, elo, color, cache)] → [(game, result)]（同序）。"""
+        groups: dict[int, list[int]] = {}
+        for idx, (_game, req) in enumerate(reqs):
+            groups.setdefault(req[0], []).append(idx)
+        out: list = [None] * len(reqs)
+        for slot, idxs in groups.items():
+            model = reqs[idxs[0]][0].models[slot]
+            feats = np.stack([reqs[i][1][1] for i in idxs]).astype(np.float32)
+            tc = [reqs[i][1][2] for i in idxs]
+            elo = [reqs[i][1][3] for i in idxs]
+            color = [reqs[i][1][4] for i in idxs]
+            cache = _concat_caches([reqs[i][1][5] for i in idxs])
+            logits, wdl, mlh, x, cache_new = model.step(feats, tc, elo, color, cache)
+            caches = _split_cache(cache_new, len(idxs))
+            for j, i in enumerate(idxs):
+                out[i] = (reqs[i][0], (logits[j], wdl[j], mlh[j], x[j], caches[j]))
+        return out
+
+    def _sprt_check(self) -> None:
+        """成对边界处检查 Wald 早停（候选落后则拒绝 H1，省算力）。"""
+        if not self.args.sprt or self.sprt_info is not None:
+            return
+        n = len(self.results)
+        if n < self.args.sprt_min_games or n >= self.args.games:
+            return
+        s_a = sum(1.0 if g["arena_result"] == 0 else 0.5 if g["arena_result"] == 1 else 0.0
+                  for g in self.results)
+        llr = s_a * self._log_p1_p0 + (n - s_a) * self._log_1p1_1p0
+        if llr <= self._bound_b:
+            saved = self.args.games - n
+            self.sprt_info = {
+                "early_stopped": True,
+                "stop_reason": "sprt_reject_h1",
+                "llr": float(llr),
+                "llr_bound": float(self._bound_b),
+                "alpha": self.args.sprt_alpha,
+                "beta": self.args.sprt_beta,
+                "p0": self._p0,
+                "p1": self._p1,
+                "games_played": n,
+                "games_planned": self.args.games,
+                "compute_saved_games": saved,
+                "compute_saved_percent": saved / self.args.games * 100,
+            }
+            self._stop_queue = True
+            print(f"\n[SPRT Early Stop] LLR={llr:.3f} <= bound={self._bound_b:.3f} at game "
+                  f"{n}/{self.args.games}；候选被拒，省 {saved} 局\n", flush=True)
+
+    def _finish(self, game: BatchedArenaGame, gd: dict) -> None:
+        gd["game_idx"] = len(self.results)
+        gd["pair_idx"] = game.pair_idx
+        gd["white_ckpt_side"] = "A" if game.slot[chess.WHITE] == 0 else "B"
+        gd["black_ckpt_side"] = "B" if game.slot[chess.WHITE] == 0 else "A"
+        if gd["white_ckpt_side"] == "B":
+            r = gd["arena_result"]
+            gd["arena_result"] = 0 if r == 2 else 2 if r == 0 else 1
+        self.results.append(gd)
+        if gd["pair_idx"] == self._pairs_done:
+            self._pairs_done += 1
+            self._sprt_check()
+        n = len(self.results)
+        if n % self.progress_every == 0 or n == len(self.games):
+            print("  [%.0fs] games %d/%d (pair %d/%d)" % (
+                time.time() - self.t0, n, len(self.games), self._pairs_done, self._num_pairs),
+                flush=True)
+
+    def _start_slot(self, i: int, queue: list) -> None:
+        while queue and not self._stop_queue:
+            game = queue.pop(0)
+            gen = game.run()
+            try:
+                req = gen.send(None)
+            except StopIteration as e:
+                self._finish(game, e.value)
+                continue
+            self.slots[i] = {"game": game, "gen": gen, "req": req}
+            return
+        self.slots[i] = None
+
+    def run(self) -> None:
+        queue = list(self.games)
+        self.slots: list = [None] * self.concurrency
+        for i in range(self.concurrency):
+            self._start_slot(i, queue)
+        while True:
+            active = [(i, s) for i, s in enumerate(self.slots) if s is not None]
+            if not active:
+                break
+            reqs = [(s["game"], s["req"]) for _i, s in active]
+            results = self._model_step(reqs)
+            for (i, s), (game, result) in zip(active, results):
+                try:
+                    s["req"] = s["gen"].send(result)
+                except StopIteration as e:
+                    self._finish(game, e.value)
+                    self._start_slot(i, queue)
+
+
+def run_batched_arena(args: argparse.Namespace, num_pairs: int, n_openings: int,
+                      t0: float, models: list | None = None) -> tuple[list[dict], dict | None]:
+    """单进程跨局攒批 arena：batch≈并发局数，替代 batch=1 的串行/多进程模式。"""
+    if models is None:
+        models = [ArenaModel(args.ckpt_a), ArenaModel(args.ckpt_b)]
+    models[0].c_visit = models[1].c_visit = args.c_visit
+    models[0].c_scale = args.c_scale_a
+    models[1].c_scale = args.c_scale_b
+
+    cfg = lambda: None
+    cfg.n_sims = args.n_sims
+    cfg.m0 = args.m0
+    cfg.max_plies = args.max_plies
+    cfg.c_visit = args.c_visit
+    cfg.c_scale = C_SCALE
+
+    games: list[BatchedArenaGame] = []
+    for pair_idx in range(num_pairs):
+        oi = pair_idx % n_openings
+        opening_san = OPENINGS[oi]
+        for a_is_white in (True, False):
+            games.append(BatchedArenaGame(
+                game_idx=len(games), pair_idx=pair_idx, models=models,
+                a_is_white=a_is_white, cfg=cfg, opening_san=opening_san,
+                opening_id=oi, seed=args.seed + len(games)))
+
+    driver = BatchedArenaDriver(games, concurrency=args.concurrency, args=args)
+    driver.run()
+    return driver.results, driver.sprt_info
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt-a")
@@ -545,6 +939,11 @@ def main():
     ap.add_argument("--max_plies", type=int, default=300)
     ap.add_argument("--seed", type=int, default=20260917)
     ap.add_argument("--workers", type=int, default=1, help="并行工作进程数（默认 1：串行运行）")
+    ap.add_argument("--batched", action="store_true",
+                    help="跨局攒批模式（推荐）：单进程并发多局，前向按模型槽位拼批，"
+                         "吞吐较 batch=1 提升约一个数量级；与 --workers 互斥")
+    ap.add_argument("--concurrency", type=int, default=24,
+                    help="--batched 模式的并发局数（批大小≈该值，默认 24）")
     ap.add_argument("--test-scoring", action="store_true")
     ap.add_argument("--c_visit", type=float, default=C_VISIT, help="双方共用的 c_visit")
     ap.add_argument("--c_scale_a", type=float, default=C_SCALE, help="A 侧 c_scale")
@@ -568,7 +967,7 @@ def main():
     id_a = _model_id(sd_a)
     id_b = _model_id(sd_b)
 
-    if args.workers <= 1:
+    if args.workers <= 1 and not args.batched:
         model_a = ArenaModel(args.ckpt_a)
         model_b = ArenaModel(args.ckpt_b)
         dummy_feats = np.zeros((1, 785), dtype=np.float32)
@@ -602,7 +1001,26 @@ def main():
     n_openings = min(args.pairs, len(OPENINGS))
     t0 = time.time()
 
-    if args.workers > 1:
+    if args.batched:
+        if args.workers > 1:
+            raise SystemExit("--batched 与 --workers>1 互斥：批量模式靠单进程跨局攒批，"
+                             "加进程只会各自 batch=1")
+        # 模型身份验证（哈希已在上面算过；这里补一次前向比较，顺带把模型传给批量运行）
+        model_a = ArenaModel(args.ckpt_a)
+        model_b = ArenaModel(args.ckpt_b)
+        dummy_feats = np.zeros((1, 785), dtype=np.float32)
+        la, wa, _, _, _ = model_a.step(dummy_feats, [2], [float(standardize_elo(2567.5))], [1],
+                                       model_a.initial_cache(1))
+        lb, wb, _, _, _ = model_b.step(dummy_feats, [2], [float(standardize_elo(2567.5))], [1],
+                                       model_b.initial_cache(1))
+        import torch.nn.functional as F
+        policy_diff = float(np.max(np.abs(
+            F.softmax(torch.from_numpy(la[0]), dim=0).numpy()
+            - F.softmax(torch.from_numpy(lb[0]), dim=0).numpy())))
+        print("A hash=%s B hash=%s same=%s policy_diff=%.2e" % (id_a, id_b, id_a == id_b, policy_diff))
+        games_log, sprt_info = run_batched_arena(args, num_pairs, n_openings, t0,
+                                                 models=[model_a, model_b])
+    elif args.workers > 1:
         # 多进程并行模式
         games_log, sprt_info = run_parallel_arena(args, num_pairs, n_openings, t0)
     else:
