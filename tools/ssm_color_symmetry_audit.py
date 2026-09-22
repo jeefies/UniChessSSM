@@ -52,8 +52,7 @@ def _flip_move(mv: chess.Move) -> chess.Move:
 
 
 def _flip_action(action: int) -> int:
-    frm, to, promo = action_to_move(action)
-    return move_to_action(chess.Move(_flip_sq(frm), _flip_sq(to), promotion=promo))
+    return move_to_action(_flip_move(action_to_move(action)))
 
 
 def _softmax(x: np.ndarray) -> np.ndarray:
