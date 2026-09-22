@@ -12,7 +12,7 @@ mkdir -p "$OUT"
   --ckpt-b runs/stage_b_training_1000_gen3/best.pt \
   --out "$OUT" \
   --games 64 --pairs 8 \
-  --batched --concurrency 24 \
+  --batched --workers 4 --concurrency 8 \
   --n_sims 256 --m0 16 \
   --seed 20260922 \
   > "$OUT/arena.log" 2>&1
