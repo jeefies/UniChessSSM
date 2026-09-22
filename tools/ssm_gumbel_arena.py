@@ -843,7 +843,9 @@ class BatchedArenaDriver:
             logits, wdl, mlh, x, cache_new = model.step(feats, tc, elo, color, cache)
             caches = _split_cache(cache_new, len(idxs))
             for j, i in enumerate(idxs):
-                out[i] = (reqs[i][0], (logits[j], wdl[j], mlh[j], x[j], caches[j]))
+                out[i] = (reqs[i][0], (logits[j], wdl[j],
+                                       None if mlh is None else mlh[j],
+                                       None if x is None else x[j], caches[j]))
         return out
 
     def _sprt_check(self) -> None:
