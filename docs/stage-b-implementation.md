@@ -393,6 +393,19 @@ $$\pi'(a) = \mathrm{softmax}\big(\ell(a) + \sigma(\mathrm{completedQ}(a))\big)\q
 | 训练（1000 局 → 46 步） | — | ~2 min（4×16 档位，pos/s ≈749 计含加载） | 有效 batch 64（microbatch 4 × accum 16） |
 | arena（64 局，4 worker，batch=1） | 565s（round2，单 worker，多为短和棋局） | **~3.7h（每局 ~14 min）** | batch=1 前向效率 ~2k f/s，每局 ~110 ply × 3,060 前向 ≈ 33.5 万前向 |
 
+**arena 推理优化（2026-09-23，commit `f649341`/`acf0d65`/`363e4e1`）**：
+
+| 手段 | 内容 | 效果 |
+|---|---|---|
+| 跨局攒批（`--batched`） | 对局协程化，驱动器把同一模型槽位的请求拼批一次上 GPU（`_concat_caches`/`_split_cache`） | batch=1 → batch≈并发局数；与原串行实现**逐字等价**（同参数 PGN 完全相同，`equiv_smoke` 验证） |
+| 多进程 × 进程内攒批（`--batched --workers N`） | N 进程各自一个 driver 跑全部分局；父进程按对做 SPRT | 树逻辑多核并行 + GPU 批量兼得 |
+| 每前向开销消除 | 条件张量（tc/elo）按 (值,批大小) 缓存、color 走 numpy 零拷贝；arena 不回传 mlh/x 的 CPU 副本；`stateseq/layers.py` RMSNorm fp32 快路径（跳过 no-op `.to()`，逐位等价） | profile 显示 `torch.tensor([...])` 重建占 16%、no-op `.to()` 约占每前向 CPU 30% |
+
+**甜点配置：`--batched --workers 4 --concurrency 24`**（与生成器同档）。driver 计数器实测
+（4×24，256 sims，与旧项目 ResNet 训练争用 GPU/CPU 的时段）：519–621 前向/秒/进程、
+1,244–1,267 前向/ply、平均 46 ply/局。同机同时段 A/B（n_sims=64，单进程）攒批 vs batch=1
+= 141s/局 → 93s/局（1.52×，争用下）；空闲 GPU 上预期接近生成器的前向吞吐（约一个数量级）。
+
 **关键结论（对 25k 局/代的影响）**：n_sims=256 下 25k 局需 ~4.8 天；n_sims=64 下需 ~19 小时。
 若阶段③ 25k/代要在合理窗口内闭环，需二选一：①生成仍用 64 sims、256 只用于 arena/评测；
 ②接受多天级的生成窗口。此项待用户决策（已向用户报告实测数）。
