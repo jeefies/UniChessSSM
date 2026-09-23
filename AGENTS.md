@@ -161,6 +161,8 @@ UniChessSSM/
 不建 CUDA context，显存只有一个 GPU 服务进程（权重 + 全体状态槽，按空闲显存自动限槽）。
 推荐 `--workers 16 --concurrency 24`（arena 55 plies/s，P3 为 3.83）；再大会报“状态池耗尽”。
 结果与 workers / concurrency 无关、逐位可复现。细节见 `docs/design-deviations.md` §2.5。
+P5（2026-09-24）：服务端两拍流水线 + 搜索侧热点优化，fp32 arena 71 plies/s、自对弈 94 plies/s
+（192 局 × 40 ply 口径，结果与 P4 逐局相同）；`--server-precision tf32` 再快约 22%（有小偏差，默认 fp32）。见 §2.6。
 
 ## 5. Stage B 硬约束（阶段① 实现+单测）
 

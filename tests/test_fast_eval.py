@@ -144,6 +144,38 @@ class TestFastEval(unittest.TestCase):
             self.assertTrue(torch.count_nonzero(t.ssm[:, 0]) == 0, "零槽被写")
         np.testing.assert_allclose(outs[0], outs[1], rtol=0, atol=1e-4)
 
+    def test_ssm_update_src_dst_bitwise(self):
+        """源/目标槽内核 == 先把源槽复制到目标槽、再用原 selective_state_update 就地更新（逐位）。
+        含零状态源、tie_hdim 形态、同批多行、源槽不被改写。"""
+        from einops import repeat
+        from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+
+        from stateseq.ssm_update import ssm_update_src_dst
+
+        g = torch.Generator(device="cuda").manual_seed(0)
+        blk = self.seq.r.blocks[0]
+        H, P, N = blk.nheads, blk.headdim, blk.d_state
+        S, b = 40, 7
+        state = torch.randn((S, H, P, N), device="cuda", generator=g)
+        state[0].zero_()
+        x = torch.randn((b, H, P), device="cuda", generator=g)
+        dt = repeat(torch.randn((b, H), device="cuda", generator=g), "b h -> b h p", p=P)
+        A = repeat(-torch.rand(H, device="cuda", generator=g), "h -> h p n", p=P, n=N)
+        B = torch.randn((b, 1, N), device="cuda", generator=g)
+        C = torch.randn((b, 1, N), device="cuda", generator=g)
+        D = repeat(torch.randn(H, device="cuda", generator=g), "h -> h p", p=P)
+        dt_bias = repeat(torch.randn(H, device="cuda", generator=g), "h -> h p", p=P)
+        src = torch.tensor([0, 3, 5, 5, 9, 11, 0], dtype=torch.int32, device="cuda")
+        dst = torch.tensor([20, 21, 22, 23, 24, 25, 26], dtype=torch.int32, device="cuda")
+        ref = state.clone()
+        ref[dst.long()] = ref[src.long()]
+        y_ref = selective_state_update(ref, x, dt, A, B, C, D, z=None, dt_bias=dt_bias,
+                                       dt_softplus=True, state_batch_indices=dst)
+        new = state.clone()
+        y = ssm_update_src_dst(new, x, dt, A, B, C, D, dt_bias, True, src, dst)
+        self.assertTrue(torch.equal(y, y_ref))
+        self.assertTrue(torch.equal(new, ref), "目标槽不同或源槽被改写")
+
     def test_batch_invariant_rows_independent_of_batch(self):
         """批不变模式（固定 FIXED_CHUNK 行块）：同一行单独算、与另外 150 行（跨多块）一起算，结果逐位相同；
         eager 与 graph 也逐位相同。这是共享 GPU 服务结果与时序/进程数无关的前提。"""

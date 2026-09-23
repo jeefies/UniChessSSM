@@ -46,6 +46,9 @@ DEFAULT_ROWS = 512          # 每客户端单次请求行数上限（24 局 × m
 GPU_RESERVE_BYTES = 3 << 30  # 状态槽之外留给权重 / graph 池 / cuBLAS 工作区的显存
 # 攒批最长等待（毫秒）：只影响吞吐，不影响结果。P4 实测闭环里等待反而更慢（客户端被拖住），默认 0
 MAX_WAIT_MS = float(os.environ.get("UNICHESS_GPU_MAX_WAIT_MS", "0"))
+# 前向精度：fp32（默认，与 P4 及更早逐位一致）/ tf32（矩阵乘走 TF32 张量核，GPU 约快 1.4 倍，
+# 与 fp32 有小偏差——见 docs/design-deviations.md §2.6）。决定数值 → 进配置哈希。
+PRECISIONS = ("fp32", "tf32")
 
 
 def _paths(d: str) -> dict:
@@ -96,6 +99,12 @@ def _serve(spec: dict) -> None:
 
     d, device = spec["dir"], spec["device"]
     P = _paths(d)
+    precision = spec.get("precision", "fp32")
+    if precision not in PRECISIONS:
+        raise ValueError(f"未知 precision={precision!r}，可选 {PRECISIONS}")
+    # 须在建 engine / 捕获 CUDA graph 之前设定（graph 捕获时定下 cuBLAS 内核）
+    torch.backends.cuda.matmul.allow_tf32 = precision == "tf32"
+    torch.backends.cudnn.allow_tf32 = precision == "tf32"
     parent = os.getppid()
     seqs, paths = [], []
     for ck in spec["checkpoints"]:
@@ -118,7 +127,8 @@ def _serve(spec: dict) -> None:
         S = int(cap)
     tensors = StateTensors(*dims, RESERVED_SLOTS + n * S, device)
     engines = [StepEngine(seq, tensors, device, cuda_graphs=spec["cuda_graphs"],
-                          batch_invariant=True, chunk=int(spec["chunk"]), capacity=n * R)
+                          batch_invariant=True, chunk=int(spec["chunk"]), capacity=n * R,
+                          n_bufs=2)
                for seq in seqs]
     for eng in engines:
         eng.warmup()
@@ -135,7 +145,8 @@ def _serve(spec: dict) -> None:
     req_fd = os.open(P["req"], os.O_RDWR)
     resp_fds = [os.open(os.path.join(d, f"resp{i}"), os.O_RDWR) for i in range(n)]
     meta = {"pid": os.getpid(), "models": paths, "n_clients": n, "slots_per_client": S,
-            "rows_per_client": R, "bytes_per_slot": bps, "chunk": int(spec["chunk"])}
+            "rows_per_client": R, "bytes_per_slot": bps, "chunk": int(spec["chunk"]),
+            "precision": precision}
     with open(P["meta"], "w", encoding="utf-8") as f:
         json.dump(meta, f)
     with open(P["ready"] + ".tmp", "w") as f:
@@ -144,7 +155,8 @@ def _serve(spec: dict) -> None:
 
     stats = {"ticks": 0, "requests": 0, "rows": 0, "chunks": 0, "busy_s": 0.0,
              "max_tick_rows": 0, "slots_per_client": S, "chunk": int(spec["chunk"]),
-             "max_wait_ms": float(spec["max_wait_ms"]), "held_ticks": 0, "held_s": 0.0}
+             "max_wait_ms": float(spec["max_wait_ms"]), "held_ticks": 0, "held_s": 0.0,
+             "pipeline": 2, "precision": precision}
     t_start = last_dump = time.perf_counter()
     K = int(spec["chunk"])
     max_wait = float(spec["max_wait_ms"]) / 1000.0
@@ -178,11 +190,46 @@ def _serve(spec: dict) -> None:
     # 不如在还有客户端正在算（尚未提交）时稍等，把块填满。触发条件任一：
     # 填充浪费 ≤ 1/4；存活客户端全都在等；最早的请求已等满 max_wait。只影响拼批时机，
     # 批不变 ⇒ 结果不变。
+    #
+    # 流水线（P5）：两套 pinned 缓冲轮流用。一拍（各模型的块）排进流后不等它算完：GPU 还忙时，
+    # 攒够接近满块（填充 ≤ 1/4）就填另一套缓冲排在它后面；否则等它算完，先排下一拍再分发上一拍的
+    # 结果、应答——GPU 两拍之间只空转收集 + 启动的时间。
+    # 同一时刻至多两拍在途；同一客户端至多一个在途请求，两拍的行互不相交，静态设备缓冲按流序复用。
     pending: list = []
     first_t = 0.0
+    inflight = None                     # (ready, [(eng, items, total)], buf, event)
+    busy_t0 = 0.0
+    nbuf = 0
+
+    def finish(tick) -> bytes:
+        ready, parts, buf, ev = tick
+        try:
+            ev.synchronize()
+            for eng, items, total in parts:
+                out = eng.out_rows(total, buf)
+                off = 0
+                for cid, k in items:
+                    cout[cid][:k] = out[off:off + k]
+                    off += k
+            return b"\x00"
+        except BaseException:
+            with open(P["error"], "a", encoding="utf-8") as f:
+                f.write(traceback.format_exc())
+            return b"\x01"
+
+    def respond(tick, status: bytes) -> None:
+        for cid in tick[0]:
+            os.write(resp_fds[cid], status)
+
     while True:
-        timeout = 1.0 if not pending else max(0.0, first_t + max_wait - time.perf_counter())
-        ready_fds, _, _ = select.select([req_fd], [], [], timeout)
+        if inflight is not None:
+            # 有一拍在算：短轮询，新请求与它算完都要及时发现
+            ready_fds, _, _ = select.select([req_fd], [], [], 0.0002)
+            if not ready_fds and not pending and not inflight[3].query():
+                continue
+        else:
+            timeout = 1.0 if not pending else max(0.0, first_t + max_wait - time.perf_counter())
+            ready_fds, _, _ = select.select([req_fd], [], [], timeout)
         now = time.perf_counter()
         if now - last_dump > 2.0:
             dump()
@@ -191,8 +238,16 @@ def _serve(spec: dict) -> None:
             if not pending:
                 first_t = now
             pending.extend(os.read(req_fd, 4096))
-        elif not pending:
-            if os.getppid() != parent:      # 启动方已退出（被杀）：不留孤儿进程
+        if not pending:
+            if inflight is not None:
+                status = finish(inflight)
+                respond(inflight, status)
+                inflight = None
+                stats["busy_s"] += time.perf_counter() - busy_t0
+                if status != b"\x00":
+                    dump()
+                    return
+            elif os.getppid() != parent:    # 启动方已退出（被杀）：不留孤儿进程
                 return
             continue
         if now - last_live > 1.0:
@@ -204,47 +259,67 @@ def _serve(spec: dict) -> None:
             by_model.setdefault(mid, []).append((cid, rows))
         padded = sum(-(-sum(k for _, k in it) // K) * K for it in by_model.values())
         real = sum(k for it in by_model.values() for _, k in it)
-        if (4 * (padded - real) > padded and not live.issubset(pending)
+        full = 4 * (padded - real) <= padded
+        if not full and inflight is not None and not inflight[3].query():
+            continue                        # GPU 还在算上一拍：接着攒，块更满（实测抢跑半空块更慢）
+        if (not full and not live.issubset(pending)
                 and now - first_t < max_wait):
+            if inflight is not None and inflight[3].query():
+                status = finish(inflight)
+                respond(inflight, status)
+                inflight = None
+                stats["busy_s"] += time.perf_counter() - busy_t0
+                if status != b"\x00":
+                    dump()
+                    return
             continue
         if now - first_t > 1e-4:
             stats["held_ticks"] += 1
             stats["held_s"] += now - first_t
         ready, pending = pending, []
-        t0 = time.perf_counter()
         status = b"\x00"
+        tick = None
         try:
-            tick_rows = 0
+            parts = []
             for mid in sorted(by_model):
                 items = by_model[mid]
                 eng = engines[mid]
                 total = sum(k for _, k in items)
-                buf = eng.in_rows(total)
+                rows_buf = eng.in_rows(total, nbuf)
                 off = 0
                 for cid, k in items:
-                    buf[off:off + k] = cin[cid][:k]
+                    rows_buf[off:off + k] = cin[cid][:k]
                     off += k
-                out = eng.execute(total)
-                off = 0
-                for cid, k in items:
-                    cout[cid][:k] = out[off:off + k]
-                    off += k
-                tick_rows += total
+                eng.submit(total, nbuf)
+                parts.append((eng, items, total))
                 stats["chunks"] += -(-total // eng.chunk)
+            ev = torch.cuda.Event()
+            ev.record()
+            tick = (ready, parts, nbuf, ev)
+            nbuf ^= 1
+            if inflight is None:
+                busy_t0 = time.perf_counter()
             stats["ticks"] += 1
             stats["requests"] += len(ready)
-            stats["rows"] += tick_rows
-            stats["max_tick_rows"] = max(stats["max_tick_rows"], tick_rows)
+            stats["rows"] += real
+            stats["max_tick_rows"] = max(stats["max_tick_rows"], real)
         except BaseException:
             with open(P["error"], "a", encoding="utf-8") as f:
                 f.write(traceback.format_exc())
             status = b"\x01"
-        stats["busy_s"] += time.perf_counter() - t0
-        for cid in ready:
-            os.write(resp_fds[cid], status)
-        if status != b"\x00":
+        if inflight is not None:            # 新一拍已排上，再收上一拍
+            prev = finish(inflight)
+            respond(inflight, prev)
+            if prev != b"\x00":
+                status = prev
+                if tick is not None:
+                    tick[3].synchronize()
+                    tick = None
+        if tick is None:
+            respond((ready,), status)
             dump()
             return
+        inflight = tick
 
 
 class GpuServer:
@@ -253,14 +328,17 @@ class GpuServer:
     def __init__(self, checkpoints: Sequence, n_clients: int, slots_per_client: int, *,
                  rows_per_client: int = DEFAULT_ROWS, device: str = "cuda",
                  cuda_graphs: bool = True, chunk: int = FIXED_CHUNK,
-                 max_wait_ms: float = MAX_WAIT_MS, root: Optional[str] = None):
+                 max_wait_ms: float = MAX_WAIT_MS, root: Optional[str] = None,
+                 precision: str = "fp32"):
         if not 1 <= int(n_clients) <= MAX_CLIENTS:
             raise ValueError(f"客户端数须在 1..{MAX_CLIENTS}")
+        if precision not in PRECISIONS:
+            raise ValueError(f"未知 precision={precision!r}，可选 {PRECISIONS}")
         self.spec = {"checkpoints": [str(c) for c in checkpoints], "n_clients": int(n_clients),
                      "slots_per_client": int(slots_per_client),
                      "rows_per_client": int(rows_per_client), "device": device,
                      "cuda_graphs": bool(cuda_graphs), "chunk": int(chunk),
-                     "max_wait_ms": float(max_wait_ms)}
+                     "max_wait_ms": float(max_wait_ms), "precision": precision}
         self.root = root if root is not None else ("/dev/shm" if os.path.isdir("/dev/shm")
                                                    else None)
         self.dir: Optional[str] = None
@@ -402,11 +480,15 @@ class RemoteBackend:
         return self.cout[:m]
 
 
-def remote_evaluator(server_dir: str, checkpoint, chunk: int = 0) -> SsmFastEvaluator:
-    """chunk>0 时核对服务端块大小（块大小决定数值，配置里写的和实际跑的必须一致）。"""
+def remote_evaluator(server_dir: str, checkpoint, chunk: int = 0,
+                     precision: str = "") -> SsmFastEvaluator:
+    """chunk>0 / precision 非空时核对服务端块大小 / 精度（二者决定数值，配置里写的和实际跑的
+    必须一致）。"""
     from .kit_adapter import _resolve
     path = _resolve(checkpoint).resolve()
     be = RemoteBackend.connect(server_dir)
     if chunk and int(chunk) != int(be.meta["chunk"]):
         raise ValueError(f"GPU 服务块大小 {be.meta['chunk']} 与配置 {chunk} 不符")
+    if precision and precision != be.meta.get("precision", "fp32"):
+        raise ValueError(f"GPU 服务精度 {be.meta.get('precision', 'fp32')} 与配置 {precision} 不符")
     return SsmFastEvaluator(be, be.pool, f"S-srv:{path}", model_id=be.model_id(str(path)))

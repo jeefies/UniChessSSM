@@ -71,6 +71,7 @@ class SelfPlayConfig:
     pool_slots: int = 0  # 每进程状态槽数（每槽约 1 MB）；0 = 按并发自动
     server_dir: str = ""  # engine=server：已启动的服务目录（多进程时由主进程给出；空 = 自己起一个）
     server_chunk: int = 0  # engine=server：批不变块大小（决定数值）；0 = FIXED_CHUNK
+    server_precision: str = "fp32"  # engine=server：fp32 / tf32（决定数值）
 
 
 # ------------------------- 生成主循环 -------------------------
@@ -106,7 +107,8 @@ def generate(cfg: SelfPlayConfig, progress_every: int = 20) -> dict:
 
         with GpuServer([os.path.abspath(cfg.ckpt)], n_clients=1,
                        slots_per_client=resolve_pool_slots(cfg), device=cfg.device,
-                       chunk=resolve_server_chunk(cfg.server_chunk)) as srv:
+                       chunk=resolve_server_chunk(cfg.server_chunk),
+                       precision=cfg.server_precision) as srv:
             stats = generate(dataclasses.replace(cfg, server_dir=srv.dir), progress_every)
         stats["gpu_server"] = srv.final_stats
         _update_manifest_gen(cfg.out_dir, stats)
@@ -117,7 +119,8 @@ def generate(cfg: SelfPlayConfig, progress_every: int = 20) -> dict:
                                     c_scale=cfg.c_scale, engine=cfg.engine,
                                     pool_slots=resolve_pool_slots(cfg),
                                     server_dir=cfg.server_dir or None,
-                                    server_chunk=resolve_server_chunk(cfg.server_chunk))
+                                    server_chunk=resolve_server_chunk(cfg.server_chunk),
+                                    server_precision=cfg.server_precision)
     sink = V3Sink(writer, gen_id=cfg.gen_id, ckpt_step=cfg.ckpt_step, elo=cfg.elo,
                   tc_bucket=cfg.tc_bucket)
     kcfg = KitSelfPlayConfig(games=cfg.num_games, seed=cfg.seed, max_plies=cfg.max_plies,
@@ -170,7 +173,8 @@ def generate(cfg: SelfPlayConfig, progress_every: int = 20) -> dict:
         "first_game": cfg.first_game,
         "model_forwards": factory.evaluator.n_forwards,
         "engine": cfg.engine,
-        **({"server_chunk": resolve_server_chunk(cfg.server_chunk)}
+        **({"server_chunk": resolve_server_chunk(cfg.server_chunk),
+            "server_precision": cfg.server_precision}
            if cfg.engine == "server" else {}),
         "evaluator": (factory.evaluator.stats() if hasattr(factory.evaluator, "stats") else {}),
         "batch": summary["batch"],
@@ -229,7 +233,7 @@ def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: fl
         book_misses += gen.get("book_memo_misses", 0)
         last_cfg = {k: gen.get(k) for k in ("concurrency", "n_sims", "m0", "gen_id", "ckpt_step",
                                             "c_visit", "c_scale", "book_plies", "max_plies",
-                                            "engine", "server_chunk")
+                                            "engine", "server_chunk", "server_precision")
                     if k in gen}
         shutil.rmtree(wd, ignore_errors=True)
 
@@ -287,7 +291,8 @@ def run_workers(args: argparse.Namespace) -> None:
                                                   pool_slots=args.pool_slots))
         server = GpuServer([os.path.abspath(args.ckpt)], n_clients=max(1, active),
                            slots_per_client=slots,
-                           chunk=resolve_server_chunk(args.server_chunk)).start()
+                           chunk=resolve_server_chunk(args.server_chunk),
+                           precision=args.server_precision).start()
         print(f"[gpu_server] {server.dir} 客户端 {active}，每客户端槽 "
               f"{server.meta['slots_per_client']}", flush=True)
     try:
@@ -322,7 +327,8 @@ def _run_worker_procs(args: argparse.Namespace, server) -> None:
                "--c_visit", str(args.c_visit), "--c_scale", str(args.c_scale),
                "--book-plies", str(args.book_plies),
                "--engine", args.engine, "--pool-slots", str(args.pool_slots),
-               "--server-chunk", str(args.server_chunk)]
+               "--server-chunk", str(args.server_chunk),
+               "--server-precision", args.server_precision]
         if server is not None:
             cmd.extend(["--gpu-server", server.dir])
         if args.openings:
@@ -388,6 +394,9 @@ def main() -> None:
                          "0 = 按 concurrency×(1+m0) 自动")
     ap.add_argument("--server-chunk", type=int, default=0,
                     help="server：批不变块大小（行，取 fast_eval.BUCKETS 之一，如 32/64/128）。决定数值；0 = 默认 FIXED_CHUNK")
+    ap.add_argument("--server-precision", choices=("fp32", "tf32"), default="fp32",
+                    help="server：前向精度。tf32 矩阵乘走 TF32 张量核（GPU 约快 1.4 倍，与 fp32 有小偏差，"
+                         "见 design-deviations §2.6）；决定数值")
     ap.add_argument("--gpu-server", default="", help=argparse.SUPPRESS)  # 内部：主进程传给 worker
     args = ap.parse_args()
 
@@ -417,6 +426,7 @@ def main() -> None:
         pool_slots=args.pool_slots,
         server_dir=args.gpu_server,
         server_chunk=args.server_chunk,
+        server_precision=args.server_precision,
     )
     generate(cfg)
 

@@ -68,3 +68,10 @@
 - **攒批**：服务端不等待（`UNICHESS_GPU_MAX_WAIT_MS=0`）。实测在闭环里“等满一块再算”反而拖慢客户端（12×32：128 块 49.7 → 48.6 plies/s）。
 - **吞吐**（5070 Ti，gen2 vs gen3，256 模拟、m0=16、384 局 × 10 ply）：P3 reference 3.83 plies/s → fast 6×32 48.6 → **server 16×24 55.4**（约 14.5 倍；GPU 利用率约 80%，服务进程 busy 93%，客户端 CPU 仅约 24%）。块 128 → 64 快约 5%。自对弈（gen3，g=1，整盘 ≤40 ply，含 book）：reference 4×24 7.55 plies/s → server 16×24 81.3 plies/s（约 10.8 倍，含服务启动）。
 - **显存上限**：状态槽约 1 MB/槽，服务端按空闲显存（留 3 GiB）给每客户端分槽，超出预算自动降槽（淘汰 / 重算增多，结果不变）。workers × concurrency 过大时（如 20×24、12×48）单客户端在途节点把槽全部钉住 → “状态池耗尽”报错。推荐 arena `--workers 16 --concurrency 24`。
+
+### 2.6 P5：GPU 服务流水线 + 搜索侧热点（2026-09-24）
+- **SSM 状态更新改“源槽 → 目标槽”**（`stateseq/ssm_update.py`）：照搬 mamba_ssm 2.3.2 的 `selective_state_update` Triton 内核（Apache-2.0，已注明出处），只把读地址换成父槽、写地址换成子槽，省去先整块复制父 ssm 状态（conv 状态仍复制）。算式、次序、块大小与原内核相同，`tests/test_fast_eval.py::test_ssm_update_src_dst_bitwise` 与“先复制再就地更新”逐位对照。64 行块 1.72 → 1.64 ms。
+- **服务端两拍流水线**（`gpu_server._serve`，`StepEngine.submit/out_rows`，两套 pinned 缓冲）：一拍排进 CUDA 流后不同步；GPU 还忙时只在攒够近满块（填充 ≤ 1/4）时才把下一拍排在后面，否则等它算完——先排下一拍、再分发上一拍的结果。实测“GPU 忙时有请求就抢跑”块平均只填 32/64 行，反而更慢（47 plies/s），故加了满块门槛。同一客户端至多一个在途请求，两拍的行互不相交，静态设备缓冲按流序复用，结果不变。
+- **搜索侧 CPU**（结果逐位不变）：kit `select_action` 快路径（π 按节点缓存，已访问边 q / ΣN 只算一次；`Kit/tests/test_gumbel_fastpath.py` 随机节点与参考写法逐位对照）；kit `Gumbel` 子局面 = 复制父局面 + 走一步（原为每次从根重放整条 line）；`legal_moves_and_ids` 直接查表。
+- **fp32 实测**（gen2 vs gen3，16×24，192 局 × 开局后 40 ply，同机交替跑）：arena 62.7 → **71.3 plies/s**（+14%），192 局着法与 P4 **逐局相同**；自对弈（gen3，g=1，192 局）83.9 → **93.8 plies/s**（+12%），按 game_key 逐局对照动作、π′、元数据全部相同（分片字节因各 worker 内写入顺序随完成时机而异）。瓶颈仍在 GPU（服务 busy 96%，每块平均约 40/64 行有效）；块 48 / 96 均更慢（67.1 / 63.7），保持 64。
+- **可选 TF32**（`--server-precision tf32`，arena / 自对弈；仅 `--engine server`）：矩阵乘走 TF32 张量核，arena **87.2 plies/s**（再 +22%）、自对弈 **115.6 plies/s**（+23%）。与 fp32 的偏差：真实局面逐步单步 policy 概率最大差约 2e-3，argmax 翻转 2/3062；但搜索会放大微小差异——同 seed 的 192 局 arena 只有 80 局与 fp32 着法完全相同。**默认仍为 fp32**；精度决定数值，非 fp32 时进 arena 配置哈希（fp32 不写入，旧运行可续跑），服务端 `meta.precision` 与客户端配置不符即拒绝。bf16 偏差过大，未提供。

@@ -35,6 +35,7 @@ import torch
 from unichess_kit.api import EvalRequest, GameStart, MoveDecision, NodeEval, SearchBudget, immediate
 from unichess_kit.search.gumbel import Gumbel, GumbelConfig, softmax
 
+from .actions import TO_ACTION as _TO_ACTION
 from .actions import move_to_action
 from .adapter import classify_final_board, encode_board, wdl_logits_to_q
 from .conditions import TimeControlBucket
@@ -80,14 +81,17 @@ def _split_cache(cache: list, n: int) -> list:
 
 
 def legal_moves_and_ids(board: chess.Board) -> tuple:
-    """合法着（``board.legal_moves`` 顺序，滤掉动作空间外的着）与对应动作 id。
+    """合法着（``board.legal_moves`` 顺序）与对应动作 id（动作空间覆盖全部合法着）。
     顺序与 arena 的 ``_legal_actions_of`` 相同，Gumbel 的并列取首因此一致。"""
-    moves, ids = [], []
-    for m in board.legal_moves:
-        a = move_to_action(m)
-        if a is not None:
-            moves.append(m)
-            ids.append(a)
+    moves = list(board.legal_moves)
+    # 热路径（每个叶子一次）：直接查表，等价于逐着 move_to_action（未覆盖的着同样报错）
+    try:
+        ids = [_TO_ACTION[(m.from_square, m.to_square,
+                           None if m.promotion == chess.QUEEN else m.promotion)] for m in moves]
+    except KeyError:
+        for m in moves:
+            move_to_action(m)       # 抛出带着法名的 ValueError
+        raise
     return moves, np.asarray(ids, dtype=np.int64)
 
 
@@ -393,7 +397,8 @@ def make_evaluator(checkpoint, device: str = "cuda", engine: str = "fast", *,
         if not server_dir:
             raise ValueError('engine="server" 需要 server_dir（由启动方的 GpuServer 提供）')
         from .gpu_server import remote_evaluator
-        return remote_evaluator(server_dir, checkpoint, chunk=fast_kw.get("server_chunk", 0))
+        return remote_evaluator(server_dir, checkpoint, chunk=fast_kw.get("server_chunk", 0),
+                                precision=fast_kw.get("server_precision", "fp32"))
     if engine == "fast":
         from .fast_eval import SsmFastEvaluator
         return SsmFastEvaluator.from_checkpoint(checkpoint, device, **fast_kw)
@@ -402,11 +407,15 @@ def make_evaluator(checkpoint, device: str = "cuda", engine: str = "fast", *,
     raise ValueError(f"未知 engine={engine!r}，可选 {ENGINES}")
 
 
-def _engine_kw(engine, pool_slots, cuda_graphs, server_dir, server_chunk=0) -> dict:
+def _engine_kw(engine, pool_slots, cuda_graphs, server_dir, server_chunk=0,
+               server_precision="fp32") -> dict:
+    if engine != "server" and server_precision != "fp32":
+        raise ValueError(f"precision={server_precision!r} 只支持 engine=server")
     if engine == "fast":
         return {"pool_slots": pool_slots, "cuda_graphs": cuda_graphs}
     if engine == "server":
-        return {"server_dir": server_dir, "server_chunk": server_chunk}
+        return {"server_dir": server_dir, "server_chunk": server_chunk,
+                "server_precision": server_precision}
     return {}
 
 
@@ -423,11 +432,12 @@ def make_player_factory(checkpoint, *, name: str = "S", device: str = "cuda",
                         engine: str = "fast", parallel: Optional[bool] = None,
                         pool_slots: int = 2048, cuda_graphs: bool = True,
                         server_dir: Optional[str] = None,
-                        server_chunk: int = 0) -> SsmPlayerFactory:
+                        server_chunk: int = 0,
+                        server_precision: str = "fp32") -> SsmPlayerFactory:
     """加载一次权重，返回每局一个 SsmPlayer 的工厂。默认 g=0（arena 口径，确定性）。"""
     evaluator = make_evaluator(checkpoint, device, engine,
                                **_engine_kw(engine, pool_slots, cuda_graphs, server_dir,
-                                            server_chunk))
+                                            server_chunk, server_precision))
     cfg = _gumbel_cfg(evaluator, simulations, m0, g, c_visit, c_scale, parallel)
     return SsmPlayerFactory(name, evaluator, cfg)
 
@@ -551,12 +561,13 @@ def make_selfplay_factory(checkpoint=None, *, evaluator=None,
                           parallel: Optional[bool] = None, pool_slots: int = 2048,
                           cuda_graphs: bool = True,
                           server_dir: Optional[str] = None,
-                          server_chunk: int = 0) -> SsmSelfPlayerFactory:
+                          server_chunk: int = 0,
+                          server_precision: str = "fp32") -> SsmSelfPlayerFactory:
     """自对弈工厂（默认 g=1）。给 evaluator 时复用已加载的模型，否则从 checkpoint 加载。"""
     if evaluator is None:
         evaluator = make_evaluator(checkpoint, device, engine,
                                    **_engine_kw(engine, pool_slots, cuda_graphs, server_dir,
-                                                server_chunk))
+                                                server_chunk, server_precision))
     cfg = _gumbel_cfg(evaluator, simulations, m0, g, c_visit, c_scale, parallel)
     return SsmSelfPlayerFactory(name, evaluator, cfg)
 

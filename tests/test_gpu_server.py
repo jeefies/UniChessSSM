@@ -156,6 +156,25 @@ class TestGpuServer(unittest.TestCase):
             with open(o, "rb") as f:
                 self.assertEqual(pickle.load(f), expect)
 
+    def test_tf32_precision(self):
+        """tf32 服务：数值确实与 fp32 不同（开关生效）、自身可复现；配置与服务精度不符即拒绝。"""
+        from stateseq.gpu_server import GpuServer, remote_evaluator
+
+        with self.assertRaises(ValueError):
+            remote_evaluator(self.server.dir, self.ckpts[0], precision="tf32")
+        fp32 = _search(self._remote(0), FENS[2])
+        with GpuServer(self.ckpts[:1], n_clients=1, slots_per_client=256,
+                       precision="tf32") as srv:
+            self.assertEqual(srv.meta["precision"], "tf32")
+            with self.assertRaises(ValueError):
+                remote_evaluator(srv.dir, self.ckpts[0], precision="fp32")
+            ev = remote_evaluator(srv.dir, self.ckpts[0], precision="tf32")
+            r1, r2 = _search(ev, FENS[2]), _search(ev, FENS[2])
+        self.assertEqual(r1, r2)
+        self.assertNotEqual(r1[2:4], fp32[2:4])
+        with self.assertRaises(ValueError):
+            GpuServer(self.ckpts[:1], n_clients=1, slots_per_client=64, precision="bf16")
+
     def test_unknown_checkpoint_rejected(self):
         from stateseq.gpu_server import remote_evaluator
 

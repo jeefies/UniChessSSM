@@ -3,8 +3,9 @@
 与 ``kit_adapter.SsmEvaluator``（参考实现，逐位对照用）的区别：
 
 - **状态常驻 GPU 槽**（``StateTensors``）：每个已评估局面（搜索树节点 / 对局当前局面）占一个槽，
-  存 12 层 (conv, ssm) 状态。子节点前向 = 把父槽复制到新槽再**原地**单步
-  （``causal_conv1d_update`` / ``selective_state_update`` 的 ``*_indices`` 参数），
+  存 12 层 (conv, ssm) 状态。子节点前向 = conv 状态父槽复制到新槽再**原地**单步
+  （``causal_conv1d_update`` 的 ``conv_state_indices``）；ssm 状态由 ``ssm_update`` 直接
+  读父槽、写子槽（P5，与“先复制再 ``selective_state_update``”逐位相同），
   不再 torch.cat / 切片 / clone，也不再从根重放路径——每次模拟恰好 1 次前向。
 - **槽簿记与张量分离**：``SlotPool`` 只管分配 / 钉住 / LRU 淘汰（纯 CPU），``StepEngine`` 管 GPU。
   同进程时两者在一起；共享 GPU 服务（``gpu_server``）时簿记留在各搜索进程（各占一段槽号），
@@ -42,9 +43,12 @@ from .actions import NUM_ACTIONS
 try:
     from causal_conv1d import causal_conv1d_update
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+
+    from .ssm_update import ssm_update_src_dst
 except ImportError:  # pragma: no cover - 仅 GPU 环境可用
     causal_conv1d_update = None
     selective_state_update = None
+    ssm_update_src_dst = None
 
 FEAT_DIM = 785
 # 一行输入（float32）：特征 785 | elo | tc | color | 父槽 | 子槽（整数以 float32 精确表示，< 2^24）
@@ -244,11 +248,15 @@ class StepEngine:
 
     ``in_rows(m)`` 给出可直接填写的 pinned 输入视图，``execute(m)`` 分块（每块 ≤ 最大桶）
     异步 H2D → 重放 → D2H，最后同步一次，返回 pinned 输出视图（下次 execute 前有效）。
+
+    流水线（共享 GPU 服务用）：``n_bufs=2`` 时有两套 pinned 输入 / 输出缓冲，``submit(m, buf)`` 只把
+    拷贝与重放排进当前流、不同步，调用方自己记事件等完成后读 ``out_rows(m, buf)``。GPU 在算上一拍时，
+    CPU 可以往另一套缓冲里填下一拍；两拍在同一条流上串行，静态设备缓冲区按流序复用，结果不变。
     """
 
     def __init__(self, seq, tensors: StateTensors, device: str, *, cuda_graphs: bool = True,
                  batch_invariant: bool = False, chunk: int = FIXED_CHUNK,
-                 capacity: int = BUCKETS[-1]):
+                 capacity: int = BUCKETS[-1], n_bufs: int = 1):
         if causal_conv1d_update is None or selective_state_update is None:
             raise RuntimeError("快速单步需要 causal_conv1d 与 mamba_ssm 的 CUDA kernel")
         if model_dims(seq) != tensors.dims:
@@ -280,11 +288,12 @@ class StepEngine:
         self.d_in = torch.zeros((self.chunk, IN_DIM), dtype=torch.float32, device=dev)
         self.d_out = torch.zeros((self.chunk, OUT_DIM), dtype=torch.float32, device=dev)
         # 输入多留一块：末块填充行落在 [m, m+填充) 上
-        self.h_in = torch.zeros((self.capacity + self.chunk, IN_DIM), dtype=torch.float32,
-                                pin_memory=True)
-        self.h_out = torch.zeros((self.capacity, OUT_DIM), dtype=torch.float32, pin_memory=True)
-        self.h_in_np = self.h_in.numpy()
-        self.h_out_np = self.h_out.numpy()
+        self.h_ins = [torch.zeros((self.capacity + self.chunk, IN_DIM), dtype=torch.float32,
+                                  pin_memory=True) for _ in range(n_bufs)]
+        self.h_outs = [torch.zeros((self.capacity, OUT_DIM), dtype=torch.float32, pin_memory=True)
+                       for _ in range(n_bufs)]
+        self.h_ins_np = [t.numpy() for t in self.h_ins]
+        self.h_outs_np = [t.numpy() for t in self.h_outs]
         self._graphs: dict = {}
 
     def _bucket(self, n: int) -> int:
@@ -297,8 +306,10 @@ class StepEngine:
 
     # ---- 前向 ----
 
-    def _mamba_step(self, li: int, hs: torch.Tensor, idx32: torch.Tensor) -> torch.Tensor:
-        """``Mamba2.step`` 的逐条复刻（rmsnorm=True, d_mlp=0, ngroups=1），状态按槽原地更新。"""
+    def _mamba_step(self, li: int, hs: torch.Tensor, idx32: torch.Tensor,
+                    par32: torch.Tensor) -> torch.Tensor:
+        """``Mamba2.step`` 的逐条复刻（rmsnorm=True, d_mlp=0, ngroups=1）。conv 状态已复制到子槽、
+        原地更新；ssm 状态由 ``ssm_update_src_dst`` 从父槽读、写子槽（与复制后原地更新逐位相同）。"""
         lay = self._layers[li]
         blk = lay["blk"]
         zxbcdt = blk.in_proj(hs.squeeze(1))
@@ -313,9 +324,8 @@ class StepEngine:
         B = rearrange(B, "b (g n) -> b g n", g=blk.ngroups)
         C = rearrange(C, "b (g n) -> b g n", g=blk.ngroups)
         x_reshaped = rearrange(x, "b (h p) -> b h p", p=blk.headdim)
-        y = selective_state_update(self.tensors.ssm_views[li], x_reshaped, dt, lay["A"], B, C,
-                                   lay["D"], z=None, dt_bias=lay["dt_bias"], dt_softplus=True,
-                                   state_batch_indices=idx32)
+        y = ssm_update_src_dst(self.tensors.ssm_views[li], x_reshaped, dt, lay["A"], B, C,
+                               lay["D"], lay["dt_bias"], True, par32, idx32)
         y = rearrange(y, "b h p -> b (h p)")
         y = blk.norm(y, z)
         return blk.out_proj(y).unsqueeze(1)
@@ -330,16 +340,16 @@ class StepEngine:
         tc, color = ints[:, 0].contiguous(), ints[:, 1].contiguous()
         par, chi = ints[:, 2].contiguous(), ints[:, 3].contiguous()
         st = self.tensors
-        st.conv.index_copy_(1, chi, st.conv.index_select(1, par))
-        st.ssm.index_copy_(1, chi, st.ssm.index_select(1, par))
+        st.conv.index_copy_(1, chi, st.conv.index_select(1, par))   # ssm 状态不复制（见 _mamba_step）
         # 新分配再拷入：b=1 时列切片的 .contiguous()/.to() 都是空操作（单元素视为连续），
         # 步长仍是 IN_DIM，而 causal_conv1d 逐字检查索引 stride(0)==1
         idx32 = torch.empty((b,), dtype=torch.int32, device=chi.device).copy_(chi)
+        par32 = torch.empty((b,), dtype=torch.int32, device=par.device).copy_(par)
         x = seq.encode(feats).unsqueeze(1)
         cond = seq.cond(tc, elo, color).unsqueeze(1)
         h = seq.in_norm(x + cond)
         for li, norm in enumerate(seq.r.norms):
-            h = h + self._mamba_step(li, norm(h), idx32)
+            h = h + self._mamba_step(li, norm(h), idx32, par32)
         logits, wdl, _mlh = seq.f(h)
         self.d_out[:b, :NUM_ACTIONS].copy_(logits.squeeze(1))
         self.d_out[:b, NUM_ACTIONS:].copy_(wdl.squeeze(1))
@@ -373,13 +383,23 @@ class StepEngine:
                     self._graph(b)
             torch.cuda.synchronize()
 
-    def in_rows(self, m: int) -> np.ndarray:
+    def in_rows(self, m: int, buf: int = 0) -> np.ndarray:
         if m > self.capacity:
             raise ValueError(f"一次前向 {m} 行超过容量 {self.capacity}")
-        return self.h_in_np[:m]
+        return self.h_ins_np[buf][:m]
+
+    def out_rows(self, m: int, buf: int = 0) -> np.ndarray:
+        return self.h_outs_np[buf][:m]
 
     @torch.no_grad()
     def execute(self, m: int) -> np.ndarray:
+        self.submit(m)
+        torch.cuda.current_stream().synchronize()
+        return self.h_outs_np[0][:m]
+
+    @torch.no_grad()
+    def submit(self, m: int, buf: int = 0) -> None:
+        """把 m 行（``in_rows(m, buf)`` 已填好）的前向排进当前流，不同步。"""
         chunks = []
         for s in range(0, m, self.chunk):
             e = min(m, s + self.chunk)
@@ -387,7 +407,7 @@ class StepEngine:
         if self.cuda_graphs:            # 首次捕获会改写静态缓冲区，须在排入任何拷贝之前
             for _, _, b in chunks:
                 self._graph(b)
-        hin, hin_np = self.h_in, self.h_in_np
+        hin, hin_np, hout = self.h_ins[buf], self.h_ins_np[buf], self.h_outs[buf]
         for s, e, b in chunks:
             if b > e - s:               # 填充行（只可能是末块）：读零槽、写垃圾槽
                 hin_np[e:s + b, COL_PAR] = ZERO_SLOT
@@ -397,9 +417,7 @@ class StepEngine:
                 self._graphs[b].replay()
             else:
                 self._forward(b)
-            self.h_out[s:e].copy_(self.d_out[:e - s], non_blocking=True)
-        torch.cuda.current_stream().synchronize()
-        return self.h_out_np[:m]
+            hout[s:e].copy_(self.d_out[:e - s], non_blocking=True)
 
 
 class LocalBackend:

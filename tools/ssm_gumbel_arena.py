@@ -271,8 +271,10 @@ def engine_spec(ckpt: str, label: str, args, c_scale: float,
               "simulations": args.n_sims, "m0": args.m0, "g": 0.0,
               "c_visit": args.c_visit, "c_scale": c_scale,
               "engine": getattr(args, "engine", "server")}
-    if kwargs["engine"] == "server":        # 块大小决定数值 → 进配置哈希
+    if kwargs["engine"] == "server":        # 块大小、精度决定数值 → 进配置哈希
         kwargs["server_chunk"] = server_chunk(args)
+        if server_precision(args) != "fp32":    # fp32 不写：旧运行的配置哈希不变，可续跑
+            kwargs["server_precision"] = server_precision(args)
     # 槽数（淘汰 + 重算逐位不变）与服务目录（每次运行不同）都不影响结果 → runtime：
     # 照样传给工厂，但不进配置哈希，续跑时可以不同
     runtime = {"pool_slots": resolve_pool_slots(args)}
@@ -284,6 +286,10 @@ def engine_spec(ckpt: str, label: str, args, c_scale: float,
 def server_chunk(args) -> int:
     from stateseq.fast_eval import FIXED_CHUNK
     return int(getattr(args, "server_chunk", 0) or FIXED_CHUNK)
+
+
+def server_precision(args) -> str:
+    return getattr(args, "server_precision", None) or "fp32"
 
 
 def resolve_pool_slots(args) -> int:
@@ -321,7 +327,8 @@ def run_arena(args) -> tuple[list, dict | None, dict]:
         server = GpuServer([os.path.abspath(args.ckpt_a), os.path.abspath(args.ckpt_b)],
                            n_clients=max(1, args.workers),
                            slots_per_client=resolve_pool_slots(args),
-                           chunk=server_chunk(args)).start()
+                           chunk=server_chunk(args),
+                           precision=server_precision(args)).start()
         print(f"[gpu_server] {server.dir} 每客户端槽 {server.meta['slots_per_client']}", flush=True)
     server_dir = server.dir if server is not None else None
     spec_a = engine_spec(args.ckpt_a, "A", args, args.c_scale_a, server_dir)
@@ -416,6 +423,9 @@ def main():
     ap.add_argument("--server-chunk", type=int, default=0,
                     help="server：批不变块大小（行，取 fast_eval.BUCKETS 之一，如 32/64/128）。块越小低负载时浪费越少、满载时吞吐越低；"
                          "块大小决定数值（进配置哈希）。0 = 默认 FIXED_CHUNK")
+    ap.add_argument("--server-precision", choices=("fp32", "tf32"), default="fp32",
+                    help="server：前向精度。tf32 矩阵乘走 TF32 张量核（GPU 约快 1.4 倍，与 fp32 有小偏差，"
+                         "见 design-deviations §2.6）；决定数值（非 fp32 时进配置哈希）")
     ap.add_argument("--c_visit", type=float, default=C_VISIT, help="双方共用的 c_visit")
     ap.add_argument("--c_scale_a", type=float, default=C_SCALE, help="A 侧 c_scale")
     ap.add_argument("--c_scale_b", type=float, default=C_SCALE, help="B 侧 c_scale")
