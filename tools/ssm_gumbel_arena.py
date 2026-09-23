@@ -64,6 +64,65 @@ OPENINGS = [
 ]
 
 
+def load_openings_file(path: str, book_plies: int | None = None) -> list[str]:
+    """从文本文件加载开局库（每行一条 SAN 着法序列，如 data/openings_200.txt）。
+
+    逐着验证合法性，跳过含非法着法的行。
+    book_plies=None（默认）：保留整行。arena 用 g=0（无随机性），开局多样性是对局多样性
+    唯一来源，因此 arena 侧**不截断**——按固定 ply 数裁切会把 200 个不同开局折叠成
+    111 个（实测），等于人为制造重复对局。
+    book_plies=k：只保留前 k 个 ply（生成器用它保证 π′ memo 的跨局共享键稳定）。
+    """
+    openings: list[str] = []
+    seen: set[str] = set()
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            toks = raw.split()   # 同时兼容 \n / \r\n
+            if not toks:
+                continue
+            if book_plies is not None:
+                toks = toks[:book_plies]
+            board = chess.Board()
+            ok = True
+            for t in toks:
+                try:
+                    board.push_san(t)
+                except Exception:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            trimmed = " ".join(toks)
+            if trimmed in seen:   # 去重在最终形态上做
+                continue
+            seen.add(trimmed)
+            openings.append(trimmed)
+    return openings
+
+
+def opening_plan(n_pairs: int, library: list[str], seed: int) -> list[tuple[int, str]]:
+    """为 n_pairs 个开局对分配开局，返回 [(库下标, SAN), ...]，长度恒为 n_pairs。
+
+    arena 用 g=0（无 Gumbel 噪声、无温度、argmax 选择），对局**完全确定性**：
+    seed 不参与决策，因此**开局多样性是对局多样性的唯一来源**。若每对开局都不同，
+    则每对都是一局全新对局；反之同开局的 pair 会产生逐字节相同的棋谱与相同结果。
+    因此 n_pairs <= 库规模时用带种子的排列保证互不重复（同 seed 可复现、换 seed 换卷）；
+    库不够时只能循环复用，由调用方以 duplicate_rate 警示统计功效已被稀释。
+    """
+    n = len(library)
+    if n == 0:
+        raise ValueError("开局库为空，无法分配开局")
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(n)
+    return [(int(idx[i % n]), library[int(idx[i % n])]) for i in range(n_pairs)]
+
+
+def _pgn_fingerprint(gd: dict) -> str:
+    """对局指纹：棋步序列（忽略 Event/Site 等元数据），用于统计"实际不同对局"数。"""
+    body = str(gd.get("pgn", "")).split("\n\n")[-1]
+    return " ".join(body.split())
+
+
 def _legal_actions_of(board: chess.Board) -> list[int]:
     return [a for m in board.legal_moves if (a := move_to_action(m)) is not None]
 
@@ -355,6 +414,9 @@ def _aggregate_results(games_log, half, args, sprt_info=None) -> dict:
         term_counts[t] = term_counts.get(t, 0) + 1
     truncated = term_counts.get("truncated", 0)
     anomalies = sum(1 for g in games_log if g["anomaly"])
+    # 实际不同对局数（g=0 下同开局+同颜色的对局逐字节重复）
+    fingerprints = [_pgn_fingerprint(g) for g in games_log]
+    distinct = len(set(fingerprints))
     res = {
         "ckpt_a": args.ckpt_a, "ckpt_b": args.ckpt_b,
         "c_visit": args.c_visit, "c_scale_a": args.c_scale_a, "c_scale_b": args.c_scale_b,
@@ -368,6 +430,9 @@ def _aggregate_results(games_log, half, args, sprt_info=None) -> dict:
         "truncated_rate": truncated / max(len(games_log), 1),
         "anomalies": anomalies,
         "workers": getattr(args, "workers", 1),
+        # g=0 确定性对局：distinct_games 才是有效样本量，重复只会虚增权重
+        "distinct_games": distinct,
+        "duplicate_rate": 1.0 - distinct / max(len(games_log), 1),
     }
     if sprt_info:
         res["sprt"] = sprt_info
@@ -441,14 +506,13 @@ def _worker_process_fn(
         result_queue.put(("worker_error", (worker_id, str(e), traceback.format_exc())))
 
 
-def run_parallel_arena(args: argparse.Namespace, num_pairs: int, n_openings: int, t0: float) -> tuple[list[dict], dict | None]:
+def run_parallel_arena(args: argparse.Namespace, num_pairs: int, openings: list[tuple[int, str]], t0: float) -> tuple[list[dict], dict | None]:
     """多进程执行 arena 对弈并支持渐进式 SPRT 检查。"""
     n_workers = min(args.workers, num_pairs)
     # 按 round-robin 分配 pairs 给 workers
     worker_pairs: list[list[tuple[int, int, str]]] = [[] for _ in range(n_workers)]
     for pair_idx in range(num_pairs):
-        oi = pair_idx % n_openings
-        opening_san = OPENINGS[oi]
+        oi, opening_san = openings[pair_idx]
         worker_pairs[pair_idx % n_workers].append((pair_idx, oi, opening_san))
 
     ctx = mp.get_context("spawn")
@@ -957,7 +1021,7 @@ class BatchedArenaDriver:
                             self.n_forwards / max(self.n_plies, 1)), flush=True)
 
 
-def run_batched_arena(args: argparse.Namespace, num_pairs: int, n_openings: int,
+def run_batched_arena(args: argparse.Namespace, num_pairs: int, openings: list[tuple[int, str]],
                       t0: float, models: list | None = None) -> tuple[list[dict], dict | None]:
     """单进程跨局攒批 arena：batch≈并发局数，替代 batch=1 的串行/多进程模式。"""
     if models is None:
@@ -975,8 +1039,7 @@ def run_batched_arena(args: argparse.Namespace, num_pairs: int, n_openings: int,
 
     games: list[BatchedArenaGame] = []
     for pair_idx in range(num_pairs):
-        oi = pair_idx % n_openings
-        opening_san = OPENINGS[oi]
+        oi, opening_san = openings[pair_idx]
         for a_is_white in (True, False):
             games.append(BatchedArenaGame(
                 game_idx=len(games), pair_idx=pair_idx, models=models,
@@ -1044,14 +1107,14 @@ def _batched_worker_fn(worker_id: int, assigned_pairs: list[tuple[int, int, str]
         result_queue.put(("worker_error", (worker_id, str(e), traceback.format_exc())))
 
 
-def run_batched_parallel_arena(args: argparse.Namespace, num_pairs: int, n_openings: int,
-                               t0: float) -> tuple[list[dict], dict | None]:
+def run_batched_parallel_arena(args: argparse.Namespace, num_pairs: int,
+                               openings: list[tuple[int, str]], t0: float) -> tuple[list[dict], dict | None]:
     """批量 + 多进程：round-robin 分配开局对，父进程收集并按成对边界做 SPRT 早停。"""
     n_workers = min(args.workers, num_pairs)
     worker_pairs: list[list[tuple[int, int, str]]] = [[] for _ in range(n_workers)]
     for pair_idx in range(num_pairs):
-        oi = pair_idx % n_openings
-        worker_pairs[pair_idx % n_workers].append((pair_idx, oi, OPENINGS[oi]))
+        oi, opening_san = openings[pair_idx]
+        worker_pairs[pair_idx % n_workers].append((pair_idx, oi, opening_san))
 
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
@@ -1176,7 +1239,12 @@ def main():
     ap.add_argument("--ckpt-b")
     ap.add_argument("--out", required=True)
     ap.add_argument("--games", type=int, default=64)
-    ap.add_argument("--pairs", type=int, default=8)
+    ap.add_argument("--pairs", type=int, default=8,
+                    help="已废弃：曾误用于裁剪开局数（64 局实际只跑出 16 个不同对局）；"
+                         "开局多样性由 --openings-file 决定")
+    ap.add_argument("--openings-file", default="data/openings_200.txt",
+                    help="开局库文件（每行一条 SAN 序列）；留空则用内置 16 条。"
+                         "g=0 的 arena 无随机性，开局多样性是对局多样性唯一来源")
     ap.add_argument("--n_sims", type=int, default=256)
     ap.add_argument("--m0", type=int, default=16)
     ap.add_argument("--max_plies", type=int, default=300)
@@ -1241,13 +1309,29 @@ def main():
     # 运行对局：成对开局与颜色互换
     # pair i 包含 2 局：第 1 局 A 白 B 黑，第 2 局 B 白 A 黑（复用相同开局）
     num_pairs = args.games // 2
-    n_openings = min(args.pairs, len(OPENINGS))
     t0 = time.time()
+
+    # 开局库：默认从 data/openings_200.txt 加载（g=0 下开局多样性是对局多样性唯一来源），
+    # 文件缺失时退回内置 OPENINGS。分配保证 pair 开局互不重复（库足够时）。
+    library = load_openings_file(args.openings_file) if args.openings_file else list(OPENINGS)
+    if not library:
+        print(f"[warn] 开局文件 {args.openings_file} 未产生有效开局，退回内置列表")
+        library = list(OPENINGS)
+    openings = opening_plan(num_pairs, library, args.seed)
+    n_openings = len(library)
+    if num_pairs > n_openings:
+        print(f"[warn] 对数 {num_pairs} > 开局数 {n_openings}：开局必然重复，"
+              f"g=0 下同开局 pair 的对局逐字节相同，统计功效被稀释", flush=True)
+    print(f"[openings] 库规模 {n_openings}，对数 {num_pairs}，"
+          f"实际不同对局数 {len(set(o for o, _ in openings)) * 2}", flush=True)
+    if args.pairs and args.pairs != n_openings:
+        print(f"[info] --pairs 已废弃（曾误用于裁剪开局数，导致 64 局实际仅 16 个不同对局）；"
+              f"现用 --openings-file 指定开局库", flush=True)
 
     if args.batched:
         if args.workers > 1:
             # 批量 + 多进程：N 进程各自攒批跑分到的开局对（树逻辑并行 + GPU 批量兼得）
-            games_log, sprt_info = run_batched_parallel_arena(args, num_pairs, n_openings, t0)
+            games_log, sprt_info = run_batched_parallel_arena(args, num_pairs, openings, t0)
         else:
             # 单进程跨局攒批（batch≈并发局数）
             model_a = ArenaModel(args.ckpt_a)
@@ -1263,11 +1347,11 @@ def main():
                 - F.softmax(torch.from_numpy(lb[0]), dim=0).numpy())))
             print("A hash=%s B hash=%s same=%s policy_diff=%.2e" % (
                 id_a, id_b, id_a == id_b, policy_diff))
-            games_log, sprt_info = run_batched_arena(args, num_pairs, n_openings, t0,
+            games_log, sprt_info = run_batched_arena(args, num_pairs, openings, t0,
                                                      models=[model_a, model_b])
     elif args.workers > 1:
         # 多进程并行模式
-        games_log, sprt_info = run_parallel_arena(args, num_pairs, n_openings, t0)
+        games_log, sprt_info = run_parallel_arena(args, num_pairs, openings, t0)
     else:
         # 串行模式（workers == 1）
         cfg = lambda: None
@@ -1292,8 +1376,7 @@ def main():
         sprt_info = None
 
         for pair_idx in range(num_pairs):
-            oi = pair_idx % n_openings
-            opening_san = OPENINGS[oi]
+            oi, opening_san = openings[pair_idx]
 
             # 局 1: A 白 B 黑
             g1_idx = len(games_log)
