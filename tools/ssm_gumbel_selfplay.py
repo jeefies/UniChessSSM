@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from stateseq.actions import move_to_action
 from stateseq.conditions import TimeControlBucket
 from stateseq.data.sequences import _board_key
+from stateseq.depth_hist import hist_add, hist_merge, hist_summary
 from stateseq.adapter import (
     encode_board, wdl_logits_to_q, get_terminal_q, classify_final_board,
 )
@@ -210,6 +211,7 @@ class GameState:
         self.n_terminal_total = 0
         self.sims_total = 0
         self.max_depth_total = 0
+        self.expand_hist: list[int] = []  # 扩展深度直方图（P3 埋点；memo 命中不计）
         self.budget_violations = 0
 
     def _update_occurrence(self) -> None:
@@ -334,6 +336,7 @@ class GameState:
     # ---- 展开：沿 node.path 从根快照重算，再展开一步（§2.3 路径重算） ----
 
     def _expand_gen(self, node: Node, action: int):
+        hist_add(self.expand_hist, node.depth + 1)
         board = self.board.copy()
         cache = self.root_cache
         occ = dict(self.occurrence)
@@ -493,6 +496,7 @@ class Driver:
         self.total_terminal = 0
         self.total_sims = 0
         self.total_max_depth = 0
+        self.expand_hist: list[int] = []
         self.budget_violations = 0
         self.term_reason_counts = [0] * len(TERM_CODES)
         self.truncated_games = 0
@@ -556,6 +560,7 @@ class Driver:
         self.total_terminal += game.n_terminal_total
         self.total_sims += game.sims_total
         self.total_max_depth += game.max_depth_total
+        self.expand_hist = hist_merge(self.expand_hist, game.expand_hist)
         self.budget_violations += game.budget_violations
         self.term_reason_counts[term_reason] += 1
         self.book_memo_hits += game.book_memo_hits
@@ -666,6 +671,7 @@ def generate(cfg: SelfPlayConfig) -> dict:
         "avg_search_nodes_per_ply": driver.total_nodes / max(driver.total_plies, 1),
         "avg_sims_per_ply": driver.total_sims / max(driver.total_plies, 1),
         "avg_max_tree_depth": driver.total_max_depth / max(driver.total_plies, 1),
+        "expand_depth": hist_summary(driver.expand_hist),
         "budget_violations": driver.budget_violations,
         "termination_reason_counts": dict(zip(TERM_CODES, driver.term_reason_counts)),
         "truncated_rate": driver.truncated_games / max(driver.games_done, 1),
@@ -714,6 +720,7 @@ def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: fl
     total_games = total_steps = total_skipped = 0
     total_plies = total_nodes = total_terminal = total_sims = 0
     total_max_depth = 0
+    expand_hist: list[int] = []
     budget_violations = 0
     term_counts = [0] * len(TERM_CODES)
     truncated_games = 0
@@ -738,6 +745,7 @@ def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: fl
         total_nodes += gen.get("avg_search_nodes_per_ply", 0.0) * gen.get("plies", 0)
         total_sims += gen.get("avg_sims_per_ply", 0.0) * gen.get("plies", 0)
         total_max_depth += gen.get("avg_max_tree_depth", 0.0) * gen.get("plies", 0)
+        expand_hist = hist_merge(expand_hist, gen.get("expand_depth", {}).get("hist"))
         budget_violations += gen.get("budget_violations", 0)
         for k, v in gen.get("termination_reason_counts", {}).items():
             term_counts[TERM_CODES.index(k)] += v
@@ -757,6 +765,7 @@ def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: fl
         "avg_search_nodes_per_ply": total_nodes / max(total_plies, 1),
         "avg_sims_per_ply": total_sims / max(total_plies, 1),
         "avg_max_tree_depth": total_max_depth / max(total_plies, 1),
+        "expand_depth": hist_summary(expand_hist),
         "budget_violations": budget_violations,
         "termination_reason_counts": dict(zip(TERM_CODES, term_counts)),
         "truncated_rate": truncated_games / max(total_games, 1),

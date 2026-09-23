@@ -34,6 +34,7 @@ from stateseq.actions import move_to_action
 from stateseq.data.sequences import _board_key
 from stateseq.model import SeqModel
 from stateseq.model_r import clone_cache
+from stateseq.depth_hist import hist_add, hist_merge, hist_summary
 from stateseq.gumbel import (
     C_SCALE, C_VISIT, Node, order_halving, gumbel_topm, qtransform_completed,
     select_action, _Candidate, _n_rounds,
@@ -305,6 +306,7 @@ def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
     occur: dict = {}
     actions: list[int] = []
     anomaly = None
+    expand_hist: list[int] = []  # 扩展深度直方图（P3 埋点）
     n_sims = cfg.n_sims
     m0 = cfg.m0
     # σ 展幅常数**绑定在模型侧**：换色时随模型一起交换，支持「同权重、不同尺度」对照。
@@ -356,6 +358,7 @@ def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
         side = turn
 
         def expand(node, action):
+            hist_add(expand_hist, node.depth + 1)
             return _expand_child(models[side], board, caches[side], occur, node, action)
 
         c_visit, c_scale = scales[side]
@@ -390,6 +393,7 @@ def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
         "arena_result": our_result,
         "anomaly": anomaly,
         "pgn": str(game_pgn) if game_pgn is not None else "",
+        "expand_depth_hist": expand_hist,
     }
 
 
@@ -434,6 +438,10 @@ def _aggregate_results(games_log, half, args, sprt_info=None) -> dict:
         "distinct_games": distinct,
         "duplicate_rate": 1.0 - distinct / max(len(games_log), 1),
     }
+    hist: list[int] = []
+    for g in games_log:
+        hist = hist_merge(hist, g.get("expand_depth_hist"))
+    res["expand_depth"] = hist_summary(hist)
     if sprt_info:
         res["sprt"] = sprt_info
     return res
@@ -704,6 +712,7 @@ class BatchedArenaGame:
                        for side in self.slot}
         self.rng = np.random.default_rng(seed)
         self.anomaly = None
+        self.expand_hist: list[int] = []  # 扩展深度直方图（P3 埋点）
 
     # ---- 前向请求：当前局面双方模型各进一步 ----
 
@@ -728,6 +737,7 @@ class BatchedArenaGame:
     # ---- 搜索：顺序减半（g=0），展开走本方根快照路径重算 ----
 
     def _expand_gen(self, node: Node, action: int, side):
+        hist_add(self.expand_hist, node.depth + 1)
         board = self.board.copy()
         cache = clone_cache(self.caches[side])
         occ = dict(self.occurrence)
@@ -882,6 +892,7 @@ class BatchedArenaGame:
             "arena_result": our_result,
             "anomaly": self.anomaly,
             "pgn": str(game_pgn) if game_pgn is not None else "",
+            "expand_depth_hist": self.expand_hist,
         }
 
 
