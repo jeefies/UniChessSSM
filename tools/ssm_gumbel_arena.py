@@ -463,6 +463,7 @@ def run_parallel_arena(args: argparse.Namespace, num_pairs: int, n_openings: int
             daemon=True,
         )
         p.start()
+        p._arena_done = False  # 收到 worker_done/worker_error 后置 True
         workers.append(p)
         print(f"[worker {wid}] 启动 pid={p.pid} pairs={len(worker_pairs[wid])}", flush=True)
 
@@ -480,15 +481,26 @@ def run_parallel_arena(args: argparse.Namespace, num_pairs: int, n_openings: int
         try:
             msg_type, payload = result_queue.get(timeout=1.0)
         except Exception:
-            dead = [i for i, p in enumerate(workers) if not p.is_alive()]
-            if dead and completed_workers + len(dead) >= n_workers:
+            # 队列空闲：只统计"已宣告结束"（worker_done / worker_error）的 worker。
+            # 不能用进程 is_alive() 判定完成——外部 pkill 或静默崩溃时会把仍在上工的
+            # worker 误判为已完成而提前 break，丢掉其余对局（32/64 局事故的根因）。
+            dead_silent = [i for i, p in enumerate(workers)
+                           if not p.is_alive() and not getattr(p, "_arena_done", False)]
+            if dead_silent:
+                stop_event.set()
+                raise RuntimeError(
+                    f"worker {dead_silent} 未宣告结束即退出（被外部杀死或静默崩溃）；"
+                    f"已收 {len(received_pairs)}/{num_pairs} 对，结果不完整不予采信")
+            if completed_workers >= n_workers:
                 while not result_queue.empty():
-                    msg_type, payload = result_queue.get_nowait()
-                    if msg_type == "game_pair":
-                        pair_idx, games = payload
-                        received_pairs[pair_idx] = games
-                    elif msg_type == "worker_done":
-                        completed_workers += 1
+                    try:
+                        msg_type, payload = result_queue.get_nowait()
+                        if msg_type == "game_pair":
+                            pair_idx, games = payload
+                            if pair_idx not in received_pairs:
+                                received_pairs[pair_idx] = games
+                    except Exception:
+                        break
                 break
             continue
 
@@ -531,9 +543,14 @@ def run_parallel_arena(args: argparse.Namespace, num_pairs: int, n_openings: int
 
         elif msg_type == "worker_done":
             completed_workers += 1
+            # payload = worker_id（进程列表下标）；标记为"已宣告结束"
+            if isinstance(payload, int) and 0 <= payload < len(workers):
+                workers[payload]._arena_done = True
         elif msg_type == "worker_error":
             wid, err_str, tb_str = payload
             stop_event.set()
+            if isinstance(wid, int) and 0 <= wid < len(workers):
+                workers[wid]._arena_done = True
             print(f"[worker {wid} ERROR]: {err_str}\n{tb_str}", file=sys.stderr, flush=True)
             raise RuntimeError(f"Worker {wid} failed with error: {err_str}")
 
@@ -1045,6 +1062,7 @@ def run_batched_parallel_arena(args: argparse.Namespace, num_pairs: int, n_openi
                         args=(wid, worker_pairs[wid], args, result_queue, stop_event),
                         daemon=True)
         p.start()
+        p._arena_done = False  # 收到 worker_done/worker_error 后置 True
         workers.append(p)
         print(f"[worker {wid}] 启动 pid={p.pid} pairs={len(worker_pairs[wid])}", flush=True)
 
@@ -1061,15 +1079,26 @@ def run_batched_parallel_arena(args: argparse.Namespace, num_pairs: int, n_openi
         try:
             msg_type, payload = result_queue.get(timeout=1.0)
         except Exception:
-            dead = [i for i, p in enumerate(workers) if not p.is_alive()]
-            if dead and completed_workers + len(dead) >= n_workers:
+            # 队列空闲：只统计"已宣告结束"（worker_done / worker_error）的 worker。
+            # 不能用进程 is_alive() 判定完成——外部 pkill 或静默崩溃时会把仍在上工的
+            # worker 误判为已完成而提前 break，丢掉其余对局（32/64 局事故的根因）。
+            dead_silent = [i for i, p in enumerate(workers)
+                           if not p.is_alive() and not getattr(p, "_arena_done", False)]
+            if dead_silent:
+                stop_event.set()
+                raise RuntimeError(
+                    f"worker {dead_silent} 未宣告结束即退出（被外部杀死或静默崩溃）；"
+                    f"已收 {len(received_pairs)}/{num_pairs} 对，结果不完整不予采信")
+            if completed_workers >= n_workers:
                 while not result_queue.empty():
-                    msg_type, payload = result_queue.get_nowait()
-                    if msg_type == "game_pair":
-                        pair_idx, games = payload
-                        received_pairs[pair_idx] = games
-                    elif msg_type == "worker_done":
-                        completed_workers += 1
+                    try:
+                        msg_type, payload = result_queue.get_nowait()
+                        if msg_type == "game_pair":
+                            pair_idx, games = payload
+                            if pair_idx not in received_pairs:
+                                received_pairs[pair_idx] = games
+                    except Exception:
+                        break
                 break
             continue
 
@@ -1107,9 +1136,14 @@ def run_batched_parallel_arena(args: argparse.Namespace, num_pairs: int, n_openi
                           f"({saved_games / args.games * 100:.1f}%)\n", flush=True)
         elif msg_type == "worker_done":
             completed_workers += 1
+            # payload = worker_id（进程列表下标）；标记为"已宣告结束"
+            if isinstance(payload, int) and 0 <= payload < len(workers):
+                workers[payload]._arena_done = True
         elif msg_type == "worker_error":
             wid, err_str, tb_str = payload
             stop_event.set()
+            if isinstance(wid, int) and 0 <= wid < len(workers):
+                workers[wid]._arena_done = True
             print(f"[worker {wid} ERROR]: {err_str}\n{tb_str}", file=sys.stderr, flush=True)
             raise RuntimeError(f"Worker {wid} failed with error: {err_str}")
 
