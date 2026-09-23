@@ -118,7 +118,9 @@ class SequenceDataset:
         self.lengths = self.reader.meta_all["n_plies"].astype(np.int64)
         self.workers = workers
         self.seed = seed
-        self.pool = mp.Pool(workers, initializer=_worker_init, initargs=(shard_dir, t_max))
+        # spawn 而非 Linux 默认的 fork：调用方进程往往已初始化 CUDA（模型已上卡 / 同进程的 GPU 测试），
+        # fork 出的子进程继承 CUDA 对象，回收时 "CUDA error: initialization error" 崩溃、池挂死。
+        self.pool = mp.get_context("spawn").Pool(workers, initializer=_worker_init, initargs=(shard_dir, t_max))
         self.val_indices = [i for i in range(self.n_games) if bool(self.reader.is_val_arr[i])]
         self.train_indices = [i for i in range(self.n_games) if not bool(self.reader.is_val_arr[i])]
         if not self.val_indices:  # 小样本兜底：尾部 1% 作 val

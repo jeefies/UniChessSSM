@@ -72,7 +72,9 @@ class SelfPlayDataset:
         self.workers = workers
         self.seed = seed
         self.t_max = t_max
-        self.pool = mp.Pool(workers, initializer=_worker_init, initargs=(shard_dir,))
+        # spawn 而非 Linux 默认的 fork：调用方进程往往已初始化 CUDA（模型已上卡 / 同进程的 GPU 测试），
+        # fork 出的子进程继承 CUDA 对象，回收时 "CUDA error: initialization error" 崩溃、池挂死。
+        self.pool = mp.get_context("spawn").Pool(workers, initializer=_worker_init, initargs=(shard_dir,))
         self.val_indices = [i for i in range(self.n_games) if bool(self.reader.is_val_arr[i])]
         self.train_indices = [i for i in range(self.n_games) if not bool(self.reader.is_val_arr[i])]
         if not self.val_indices:
