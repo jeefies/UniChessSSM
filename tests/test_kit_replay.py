@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 KIT_ROOT = os.environ.get("UNICHESS_KIT_ROOT", os.path.join(os.path.dirname(HERE), "Kit"))
 if os.path.isdir(KIT_ROOT) and KIT_ROOT not in sys.path:
-    sys.path.insert(0, KIT_ROOT)
+    sys.path.append(KIT_ROOT)  # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
 
 try:
     import chess

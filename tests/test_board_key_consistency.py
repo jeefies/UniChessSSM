@@ -7,20 +7,27 @@
 
 from __future__ import annotations
 
+import os
+import sys
 import unittest
 
 import chess
 
 from stateseq.data.sequences import _board_key
 
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+KIT_ROOT = os.environ.get("UNICHESS_KIT_ROOT", os.path.join(os.path.dirname(HERE), "Kit"))
+if os.path.isdir(KIT_ROOT) and KIT_ROOT not in sys.path:
+    sys.path.append(KIT_ROOT)  # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
+
 
 class BoardKeyConsistencyTest(unittest.TestCase):
     def test_tool_modules_reuse_sequences_key(self):
-        import tools.ssm_gumbel_arena as ar
-        import tools.ssm_gumbel_selfplay as sp
-
-        self.assertIs(sp._board_key, _board_key)
-        self.assertIs(ar._board_key, _board_key)
+        try:  # 自对弈与 arena 的 Player 都在 kit_adapter（需要 torch 与兄弟仓库 Kit）
+            import stateseq.kit_adapter as ka
+        except ImportError:
+            self.skipTest("需要 torch 与兄弟仓库 Kit")
+        self.assertIs(ka._board_key, _board_key)
 
     def test_cycle_returns_same_key(self):
         start = chess.Board()

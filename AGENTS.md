@@ -66,7 +66,12 @@ B0 链路审计全 PASS（对拍 fp32 逐位一致、WDL 符号正确、80 局 0
 `/home/jeefy/UniChess` 下除 `SSM/` 与 `SSM.git/` 外一切仍是只读。
 GitHub 远端为 `gh` → `git@github.com:jeefies/UniChessSSM.git`。
 
-- git 同步：本地 commit → push 到远端 bare → 远端工作目录 `git pull`。
+- git 同步（2026-09-23 起）：本地 commit → push 到 GitHub（`origin`/`gh`）→ 远端工作目录
+  `git pull --ff-only origin main`。远端 bare `SSM.git` 已不再使用；**勿向 `legacy-unichess` 推送**。
+- **UniChessKit 依赖（P3 起）**：arena 与自对弈需要兄弟仓库 `../Kit`（或环境变量
+  `UNICHESS_KIT_ROOT`）；口径变化见 `docs/design-deviations.md` §2.4。Kit 只能**追加**到 sys.path 末尾；
+  且本仓库 `tests/` 无 `__init__.py`（命名空间包），Kit 的常规 `tests` 包在 sys.path 任何位置都会胜出，
+  测试间互相导入须带 `from test_xxx import` 回退（见 `tests/test_cache_isolation.py`）。
 - 远端 conda 环境（与原项目共用，**复用不改动**）：
   `/home/jeefy/miniconda3/envs/unichess/bin/python`（Py 3.12.14，torch 2.11.0+cu128，
   mamba-ssm 2.3.2，causal-conv1d 1.7.0，CUDA 12.9）。
@@ -90,6 +95,7 @@ UniChessSSM/
 │   ├── heads.py         # f: policy/WDL/moves-left
 │   ├── losses.py        # 五损失（统一归约口径）
 │   ├── gumbel.py        # Gumbel 顺序减半搜索核心（纯 numpy，无 GPU 可测）
+│   ├── kit_adapter.py   # 接入 UniChessKit：SsmPlayer / SsmExpander（ReplayStore）/ SsmSelfPlayer / V3Sink
 │   └── data/            # 分片读写
 │       ├── shards.py    # v2 分片（动作列表）
 │       └── gshards.py   # v3 分片（变长合法目标 + 终局元数据）
@@ -109,9 +115,8 @@ UniChessSSM/
 │   ├── ssm_uci_test.py   # 映射自测 a/b/c
 │   ├── ssm_path_audit.py     # 推理链路端到端对拍（fp32 逐位一致）
 │   ├── ssm_wdl_sign_audit.py # WDL→Q 符号审计
-│   ├── ssm_gumbel_selfplay.py # Stage B Gumbel 自对弈生成器（多进程 + 槽位复用）
-│   ├── ssm_gumbel_arena.py    # Stage B 换代 arena（复用 order_halving，g=0）
-│   ├── compare_c_scale.py     # 固定局面机制对照（c_scale 尺度诊断）
+│   ├── ssm_gumbel_selfplay.py # Stage B 自对弈生成器（kit run_selfplay 薄封装，P3）
+│   ├── ssm_gumbel_arena.py    # Stage B 换代 arena（kit run_match 薄封装，g=0，P3）
 │   ├── repair_v3_meta.py      # v3 meta 终局语义修复（只改 meta 不重跑生成）
 │   ├── align_pipol.py / trace_pipol.py # π′ 对齐与 σ/Q 追踪
 │   └── run_arena*.sh     # arena 启动器（自动起/停推理服务器）
@@ -126,7 +131,8 @@ UniChessSSM/
 │   ├── test_value_sign.py # WDL→Q 符号单测
 │   ├── test_gumbel.py / test_gshards_v3.py # 搜索算法 + v3 分片往返
 │   ├── test_termination_classify.py # 终局裁决唯一入口
-│   └── test_soft_policy_integration.py / test_arena_expand.py / test_board_key_consistency.py
+│   ├── test_kit_replay.py / test_kit_adapter.py / test_kit_selfplay.py / test_arena_kit.py # kit 接入
+│   └── test_soft_policy_integration.py / test_board_key_consistency.py
 ├── data/  runs/         # 运行时产物（gitignore；常驻 ≤10 GB，临时 ≤50 GB）
 └── docs/                # 权威设计文档 / design-deviations.md / stage-a-experiment.md / stage-b-*
 ```
@@ -145,7 +151,7 @@ UniChessSSM/
   `stateseq/gumbel.py` 是纯 numpy 实现，可在无 GPU 环境下做算法单测。
 
 **并发陷阱（2026-09-20 实测，OOM 根因）**：`ssm_gumbel_selfplay.py` 的 `--concurrency`
-是**每 worker** 的并发局数，`run_workers` 原样透传给每个子进程（`tools/ssm_gumbel_selfplay.py:611`），
+是**每 worker** 的并发局数，`run_workers` 原样透传给每个子进程，
 且每进程各建独立 CUDA context。`--workers 3 --concurrency 128`（默认 concurrency）会让 3 个进程
 各占约 5 GiB，合计 ~15 GiB 撞满 15.51 GiB 显存 → 全部 worker `torch.OutOfMemoryError` 退出码 1。
 已验证可行档位：round2 用 `--concurrency 24 --workers 4`（GPU 利用率 97%）；成功的 fix500 用
@@ -203,7 +209,7 @@ UniChessSSM/
   （决定见 `design-deviations.md` §9.3；**代码默认值直到 2026-09-20 本次才真正落到
   `stateseq/gumbel.py:26`** —— 此前 3 天里文档写 0.1、代码仍是 `C_SCALE = 1.0`，
   `git log -S'C_SCALE = 0.1'` 为空可证。生成器 CLI 是 `default=C_SCALE`
-  （`tools/ssm_gumbel_selfplay.py:660`），**不显式传 `--c_scale` 就会静默沿用旧值**，
+  **不显式传 `--c_scale` 就会静默沿用旧值**，
   这正是 fix500 被降级的那个设置）。判据不是"熵要高"，而是**价值分辨力与打分幅度是否匹配**：
   c_scale=1.0 时 α≈50~80 把仅 ~0.03 的 Q 差放大成 18 logit 差，60.3% 局面目标退化为近乎确定选择
   （KL(π′‖π)=2.195 反超原始 policy 熵 1.811）；32 局同权重对抗 c_scale=0.1 胜 65.6%（21:11，0 和棋）。

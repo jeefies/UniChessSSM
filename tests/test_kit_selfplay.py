@@ -1,15 +1,16 @@
 """S 自对弈接入 kit（``SsmSelfPlayer`` + ``V3Sink``）单元测试。需要 CUDA 与兄弟仓库 Kit。
 
-核心断言：kit ``run_selfplay`` 与原生成器 ``ssm_gumbel_selfplay.Driver``（随机初始化模型、
-并发 1、同 seed / 开局库 / book_plies）写出的 v3 分片 **逐字节相同**（actions / pipol /
-pipol.offsets），meta 数组逐项相同；生成统计（book π′ 缓存命中、预算违例、扩展深度直方图、
-终局原因）也逐项相同。
+切换前与原生成器 ``Driver`` 写出的 v3 分片逐字节相同、生成统计逐项相同（随机权重与真实
+权重各一组，见 git 历史中的本文件与 ``tools/kit_selfplay_parity.py``）。原生成器已删除，这里锁死：
+1. 并发 1 下同配置两次运行分片逐字节相同（book π′ 缓存有命中）；
+2. 按全局局号拆成两段（多 worker 的做法）与一次跑完逐局相同——局号、rng、book 分配
+   只取决于全局局号，每局的 meta / 着法 / π′ 与在哪个 worker 生成无关；
+3. 并发 > 1 结构正确（局号全、book 着法与 flags、跨局拼批）。
 """
 
 from __future__ import annotations
 
 import glob
-import importlib.util
 import os
 import shutil
 import sys
@@ -20,7 +21,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 KIT_ROOT = os.environ.get("UNICHESS_KIT_ROOT", os.path.join(os.path.dirname(HERE), "Kit"))
 if os.path.isdir(KIT_ROOT) and KIT_ROOT not in sys.path:
-    sys.path.insert(0, KIT_ROOT)
+    sys.path.append(KIT_ROOT)  # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
 
 try:
     import torch
@@ -36,15 +37,6 @@ try:
     _HAS_KIT = True
 except ImportError:  # pragma: no cover
     _HAS_KIT = False
-
-
-def _load_tool():
-    path = os.path.join(HERE, "tools", "ssm_gumbel_selfplay.py")
-    spec = importlib.util.spec_from_file_location("ssm_gumbel_selfplay_kit", path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    return mod
 
 
 def compare_shard_dirs(dir_a: str, dir_b: str) -> list:
@@ -73,6 +65,25 @@ def compare_shard_dirs(dir_a: str, dir_b: str) -> list:
     return diffs
 
 
+def games_by_key(shard_dir: str) -> dict:
+    """分片目录 → {game_key: (meta 行字节, 着法字节, π′ 字节)}，与分片切分方式无关。"""
+    out = {}
+    for meta_path in glob.glob(os.path.join(shard_dir, "*.meta.npz")):
+        base = meta_path[:-len(".meta.npz")]
+        with np.load(meta_path) as z:
+            metas, offsets = z["metas"], z["offsets"]
+        acts = np.fromfile(base + ".actions.bin", dtype=np.uint16)
+        poff = np.fromfile(base + ".pipol.offsets.bin", dtype=np.int64)
+        with open(base + ".pipol.bin", "rb") as fh:
+            blob = fh.read()
+        for i, m in enumerate(metas):
+            key = m["game_key"]
+            key = key.decode() if isinstance(key, bytes) else str(key)
+            out[key] = (m.tobytes(), acts[offsets[i]:offsets[i + 1]].tobytes(),
+                        blob[poff[i]:poff[i + 1]])
+    return out
+
+
 @unittest.skipUnless(_HAS_CUDA and _HAS_KIT, "需要 CUDA（mamba 步进核）与兄弟仓库 Kit")
 class TestKitSelfPlay(unittest.TestCase):
     @classmethod
@@ -81,7 +92,6 @@ class TestKitSelfPlay(unittest.TestCase):
         from stateseq.model import SeqModel
 
         cls.ka = ka
-        cls.tool = _load_tool()
         torch.manual_seed(7)
         cls.seq = SeqModel(dropout=0.0).to("cuda").eval()
 
@@ -97,65 +107,47 @@ class TestKitSelfPlay(unittest.TestCase):
             fh.write("\n".join(lines) + "\n")
         return path
 
-    def _run_s(self, games, seed, n_sims, max_plies, openings, book_plies, g):
-        T = self.tool
-        model = T.ModelWrapper.__new__(T.ModelWrapper)
-        model.device, model.seq, model._tc_cache, model._elo_cache = "cuda", self.seq, {}, {}
-        out = os.path.join(self.tmp, "s")
-        cfg = T.SelfPlayConfig(ckpt="rand7", out_dir=out, tag="t", num_games=games, concurrency=1,
-                               n_sims=n_sims, seed=seed, max_plies=max_plies, gen_id=3,
-                               gumbel_g=g, openings_path=openings or "", book_plies=book_plies)
-        writer = T.V3ShardWriter(out, "t")
-        driver = T.Driver(model, cfg, writer, openings=T.load_openings(openings, book_plies)
-                          if openings else [])
-        driver.run(progress_every=10 ** 9)
-        writer.flush()
-        return out, driver
-
-    def _run_kit(self, games, seed, n_sims, max_plies, openings, book_plies, g, concurrency=1):
+    def _run_kit(self, games, seed, n_sims, max_plies, openings, book_plies, g, concurrency=1,
+                 first_game=0, name=None):
         from stateseq.data.gshards import V3ShardWriter
         from unichess_kit.pipelines.selfplay import SelfPlayConfig, run_selfplay
 
         ka = self.ka
-        out = os.path.join(self.tmp, f"k{concurrency}")
+        out = os.path.join(self.tmp, name or f"k{concurrency}")
         ev = ka.SsmEvaluator(self.seq, "cuda", "S:rand7")
         factory = ka.make_selfplay_factory(evaluator=ev, simulations=n_sims, g=g)
         writer = V3ShardWriter(out, "t")
         sink = ka.V3Sink(writer, gen_id=3)
         summary = run_selfplay(SelfPlayConfig(games=games, seed=seed, max_plies=max_plies,
                                               concurrency=concurrency, openings=openings,
-                                              book_plies=book_plies), factory, sink)
+                                              book_plies=book_plies, first_game=first_game),
+                               factory, sink)
         writer.flush()
         return out, factory, sink, summary
 
-    def _assert_parity(self, games, seed, n_sims, max_plies, openings, book_plies, g=1.0):
-        s_dir, drv = self._run_s(games, seed, n_sims, max_plies, openings, book_plies, g)
-        k_dir, fac, sink, summary = self._run_kit(games, seed, n_sims, max_plies, openings,
-                                                  book_plies, g)
-        self.assertEqual(compare_shard_dirs(s_dir, k_dir), [])
-        sh = fac.shared
-        self.assertEqual(summary["games"], drv.games_done)
-        self.assertEqual(sink.plies, drv.total_plies)
-        self.assertEqual(sink.term_reason_counts, drv.term_reason_counts)
-        self.assertEqual(sink.truncated_games, drv.truncated_games)
-        self.assertEqual((sh.book_memo_hits, sh.book_memo_misses),
-                         (drv.book_memo_hits, drv.book_memo_misses))
-        self.assertEqual(sh.budget_violations, drv.budget_violations)
-        self.assertEqual(sh.expand_hist, drv.expand_hist)
-        self.assertEqual((sh.n_nodes, sh.sims, sh.max_depth),
-                         (drv.total_nodes, drv.total_sims, drv.total_max_depth))
-        return drv, fac
-
-    def test_parity_with_book(self):
+    def test_deterministic_with_book(self):
         # 3 条线（其一裁切后与第一条重复、各占序号）× 7 局：memo 命中与 book_id 取模都覆盖到
         path = self._openings(["e4 e5 Nf3 Nc6", "d4 Nf6", "e4 e5 Nf3 Nc6 Bb5"])
-        drv, fac = self._assert_parity(games=7, seed=11, n_sims=16, max_plies=24,
-                                       openings=path, book_plies=3)
-        self.assertGreater(drv.book_memo_hits, 0)
+        kw = dict(games=7, seed=11, n_sims=16, max_plies=24, openings=path, book_plies=3, g=1.0)
+        d1, f1, s1, _ = self._run_kit(name="r1", **kw)
+        d2, f2, s2, _ = self._run_kit(name="r2", **kw)
+        self.assertEqual(compare_shard_dirs(d1, d2), [])
+        self.assertGreater(f1.shared.book_memo_hits, 0)
+        self.assertEqual(f1.shared.expand_hist, f2.shared.expand_hist)
+        self.assertEqual(s1.term_reason_counts, s2.term_reason_counts)
 
-    def test_parity_without_book(self):
-        self._assert_parity(games=3, seed=5, n_sims=16, max_plies=20, openings=None,
-                            book_plies=6)
+    def test_split_by_global_index_equals_whole(self):
+        path = self._openings(["e4 e5 Nf3 Nc6", "d4 Nf6", "c4 e5"])
+        kw = dict(seed=11, n_sims=16, max_plies=20, openings=path, book_plies=3, g=1.0)
+        whole, *_ = self._run_kit(games=7, name="whole", **kw)
+        part1, *_ = self._run_kit(games=3, first_game=0, name="p1", **kw)
+        part2, *_ = self._run_kit(games=4, first_game=3, name="p2", **kw)
+        got = {**games_by_key(part1), **games_by_key(part2)}
+        want = games_by_key(whole)
+        self.assertEqual(len(want), 7)
+        self.assertEqual(sorted(got), sorted(want))
+        for key in want:
+            self.assertEqual(got[key], want[key], f"{key} 按段生成与整段生成不同")
 
     def test_concurrent_run_valid(self):
         """并发 > 1 不求逐字节（拼批浮点差），只验结构：局号全、book 着法与 flags、π′ 归一。"""

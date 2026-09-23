@@ -1,12 +1,14 @@
 """扩展深度直方图（P3 埋点）单元测试。
 
 1. 纯函数：hist_add / hist_merge / hist_summary 的计数、分位与重放前向数；
-2. （需 CUDA）随机初始化模型上，串行 ``play_one_game`` 与批量 ``BatchedArenaGame`` 的
-   直方图逐位相等、PGN 一致，且驱动器前向数与直方图推出的前向数吻合。
+2. arena 的 kit 记录 → games.jsonl 转换与聚合（逐局直方图合并进 arena.json）。
+端到端（真实搜索产出直方图、多进程转发、续跑读回）见 ``tests/test_arena_kit.py``；
+自对弈直方图与原生成器逐位一致见 ``tests/test_kit_selfplay.py``。
 """
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import os
 import sys
@@ -14,18 +16,19 @@ import unittest
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
+KIT_ROOT = os.environ.get("UNICHESS_KIT_ROOT", os.path.join(os.path.dirname(HERE), "Kit"))
+if os.path.isdir(KIT_ROOT) and KIT_ROOT not in sys.path:
+    sys.path.append(KIT_ROOT)  # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
 
 from stateseq.depth_hist import hist_add, hist_merge, hist_summary  # noqa: E402
 
 try:
-    import torch  # noqa: F401
     import chess  # noqa: F401
+    import unichess_kit  # noqa: F401
 
-    _HAS_TORCH = True
-    _HAS_CUDA = torch.cuda.is_available()
-except ImportError:  # pragma: no cover - 本机（Windows）无 torch
-    _HAS_TORCH = False
-    _HAS_CUDA = False
+    _HAS_KIT = True
+except ImportError:  # pragma: no cover - 缺 python-chess 或兄弟仓库 Kit
+    _HAS_KIT = False
 
 
 class TestHistPure(unittest.TestCase):
@@ -65,61 +68,41 @@ def _load_tool():
     return mod
 
 
-@unittest.skipUnless(_HAS_CUDA, "需要 CUDA（mamba/causal_conv1d 步进核只有 GPU 版）")
-class TestArenaHist(unittest.TestCase):
+def _rec(game, white, a_score, moves, termination):
+    return {"type": "game", "game": game, "pair": game // 2, "white": white,
+            "opening": ["e2e4", "e7e5"], "moves": moves, "result": "*",
+            "termination": termination, "plies": 2 + len(moves), "a_score": a_score,
+            "sources": {"A": {}, "B": {}}, "elapsed_s": 0.1}
+
+
+@unittest.skipUnless(_HAS_KIT, "需要 python-chess 与兄弟仓库 Kit")
+class TestArenaAggregate(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tool = _load_tool()
 
-    def _model(self, seed: int):
-        from stateseq.model import SeqModel
+    def test_game_dict_and_aggregate(self):
+        ckpts = {"A": "a.pt", "B": "b.pt"}
+        h1, h2 = [0, 3, 2], [0, 1, 0, 4]
+        g0 = self.tool.game_dict(_rec(0, "A", 1.0, ["g1f3", "b8c6"], "truncated"),
+                                 ckpts, {0: 7}, h1)
+        g1 = self.tool.game_dict(_rec(1, "B", 0.5, ["g1f3"], "truncated"), ckpts, {0: 7}, h2)
+        self.assertEqual((g0["arena_result"], g1["arena_result"]), (0, 1))
+        self.assertEqual((g0["ckpt_white"], g0["ckpt_black"]), ("a.pt", "b.pt"))
+        self.assertEqual((g1["ckpt_white"], g1["ckpt_black"]), ("b.pt", "a.pt"))
+        self.assertEqual((g0["n_plies"], g0["opening_id"], g0["is_truncated"]), (2, 7, True))
+        self.assertIn("1. e4 e5 2. Nf3 Nc6", g0["pgn"])
+        self.assertEqual(g0["expand_depth_hist"], h1)
 
-        torch.manual_seed(seed)
-        m = self.tool.ArenaModel.__new__(self.tool.ArenaModel)
-        m.ckpt_path = f"rand{seed}"
-        m.device = "cuda"
-        m.seq = SeqModel(dropout=0.0).to("cuda").eval()
-        m._tc_cache, m._elo_cache = {}, {}
-        m.c_visit, m.c_scale = 50.0, 0.1
-        return m
-
-    def _cfg(self):
-        cfg = lambda: None  # noqa: E731
-        cfg.n_sims, cfg.m0, cfg.max_plies, cfg.c_visit, cfg.c_scale = 12, 4, 3, 50.0, 0.1
-        return cfg
-
-    def test_serial_equals_batched(self):
-        a, b = self._model(1), self._model(2)
-        cfg = self._cfg()
-        opening = "e4 e5"
-        gd_s = self.tool.play_one_game(a, b, cfg, opening_san=opening, opening_id=0, seed=7)
-        game = self.tool.BatchedArenaGame(0, 0, [a, b], True, cfg, opening, 0, seed=7)
-        args = self.tool.argparse.Namespace(sprt=False, games=1, sprt_alpha=0.05, sprt_beta=0.05,
-                                            sprt_min_games=64)
-        driver = self.tool.BatchedArenaDriver([game], concurrency=1, args=args,
-                                              internal_sprt=False)
-        driver.run()
-        gd_b = driver.results[0]
-
-        self.assertEqual(gd_s["pgn"], gd_b["pgn"])
-        self.assertEqual(gd_s["expand_depth_hist"], gd_b["expand_depth_hist"])
-        hist = gd_b["expand_depth_hist"]
-        s = hist_summary(hist)
-        n_plies = gd_b["n_plies"]
-        self.assertEqual(n_plies, cfg.max_plies)
-        self.assertLessEqual(s["expansions"], cfg.n_sims * n_plies)
-        self.assertGreater(s["max"], 1, "12 sims / m0=4 应当展开到第 2 层以下")
-        # 前向数 = 每 ply（含开局）双方各 1 次推进 + 重放 + 非终局评估
-        advances = 2 * (2 + n_plies)
-        lo = advances + s["replay_forwards"]
-        self.assertLessEqual(lo, driver.n_forwards)
-        self.assertLessEqual(driver.n_forwards, lo + s["expansions"])
-
-        agg = self.tool._aggregate_results([gd_b, dict(gd_s, arena_result=1)], 1,
-                                           self.tool.argparse.Namespace(
-                                               ckpt_a="a", ckpt_b="b", c_visit=50.0,
-                                               c_scale_a=0.1, c_scale_b=0.1, n_sims=12, m0=4))
-        self.assertEqual(agg["expand_depth"]["hist"], hist_merge(hist, hist))
+        args = argparse.Namespace(ckpt_a="a.pt", ckpt_b="b.pt", c_visit=50.0, c_scale_a=0.1,
+                                  c_scale_b=0.1, n_sims=12, m0=4, workers=1)
+        agg = self.tool._aggregate_results([g0, g1], args)
+        self.assertEqual((agg["wins_a"], agg["draws"], agg["wins_b"]), (1, 1, 0))
+        self.assertEqual(agg["score_a"], 1.5)
+        self.assertEqual(agg["termination"], {"truncated": 2})
+        self.assertEqual(agg["distinct_games"], 2)
+        self.assertEqual(agg["expand_depth"], hist_summary(hist_merge(h1, h2)))
+        self.assertNotIn("sprt", agg)
 
 
 if __name__ == "__main__":

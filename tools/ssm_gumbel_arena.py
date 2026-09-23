@@ -1,13 +1,32 @@
-"""Gumbel arena — 复用生产搜索 order_halving，修复 review §2 所有问题。
+"""Gumbel arena（换代评测）——对局由 UniChessKit 的 ``pipelines.match`` 驱动。
+
+S 侧只提供 Player（``stateseq.kit_adapter.SsmPlayer``：R cache 懒追赶 + 路径重算展开 +
+Gumbel 顺序减半，g=0 确定性）；成对开局、跨局拼批、多进程、断点续跑、裁决都在 kit。
+切换前与原实现（``ArenaModel`` / ``play_one_game`` / ``BatchedArenaDriver``，见 git 历史）
+在并发 1 下逐局 ``_pgn_fingerprint`` 一致（真实权重 gen2 vs gen3：8/8 与 16/16）。
 
 用法：
   python tools/ssm_gumbel_arena.py --ckpt-a runs/champion.pt --ckpt-b runs/challenger.pt \\
-      --out runs/arena_ab --games 64 --pairs 8
+      --out runs/arena_ab --games 64 --workers 4 --concurrency 24
+
+口径（与原实现相同）：
+- 第 p 对两局同一开局，A 先执白；开局 = 带种子的排列（kit ``OpeningBook.plan``，与原
+  ``opening_plan`` 逐对相同），g=0 下开局是对局多样性的唯一来源。
+- ``--max_plies`` 只计开局之后的 ply；裁决 claim_draw 口径（与 ``classify_final_board`` 一致）。
+- 计分按模型（A 视角），``arena_result`` 0 = A 胜、1 = 和、2 = B 胜。
+
+与原实现的差别：
+- ``--sprt`` 改用 kit 的五项式（逐对）GSPRT，H0: Elo 0 vs H1: Elo 35（≈ 原 p 0.50 vs 0.55），
+  接受或拒绝都会停；原实现是逐局伯努利 LLR、只在拒绝 H1 时停。
+- 结果逐局写入 ``<out>/kit_results.jsonl``：同一命令重跑会核对配置哈希并续跑。
+- 出错整批停止（kit 语义），不再逐局记 anomaly（字段保留，恒为 None）。
 
 输出：
-  arena.json        — 聚合统计（含终止分布+验证断言）
-  games.jsonl       — 逐局诊断（每行 JSON）
-  model_ids.json    — 双方检查点参数标识+前向比较
+  arena.json        — 聚合统计（含终止分布、扩展深度直方图、kit 的 Elo/五项式统计）
+  games.jsonl       — 逐局诊断（每行 JSON，字段同原实现）
+  model_ids.json    — 双方检查点参数标识 + 初始局面前向比较
+  kit_results.jsonl — kit 的原始逐局结果（断点续跑用）
+  expand_hist.jsonl — 逐局扩展深度直方图（续跑时已完成局的直方图从这里读回）
   scoring_test.json — 计分正向测试（--test-scoring）
 """
 
@@ -17,7 +36,6 @@ import argparse
 import hashlib
 import json
 import math
-import multiprocessing as mp
 import os
 import sys
 import time
@@ -25,26 +43,21 @@ import time
 import chess
 import chess.pgn
 import numpy as np
-import torch
 
 sys.stdout.reconfigure(line_buffering=True, encoding="utf-8")
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, HERE)
+KIT_ROOT = os.environ.get("UNICHESS_KIT_ROOT", os.path.join(os.path.dirname(HERE), "Kit"))
+if os.path.isdir(KIT_ROOT) and KIT_ROOT not in sys.path:
+    sys.path.append(KIT_ROOT)  # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
 
-from stateseq.actions import move_to_action
-from stateseq.data.sequences import _board_key
-from stateseq.model import SeqModel
-from stateseq.model_r import clone_cache
-from stateseq.depth_hist import hist_add, hist_merge, hist_summary
-from stateseq.gumbel import (
-    C_SCALE, C_VISIT, Node, order_halving, gumbel_topm, qtransform_completed,
-    select_action, _Candidate, _n_rounds,
-)
-from stateseq.adapter import (
-    encode_board, standardize_elo, wdl_logits_to_q,
-    get_terminal_q, classify_final_board,
-)
+from stateseq.depth_hist import hist_merge, hist_summary  # noqa: E402
+from stateseq.gumbel import C_SCALE, C_VISIT  # noqa: E402
+from unichess_kit.pipelines.match import MatchConfig, SprtConfig, run_match  # noqa: E402
+from unichess_kit.registry import EngineSpec  # noqa: E402
+from unichess_kit.rules.openings import OpeningBook  # noqa: E402
 
-# ---- 开局库（ECO 经典变例）----
+# ---- 内置开局库（ECO 经典变例；开局文件缺失时的后备）----
 OPENINGS = [
     "e4 e5 Nf3 Nc6 Bb5",
     "d4 d5 c4 e6",
@@ -59,63 +72,15 @@ OPENINGS = [
     "e4 d5 exd5 Qxd5 Nc3 Qa5",
     "d4 Nf6 c4 c5",
     "e4 e5 Nf3 Nf6",
-    "d4 e6 c4 Bb4+",
-    "e4 e5 Nf3 Nc6 Bc4",
-    "d4 g6 c4 Bg7",
+    "e4 g6",
+    "d4 f5",
+    "e4 e5 f4",
 ]
 
+SPRT_ELO1 = 35.0  # ≈ 原实现 H1 的 p=0.55：-400·log10(1/0.55 − 1) = 34.9
 
-def load_openings_file(path: str, book_plies: int | None = None) -> list[str]:
-    """从文本文件加载开局库（每行一条 SAN 着法序列，如 data/openings_200.txt）。
-
-    逐着验证合法性，跳过含非法着法的行。
-    book_plies=None（默认）：保留整行。arena 用 g=0（无随机性），开局多样性是对局多样性
-    唯一来源，因此 arena 侧**不截断**——按固定 ply 数裁切会把 200 个不同开局折叠成
-    111 个（实测），等于人为制造重复对局。
-    book_plies=k：只保留前 k 个 ply（生成器用它保证 π′ memo 的跨局共享键稳定）。
-    """
-    openings: list[str] = []
-    seen: set[str] = set()
-    with open(path, "r", encoding="utf-8") as fh:
-        for raw in fh:
-            toks = raw.split()   # 同时兼容 \n / \r\n
-            if not toks:
-                continue
-            if book_plies is not None:
-                toks = toks[:book_plies]
-            board = chess.Board()
-            ok = True
-            for t in toks:
-                try:
-                    board.push_san(t)
-                except Exception:
-                    ok = False
-                    break
-            if not ok:
-                continue
-            trimmed = " ".join(toks)
-            if trimmed in seen:   # 去重在最终形态上做
-                continue
-            seen.add(trimmed)
-            openings.append(trimmed)
-    return openings
-
-
-def opening_plan(n_pairs: int, library: list[str], seed: int) -> list[tuple[int, str]]:
-    """为 n_pairs 个开局对分配开局，返回 [(库下标, SAN), ...]，长度恒为 n_pairs。
-
-    arena 用 g=0（无 Gumbel 噪声、无温度、argmax 选择），对局**完全确定性**：
-    seed 不参与决策，因此**开局多样性是对局多样性的唯一来源**。若每对开局都不同，
-    则每对都是一局全新对局；反之同开局的 pair 会产生逐字节相同的棋谱与相同结果。
-    因此 n_pairs <= 库规模时用带种子的排列保证互不重复（同 seed 可复现、换 seed 换卷）；
-    库不够时只能循环复用，由调用方以 duplicate_rate 警示统计功效已被稀释。
-    """
-    n = len(library)
-    if n == 0:
-        raise ValueError("开局库为空，无法分配开局")
-    rng = np.random.default_rng(seed)
-    idx = rng.permutation(n)
-    return [(int(idx[i % n]), library[int(idx[i % n])]) for i in range(n_pairs)]
+# 选择 "a"/"b" 引擎时 kit 按 EngineSpec 加载（多进程时每个 worker 各自加载）
+FACTORY = "stateseq.kit_adapter:make_player_factory"
 
 
 def _pgn_fingerprint(gd: dict) -> str:
@@ -124,23 +89,12 @@ def _pgn_fingerprint(gd: dict) -> str:
     return " ".join(body.split())
 
 
-def _legal_actions_of(board: chess.Board) -> list[int]:
-    return [a for m in board.legal_moves if (a := move_to_action(m)) is not None]
-
-
-def _resolve_move(action: int, board: chess.Board):
-    for m in board.legal_moves:
-        if move_to_action(m) == action:
-            return m
-    return None
-
-
 def _result_str(board: chess.Board) -> str:
     outcome = board.outcome(claim_draw=True)
     if outcome is None:
         return "*"
     if outcome.winner is None:
-        return "\u00bd-\u00bd"
+        return "½-½"
     return "1-0" if outcome.winner == chess.WHITE else "0-1"
 
 
@@ -188,239 +142,66 @@ def _run_scoring_test(out_dir: str) -> None:
     print("=== %d/%d PASS ===" % (passed, len(SCORING_TEST_FENS)))
 
 
-# ---- 模型封装 ----
+# ---- 开局库 ----
 
-class ArenaModel:
-    def __init__(self, ckpt_path: str, device: str = "cuda"):
-        self.ckpt_path = ckpt_path
-        self.device = device
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        sd = ckpt.get("model", ckpt)
-        self.seq = SeqModel(dropout=0.0)
-        self.seq.load_state_dict(sd)
-        self.seq.to(device).eval()
-        # 条件张量缓存：arena 的 tc/elo 全局固定，按 (标量值, 批大小) 缓存，
-        # 避免每次前向都 torch.tensor([...]) 重建（profile 显示这是最大单项开销）。
-        self._tc_cache: dict = {}
-        self._elo_cache: dict = {}
-
-    def initial_cache(self, b: int = 1):
-        return self.seq.initial_cache(b, device=self.device, dtype=torch.float32)
-
-    def _scalar_tensor(self, cache: dict, kind: str, val, n: int) -> torch.Tensor:
-        key = (val, n)
-        t = cache.get(key)
-        if t is None:
-            t = (torch.full((n,), int(val), dtype=torch.long, device=self.device)
-                 if kind == "long" else
-                 torch.full((n,), float(val), dtype=torch.float32, device=self.device))
-            cache[key] = t
-        return t
-
-    @torch.no_grad()
-    def step(self, feats, tc, elo, color, cache, need_extra: bool = False):
-        """单步前向。
-
-        need_extra=False（arena 搜索默认）：不回传 mlh 与 x 的 CPU 副本——二者在
-        搜索路径上无人消费，省掉 2/5 的 D2H 同步传输。
-        """
-        f_t = torch.from_numpy(feats).float().to(self.device)
-        n = len(tc)
-        if len(set(tc)) == 1:
-            tc_t = self._scalar_tensor(self._tc_cache, "long", tc[0], n)
-        else:
-            tc_t = torch.from_numpy(np.asarray(tc, dtype=np.int64)).to(self.device)
-        if len(set(elo)) == 1:
-            elo_t = self._scalar_tensor(self._elo_cache, "float", elo[0], n)
-        else:
-            elo_t = torch.from_numpy(np.asarray(elo, dtype=np.float32)).to(self.device)
-        color_t = torch.from_numpy(np.asarray(color, dtype=np.int64)).to(self.device)
-        logits, wdl, mlh, x, cache_new = self.seq.step(f_t, tc_t, elo_t, color_t, cache)
-        if need_extra:
-            return (logits.cpu().numpy(), wdl.cpu().numpy(),
-                    mlh.cpu().numpy(), x.cpu().numpy(), cache_new)
-        return logits.cpu().numpy(), wdl.cpu().numpy(), None, None, cache_new
+def resolve_openings(path: str, out_dir: str) -> str:
+    """开局文件路径；为空或不存在时把内置库写到 out_dir 并返回其路径。"""
+    if path and os.path.exists(path):
+        return path
+    if path:
+        print(f"[warn] 开局文件 {path} 不存在，退回内置 {len(OPENINGS)} 条", flush=True)
+    builtin = os.path.join(out_dir, "openings_builtin.txt")
+    with open(builtin, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(OPENINGS) + "\n")
+    return builtin
 
 
-# ---- 单局对弈（每方独立模型 + 完整历史 cache/occurrence）----
+# ---- kit 记录 → 原 games.jsonl 字段 ----
 
-def _expand_child(model: ArenaModel, board: chess.Board, cache, occur: dict,
-                  node: Node, action: int) -> Node:
-    """从本方根快照重放 node.path，再展开 action（与生成器 `_expand_gen` 同口径）。
-
-    - board/cache/occur 均为**根局面**的快照（该方模型对完整历史推进后的状态）；
-    - occurrence 统一 encode-before-increment（与根节点及训练重放一致）；
-    - 路径重放动作必须合法（规则引擎权威），否则抛 RuntimeError（不得伪造终局）。
-    """
-    b_copy = board.copy()
-    cache_copy = clone_cache(cache)
-    occ_copy = dict(occur)
-    new_path = node.path + (action,)
-    for a in node.path:
-        mv = _resolve_move(a, b_copy)
-        if mv is None:
-            raise RuntimeError(f"路径重放动作 {a} 在 {b_copy.fen()} 上不合法")
-        b_copy.push(mv)
-        key = _board_key(b_copy)
-        feats, tc_val, elo_std, color = encode_board(b_copy, occ_copy.get(key, 0))
-        _, _, _, _, cache_copy = model.step(
-            np.asarray(feats, dtype=np.float32).reshape(1, -1),
-            [int(tc_val)], [float(elo_std)], [int(color)], cache_copy)
-        occ_copy[key] = occ_copy.get(key, 0) + 1
-    mv = _resolve_move(action, b_copy)
-    if mv is None:
-        raise RuntimeError(f"动作 {action} 在 {b_copy.fen()} 上不合法")
-    b_copy.push(mv)
-    if b_copy.is_game_over(claim_draw=True) or not list(b_copy.legal_moves):
-        return Node(np.array([], dtype=np.int64), np.array([], dtype=np.float32),
-                    get_terminal_q(b_copy), depth=node.depth + 1, action=action,
-                    path=new_path, terminal=True)
-    key = _board_key(b_copy)
-    feats, tc_val, elo_std, color = encode_board(b_copy, occ_copy.get(key, 0))
-    lc, wc, _, _, _ = model.step(
-        np.asarray(feats, dtype=np.float32).reshape(1, -1),
-        [int(tc_val)], [float(elo_std)], [int(color)], cache_copy)
-    q_c = wdl_logits_to_q(wc[0])
-    legal_c = _legal_actions_of(b_copy)
-    lc_np = lc[0]
-    lc_masked = np.full(1936, -3e4, dtype=np.float32)
-    lc_masked[legal_c] = lc_np[legal_c]
-    return Node(np.array(legal_c, dtype=np.int64),
-                lc_masked[np.array(legal_c)].astype(np.float32),
-                q_c, depth=node.depth + 1, action=action, path=new_path)
+_ARENA_RESULT = {1.0: 0, 0.5: 1, 0.0: 2}  # A 得分 → arena_result（A 视角 0 胜 / 1 和 / 2 负）
 
 
-def play_one_game(model_w: ArenaModel, model_b: ArenaModel, cfg,
-                  opening_san: str | None = None, opening_id: int = 0,
-                  seed: int = 0) -> dict:
-    """单局对弈：双方模型各自对**完整历史**推进 cache/occurrence，搜索复用生产 order_halving。
-
-    - 每 ply 双方模型都前进一步——每方的根快照等于"该检查点单独下完这盘棋"的 R 状态；
-    - occurrence 全局面共享（口径 = `stateseq/data/sequences.py::_board_key`）；
-    - 开局着法同样经过模型步进（不得凭空跳开局，否则历史缺失）；
-    - 终局原因：棋盘优先（`get_termination_reason_from_board`），未终局记 truncated。
-    """
-    models = {chess.WHITE: model_w, chess.BLACK: model_b}
-    caches = {chess.WHITE: model_w.initial_cache(1), chess.BLACK: model_b.initial_cache(1)}
+def game_dict(rec: dict, ckpts: dict, opening_ids: dict, expand_hist: list | None) -> dict:
     board = chess.Board()
-    occur: dict = {}
-    actions: list[int] = []
-    anomaly = None
-    expand_hist: list[int] = []  # 扩展深度直方图（P3 埋点）
-    n_sims = cfg.n_sims
-    m0 = cfg.m0
-    # σ 展幅常数**绑定在模型侧**：换色时随模型一起交换，支持「同权重、不同尺度」对照。
-    # ArenaModel 未显式设置时回落到 cfg（同一份共享配置），行为与旧版一致。
-    scales = {
-        chess.WHITE: (getattr(model_w, "c_visit", cfg.c_visit), getattr(model_w, "c_scale", cfg.c_scale)),
-        chess.BLACK: (getattr(model_b, "c_visit", cfg.c_visit), getattr(model_b, "c_scale", cfg.c_scale)),
-    }
-
-    def _advance():
-        """当前局面：双方模型各前进一步，返回行棋方 (logits, wdl)。"""
-        key = _board_key(board)
-        feats, tc_val, elo_std, color = encode_board(board, occur.get(key, 0))
-        feats_np = np.asarray(feats, dtype=np.float32).reshape(1, -1)
-        mover_logits = None
-        mover_wdl = None
-        for side in (chess.WHITE, chess.BLACK):
-            lg, wd, _, _, new_cache = models[side].step(
-                feats_np, [int(tc_val)], [float(elo_std)], [int(color)], caches[side])
-            caches[side] = new_cache
-            if side == board.turn:
-                mover_logits, mover_wdl = lg, wd
-        occur[key] = occur.get(key, 0) + 1
-        return mover_logits, mover_wdl
-
-    if opening_san:
-        # 先编码当前局面再落子（encode-before-move），与生成器 / 训练重放同口径：
-        # 序列是 B₀,B₁,…，每个局面恰好进 R 一次。此前写成 push→advance，导致初始局面
-        # B₀ 从未入 R、而最后一个开局局面被重复步进两次（occurrence 也多记一次）。
-        for token in opening_san.split():
-            _advance()
-            board.push_san(token)
-
-    for ply in range(cfg.max_plies):
-        if board.is_game_over(claim_draw=True):
-            break
-        turn = board.turn
-
-        logits_np, wdl_np = _advance()
-        q_root = wdl_logits_to_q(wdl_np[0])
-        legal_actions = _legal_actions_of(board)
-        if not legal_actions:
-            break
-        legal_arr = np.array(legal_actions, dtype=np.int64)
-        logits_legal = logits_np[0][legal_arr].astype(np.float32)
-
-        root = Node(legal=legal_arr.copy(), logits=logits_legal.copy(), q=q_root)
-
-        side = turn
-
-        def expand(node, action):
-            hist_add(expand_hist, node.depth + 1)
-            return _expand_child(models[side], board, caches[side], occur, node, action)
-
-        c_visit, c_scale = scales[side]
-        ply_seed = seed + ply * 100003
-        result = order_halving(root, expand, n_sims=n_sims, m0=m0, g=0.0,
-                               seed=ply_seed, c_visit=c_visit, c_scale=c_scale)
-        if result["action"] is None:
-            anomaly = "order_halving returned None"
-            break
-        chosen = int(result["action"])
-        actions.append(chosen)
-        mv = _resolve_move(chosen, board)
-        if mv is None:
-            anomaly = "chosen action resolves to None"
-            break
-        board.push(mv)
-
-    # 终局裁决与生成器共用唯一入口（claim_draw=True 口径；未终局 = 走满 max_plies）
-    our_result, term_reason, is_truncated = classify_final_board(board)
-    result_str = _result_str(board)
-
-    game_pgn = chess.pgn.Game.from_board(board)
+    for u in rec["opening"] + rec["moves"]:
+        board.push_uci(u)
+    white, black = rec["white"], ("B" if rec["white"] == "A" else "A")
     return {
-        "opening_id": opening_id,
-        "seed": seed,
-        "ckpt_white": model_w.ckpt_path,
-        "ckpt_black": model_b.ckpt_path,
-        "n_plies": len(actions),
-        "termination_reason": term_reason,
-        "is_truncated": is_truncated,
-        "board_result": result_str,
-        "arena_result": our_result,
-        "anomaly": anomaly,
-        "pgn": str(game_pgn) if game_pgn is not None else "",
-        "expand_depth_hist": expand_hist,
+        "opening_id": opening_ids.get(rec["pair"]),
+        "seed": None,
+        "ckpt_white": ckpts[white],
+        "ckpt_black": ckpts[black],
+        "n_plies": len(rec["moves"]),
+        "termination_reason": rec["termination"],
+        "is_truncated": rec["termination"] == "truncated",
+        "board_result": _result_str(board),
+        "arena_result": _ARENA_RESULT[rec["a_score"]],
+        "anomaly": None,
+        "pgn": str(chess.pgn.Game.from_board(board)),
+        "expand_depth_hist": expand_hist or [],
+        "game_idx": rec["game"],
+        "pair_idx": rec["pair"],
+        "white_ckpt_side": white,
+        "black_ckpt_side": black,
+        "elapsed_s": rec.get("elapsed_s"),
     }
 
 
-def _aggregate_results(games_log, half, args, sprt_info=None) -> dict:
-    wins_a = 0
-    wins_b = 0
-    draws = 0
-    for gd in games_log:
-        if gd["arena_result"] == 0:
-            wins_a += 1
-        elif gd["arena_result"] == 2:
-            wins_b += 1
-        else:
-            draws += 1
-    # 断言：W_A + W_B + D = N
-    assert wins_a + wins_b + draws == len(games_log), \
+def _aggregate_results(games_log, args, sprt_info=None) -> dict:
+    wins_a = sum(1 for g in games_log if g["arena_result"] == 0)
+    wins_b = sum(1 for g in games_log if g["arena_result"] == 2)
+    draws = len(games_log) - wins_a - wins_b
+    assert all(g["arena_result"] in (0, 1, 2) for g in games_log), \
         "Scoring invariant violated: W_A+W_B+D != N"
     score_a = wins_a + 0.5 * draws
-    term_counts = {}
+    term_counts: dict = {}
     for gd in games_log:
         t = gd["termination_reason"]
         term_counts[t] = term_counts.get(t, 0) + 1
     truncated = term_counts.get("truncated", 0)
     anomalies = sum(1 for g in games_log if g["anomaly"])
     # 实际不同对局数（g=0 下同开局+同颜色的对局逐字节重复）
-    fingerprints = [_pgn_fingerprint(g) for g in games_log]
-    distinct = len(set(fingerprints))
+    distinct = len({_pgn_fingerprint(g) for g in games_log})
     res = {
         "ckpt_a": args.ckpt_a, "ckpt_b": args.ckpt_b,
         "c_visit": args.c_visit, "c_scale_a": args.c_scale_a, "c_scale_b": args.c_scale_b,
@@ -447,801 +228,123 @@ def _aggregate_results(games_log, half, args, sprt_info=None) -> dict:
     return res
 
 
-# ---- 独立工作进程（多进程并行评测）----
+def _read_kit_games(path: str) -> list:
+    games = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                rec = json.loads(line)
+                if rec.get("type") == "game":
+                    games.append(rec)
+    return sorted(games, key=lambda r: r["game"])
 
-def _worker_process_fn(
-    worker_id: int,
-    assigned_pairs: list[tuple[int, int, str]],  # [(pair_idx, opening_id, opening_san), ...]
-    args: argparse.Namespace,
-    result_queue: mp.Queue,
-    stop_event: mp.Event,
-):
-    """Worker process:
-    - Loads model_a and model_b in its own process/context
-    - Plays assigned opening pairs (2 games each: A-W/B-B and B-W/A-B)
-    - Puts played pairs onto result_queue
-    - Listens to stop_event (e.g. for SPRT early stopping)
-    """
+
+def _compare_models(ckpt_a: str, ckpt_b: str) -> dict:
+    """双方参数标识 + 初始局面前向比较（模型是否真的不同）。比较完即释放显存。"""
+    import torch
+
+    from stateseq import kit_adapter as ka
+
+    ids, outs = {}, {}
+    for side, path in (("a", ckpt_a), ("b", ckpt_b)):
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+        ids[side] = _model_id(ck.get("model", ck))
+        ev = ka.SsmEvaluator.from_checkpoint(path, "cuda")
+        payload = ka.encode_payload(chess.Board(), 0, ev.initial_cache())
+        (logits, wdl, _), = ev.evaluate([payload])
+        p = np.exp(logits - logits.max())
+        outs[side] = (p / p.sum(), wdl)
+        del ev
+    torch.cuda.empty_cache()
+    policy_diff = float(np.max(np.abs(outs["a"][0] - outs["b"][0])))
+    wdl_diff = float(np.max(np.abs(outs["a"][1] - outs["b"][1])))
+    return {"a": {"hash": ids["a"]}, "b": {"hash": ids["b"]}, "same_hash": ids["a"] == ids["b"],
+            "forward_comparison": {"max_policy_prob_diff": policy_diff,
+                                   "max_wdl_diff": wdl_diff,
+                                   "models_differ_functionally": policy_diff > 1e-6}}
+
+
+def engine_spec(ckpt: str, label: str, args, c_scale: float) -> EngineSpec:
+    return EngineSpec(factory=FACTORY, root=HERE, label=label,
+                      kwargs={"checkpoint": os.path.abspath(ckpt), "name": label,
+                              "simulations": args.n_sims, "m0": args.m0, "g": 0.0,
+                              "c_visit": args.c_visit, "c_scale": c_scale})
+
+
+def run_arena(args) -> tuple[list, dict | None, dict]:
+    """跑评测 → (games_log, sprt_info, kit 汇总)。"""
+    os.makedirs(args.out, exist_ok=True)
+    openings = resolve_openings(args.openings_file, args.out)
+    num_pairs = args.games // 2
+    book = OpeningBook.from_file(openings)
+    plan = book.plan(num_pairs, args.seed)
+    opening_ids = {p: int(i) for p, (i, _) in enumerate(plan)}
+    if num_pairs > len(book):
+        print(f"[warn] 对数 {num_pairs} > 开局数 {len(book)}：开局必然重复，"
+              f"g=0 下同开局 pair 的对局逐字节相同，统计功效被稀释", flush=True)
+    print(f"[openings] 库规模 {len(book)}，对数 {num_pairs}，"
+          f"实际不同对局数 {len(set(opening_ids.values())) * 2}", flush=True)
+
+    sprt = (SprtConfig(elo0=0.0, elo1=SPRT_ELO1, alpha=args.sprt_alpha, beta=args.sprt_beta,
+                       min_pairs=max(1, args.sprt_min_games // 2)) if args.sprt else None)
+    cfg = MatchConfig(pairs=num_pairs, seed=args.seed, max_plies=args.max_plies,
+                      concurrency=args.concurrency, openings=openings, sprt=sprt,
+                      workers=max(1, args.workers), max_plies_after_opening=True)
+    spec_a = engine_spec(args.ckpt_a, "A", args, args.c_scale_a)
+    spec_b = engine_spec(args.ckpt_b, "B", args, args.c_scale_b)
+
+    kit_path = os.path.join(args.out, "kit_results.jsonl")
+    hist_path = os.path.join(args.out, "expand_hist.jsonl")
+    done_hists: dict = {}
+    if os.path.exists(kit_path) and os.path.exists(hist_path):
+        with open(hist_path, encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    row = json.loads(line)
+                    done_hists[row["game"]] = row["hist"]
+    hist_fh = open(hist_path, "a" if os.path.exists(kit_path) else "w", encoding="utf-8")
+    hists: dict = {}
+
+    def observer(ev: dict) -> None:
+        if ev.get("type") == "move":
+            h = (ev.get("info") or {}).get("expand_hist")
+            if h:
+                hists[ev["game"]] = hist_merge(hists.get(ev["game"], []), h)
+
+    t0 = time.time()
+
+    def progress(rec: dict, records: list) -> None:
+        # 多进程时 worker 的逐步事件先于该局结果到达（同一队列），此时该局直方图已完整
+        h = hists.pop(rec["game"], [])
+        done_hists[rec["game"]] = h
+        hist_fh.write(json.dumps({"game": rec["game"], "hist": h}) + "\n")
+        hist_fh.flush()
+        n = len(records)
+        if n % 8 == 0 or n == 2 * num_pairs:
+            w = sum(1 for r in records if r["a_score"] == 1.0)
+            lo = sum(1 for r in records if r["a_score"] == 0.0)
+            print("  [%.0fs] games %d/%d  A +%d =%d -%d" % (time.time() - t0, n, 2 * num_pairs,
+                                                            w, n - w - lo, lo), flush=True)
+
     try:
-        model_a = ArenaModel(args.ckpt_a)
-        model_b = ArenaModel(args.ckpt_b)
-        model_a.c_visit = model_b.c_visit = args.c_visit
-        model_a.c_scale = args.c_scale_a
-        model_b.c_scale = args.c_scale_b
-
-        cfg = lambda: None
-        cfg.n_sims = args.n_sims
-        cfg.m0 = args.m0
-        cfg.max_plies = args.max_plies
-        cfg.c_visit = args.c_visit
-        cfg.c_scale = C_SCALE
-
-        for pair_idx, oi, opening_san in assigned_pairs:
-            if stop_event.is_set():
-                break
-
-            # 局 1: A 白 B 黑
-            g1_idx = pair_idx * 2
-            seed_1 = args.seed + worker_id * 1000 + g1_idx
-            gd1 = play_one_game(model_a, model_b, cfg, opening_san=opening_san, opening_id=oi, seed=seed_1)
-            gd1["game_idx"] = g1_idx
-            gd1["pair_idx"] = pair_idx
-            gd1["white_ckpt_side"] = "A"
-            gd1["black_ckpt_side"] = "B"
-            gd1["worker_id"] = worker_id
-
-            if stop_event.is_set():
-                result_queue.put(("game_pair", (pair_idx, [gd1])))
-                break
-
-            # 局 2: B 白 A 黑
-            g2_idx = pair_idx * 2 + 1
-            seed_2 = args.seed + worker_id * 1000 + g2_idx
-            gd2 = play_one_game(model_b, model_a, cfg, opening_san=opening_san, opening_id=oi, seed=seed_2)
-            r2 = gd2["arena_result"]
-            gd2["arena_result"] = 0 if r2 == 2 else 2 if r2 == 0 else 1
-            gd2["game_idx"] = g2_idx
-            gd2["pair_idx"] = pair_idx
-            gd2["white_ckpt_side"] = "B"
-            gd2["black_ckpt_side"] = "A"
-            gd2["worker_id"] = worker_id
-
-            result_queue.put(("game_pair", (pair_idx, [gd1, gd2])))
-
-        result_queue.put(("worker_done", worker_id))
-    except Exception as e:
-        import traceback
-        result_queue.put(("worker_error", (worker_id, str(e), traceback.format_exc())))
-
-
-def run_parallel_arena(args: argparse.Namespace, num_pairs: int, openings: list[tuple[int, str]], t0: float) -> tuple[list[dict], dict | None]:
-    """多进程执行 arena 对弈并支持渐进式 SPRT 检查。"""
-    n_workers = min(args.workers, num_pairs)
-    # 按 round-robin 分配 pairs 给 workers
-    worker_pairs: list[list[tuple[int, int, str]]] = [[] for _ in range(n_workers)]
-    for pair_idx in range(num_pairs):
-        oi, opening_san = openings[pair_idx]
-        worker_pairs[pair_idx % n_workers].append((pair_idx, oi, opening_san))
-
-    ctx = mp.get_context("spawn")
-    result_queue = ctx.Queue()
-    stop_event = ctx.Event()
-
-    workers = []
-    for wid in range(n_workers):
-        p = ctx.Process(
-            target=_worker_process_fn,
-            args=(wid, worker_pairs[wid], args, result_queue, stop_event),
-            daemon=True,
-        )
-        p.start()
-        p._arena_done = False  # 收到 worker_done/worker_error 后置 True
-        workers.append(p)
-        print(f"[worker {wid}] 启动 pid={p.pid} pairs={len(worker_pairs[wid])}", flush=True)
-
-    # SPRT 参数与阈值
-    p0, p1 = 0.50, 0.55
-    bound_b = math.log(args.sprt_beta / (1.0 - args.sprt_alpha))
-    log_p1_p0 = math.log(p1 / p0)
-    log_1p1_1p0 = math.log((1.0 - p1) / (1.0 - p0))
-
-    received_pairs: dict[int, list[dict]] = {}
-    completed_workers = 0
+        summary = run_match(cfg, spec_a=spec_a, spec_b=spec_b, out_path=kit_path,
+                            progress=progress, observer=observer)
+    finally:
+        hist_fh.close()
+    ckpts = {"A": args.ckpt_a, "B": args.ckpt_b}
+    games_log = [game_dict(r, ckpts, opening_ids, done_hists.get(r["game"]))
+                 for r in _read_kit_games(kit_path)]
     sprt_info = None
-
-    while completed_workers < n_workers:
-        try:
-            msg_type, payload = result_queue.get(timeout=1.0)
-        except Exception:
-            # 队列空闲：只统计"已宣告结束"（worker_done / worker_error）的 worker。
-            # 不能用进程 is_alive() 判定完成——外部 pkill 或静默崩溃时会把仍在上工的
-            # worker 误判为已完成而提前 break，丢掉其余对局（32/64 局事故的根因）。
-            dead_silent = [i for i, p in enumerate(workers)
-                           if not p.is_alive() and not getattr(p, "_arena_done", False)]
-            if dead_silent:
-                stop_event.set()
-                raise RuntimeError(
-                    f"worker {dead_silent} 未宣告结束即退出（被外部杀死或静默崩溃）；"
-                    f"已收 {len(received_pairs)}/{num_pairs} 对，结果不完整不予采信")
-            if completed_workers >= n_workers:
-                while not result_queue.empty():
-                    try:
-                        msg_type, payload = result_queue.get_nowait()
-                        if msg_type == "game_pair":
-                            pair_idx, games = payload
-                            if pair_idx not in received_pairs:
-                                received_pairs[pair_idx] = games
-                    except Exception:
-                        break
-                break
-            continue
-
-        if msg_type == "game_pair":
-            pair_idx, games = payload
-            received_pairs[pair_idx] = games
-            total_games_so_far = sum(len(g) for g in received_pairs.values())
-            if len(received_pairs) % 4 == 0 or len(received_pairs) == num_pairs:
-                print("  [%.0fs] games %d/%d (pair %d/%d)" % (
-                    time.time() - t0, total_games_so_far, args.games, len(received_pairs), num_pairs), flush=True)
-
-            if args.sprt and total_games_so_far >= args.sprt_min_games and total_games_so_far < args.games and not stop_event.is_set():
-                all_current_games = []
-                for p_idx in sorted(received_pairs.keys()):
-                    all_current_games.extend(received_pairs[p_idx])
-                current_n = len(all_current_games)
-                s_a = sum(1.0 if g["arena_result"] == 0 else 0.5 if g["arena_result"] == 1 else 0.0
-                          for g in all_current_games)
-                llr = s_a * log_p1_p0 + (current_n - s_a) * log_1p1_1p0
-                if llr <= bound_b:
-                    saved_games = args.games - current_n
-                    saved_pct = saved_games / args.games * 100.0
-                    stop_event.set()
-                    sprt_info = {
-                        "early_stopped": True,
-                        "stop_reason": "sprt_reject_h1",
-                        "llr": float(llr),
-                        "llr_bound": float(bound_b),
-                        "alpha": float(args.sprt_alpha),
-                        "beta": float(args.sprt_beta),
-                        "p0": float(p0),
-                        "p1": float(p1),
-                        "games_played": current_n,
-                        "games_planned": args.games,
-                        "compute_saved_games": saved_games,
-                        "compute_saved_percent": saved_pct,
-                    }
-                    print(f"\n[SPRT Early Stop Triggered] LLR={llr:.3f} <= bound={bound_b:.3f} at game {current_n}/{args.games}", flush=True)
-                    print(f"Candidate rejected early. Compute saved: {saved_games} games ({saved_pct:.1f}%)\n", flush=True)
-
-        elif msg_type == "worker_done":
-            completed_workers += 1
-            # payload = worker_id（进程列表下标）；标记为"已宣告结束"
-            if isinstance(payload, int) and 0 <= payload < len(workers):
-                workers[payload]._arena_done = True
-        elif msg_type == "worker_error":
-            wid, err_str, tb_str = payload
-            stop_event.set()
-            if isinstance(wid, int) and 0 <= wid < len(workers):
-                workers[wid]._arena_done = True
-            print(f"[worker {wid} ERROR]: {err_str}\n{tb_str}", file=sys.stderr, flush=True)
-            raise RuntimeError(f"Worker {wid} failed with error: {err_str}")
-
-    if stop_event.is_set():
-        # 给 workers 一点时间退出并收集剩余入队数据
-        time.sleep(0.5)
-        while not result_queue.empty():
-            try:
-                msg_type, payload = result_queue.get_nowait()
-                if msg_type == "game_pair":
-                    pair_idx, games = payload
-                    if pair_idx not in received_pairs:
-                        received_pairs[pair_idx] = games
-            except Exception:
-                break
-
-    for p in workers:
-        p.join(timeout=5.0)
-
-    all_games_log = []
-    current_game_idx = 0
-    for p_idx in sorted(received_pairs.keys()):
-        for gd in received_pairs[p_idx]:
-            gd["game_idx"] = current_game_idx
-            current_game_idx += 1
-            all_games_log.append(gd)
-
-    return all_games_log, sprt_info
-
-
-# ---- 批量推理 arena（单进程跨局攒批）----
-#
-# 动机：原 play_one_game 用同步递归搜索，每次模型前向 batch=1（~2k 前向/秒/进程），
-# 256 sims 下 64 局需 ~3.7 小时、400 局换代门槛需 ~23 小时，不可用。
-# 本模式把对局改成生成器协程（与 ssm_gumbel_selfplay.py 的 Driver 同机制）：
-# 任一局需要前向时 yield (模型槽位, 特征, tc, elo, color, cache)，驱动器把同一模型的
-# 请求拼成 batch 一次性上 GPU——batch≈并发局数，吞吐提升到 ~15-20k 前向/秒。
-# 算法与原版逐条对应：双方模型每 ply 各进一步、occurrence 全局面共享、
-# encode-before-move、开局 SAN 步进、g=0 确定性搜索、终局裁决共用 classify_final_board。
-
-
-def _concat_caches(caches: list) -> list:
-    """把 N 份 batch=1 的 Cache 沿 batch 维拼成一份 batch=N。"""
-    n_layers = len(caches[0])
-    out = []
-    for li in range(n_layers):
-        conv = torch.cat([c[li][0] for c in caches], dim=0)
-        ssm = torch.cat([c[li][1] for c in caches], dim=0)
-        out.append((conv, ssm))
-    return out
-
-
-def _split_cache(cache: list, n: int) -> list:
-    """把 batch=N 的 Cache 拆回 N 份 batch=1（model_r.step 内部会 clone）。"""
-    out = [[] for _ in range(n)]
-    for conv, ssm in cache:
-        for i in range(n):
-            out[i].append((conv[i:i + 1], ssm[i:i + 1]))
-    return out
-
-
-class BatchedArenaGame:
-    """一局对弈协程：双方模型各自维护 R cache，每 ply 双方各进一步，行棋方搜索。
-
-    与原 ``play_one_game`` 的语义逐条对应，唯一差别是搜索改为生成器形式以便跨局攒批。
-    ``models`` 为 [wrapperA, wrapperB]；``a_is_white`` 决定哪方执白。
-    """
-
-    def __init__(self, game_idx: int, pair_idx: int, models: list, a_is_white: bool, cfg,
-                 opening_san: str, opening_id: int, seed: int):
-        self.game_idx = game_idx
-        self.pair_idx = pair_idx
-        self.models = models                      # [A, B]
-        self.cfg = cfg
-        self.opening_san = opening_san
-        self.opening_id = opening_id
-        self.seed = seed
-        self.board = chess.Board()
-        self.occurrence: dict = {}
-        self.actions: list[int] = []
-        # 执子方 → 模型槽位 / σ 常数（σ 绑定模型侧，支持 A/B 不同 c_scale 对照）
-        self.slot = {chess.WHITE: 0 if a_is_white else 1,
-                     chess.BLACK: 1 if a_is_white else 0}
-        self.caches = {side: models[self.slot[side]].initial_cache(1) for side in self.slot}
-        self.scales = {side: (getattr(models[self.slot[side]], "c_visit", cfg.c_visit),
-                              getattr(models[self.slot[side]], "c_scale", cfg.c_scale))
-                       for side in self.slot}
-        self.rng = np.random.default_rng(seed)
-        self.anomaly = None
-        self.expand_hist: list[int] = []  # 扩展深度直方图（P3 埋点）
-
-    # ---- 前向请求：当前局面双方模型各进一步 ----
-
-    def _advance_both(self):
-        board = self.board
-        key = _board_key(board)
-        occ = self.occurrence.get(key, 0)
-        feats, tc_val, elo_std, color = encode_board(board, occ)
-        feats_np = np.asarray(feats, dtype=np.float32).reshape(-1)
-        mover_logits = None
-        mover_wdl = None
-        for side in (chess.WHITE, chess.BLACK):
-            slot = self.slot[side]
-            lg, wd, _mlh, _x, cache_new = yield (
-                slot, feats_np, int(tc_val), float(elo_std), int(color), self.caches[side])
-            self.caches[side] = cache_new
-            if side == board.turn:
-                mover_logits, mover_wdl = lg, wd
-        self.occurrence[key] = occ + 1
-        return mover_logits, mover_wdl
-
-    # ---- 搜索：顺序减半（g=0），展开走本方根快照路径重算 ----
-
-    def _expand_gen(self, node: Node, action: int, side):
-        hist_add(self.expand_hist, node.depth + 1)
-        board = self.board.copy()
-        cache = clone_cache(self.caches[side])
-        occ = dict(self.occurrence)
-        slot = self.slot[side]
-        new_path = node.path + (action,)
-        for a in node.path:
-            mv = _resolve_move(a, board)
-            if mv is None:
-                raise RuntimeError(f"路径重放动作 {a} 在 {board.fen()} 上不合法")
-            board.push(mv)
-            key = _board_key(board)
-            feats, tc_val, elo_std, color = encode_board(board, occ.get(key, 0))
-            _, _, _, _, cache = yield (
-                slot, np.asarray(feats, dtype=np.float32).reshape(-1),
-                int(tc_val), float(elo_std), int(color), cache)
-            occ[key] = occ.get(key, 0) + 1
-        mv = _resolve_move(action, board)
-        if mv is None:
-            raise RuntimeError(f"动作 {action} 在 {board.fen()} 上不合法")
-        board.push(mv)
-        if board.is_game_over(claim_draw=True) or not list(board.legal_moves):
-            return Node(np.array([], dtype=np.int64), np.array([], dtype=np.float32),
-                        get_terminal_q(board), depth=node.depth + 1, action=action,
-                        path=new_path, terminal=True)
-        key = _board_key(board)
-        feats, tc_val, elo_std, color = encode_board(board, occ.get(key, 0))
-        lc, wc, _, _, _ = yield (
-            slot, np.asarray(feats, dtype=np.float32).reshape(-1),
-            int(tc_val), float(elo_std), int(color), cache)
-        occ[key] = occ.get(key, 0) + 1
-        q_c = wdl_logits_to_q(wc)
-        legal_c = _legal_actions_of(board)
-        lc_np = lc
-        lc_masked = np.full(1936, -3e4, dtype=np.float32)
-        lc_masked[legal_c] = lc_np[legal_c]
-        return Node(np.array(legal_c, dtype=np.int64),
-                    lc_masked[np.array(legal_c)].astype(np.float32),
-                    q_c, depth=node.depth + 1, action=action, path=new_path)
-
-    def _simulate_gen(self, node: Node, side):
-        if node.is_terminal:
-            return float(node.q)
-        c_visit, c_scale = self.scales[side]
-        a = select_action(node, c_visit, c_scale)
-        edge_idx = int(np.flatnonzero(node.legal == a)[0])
-        key = int(a)
-        child = node.children.get(key)
-        if child is None:
-            child = yield from self._expand_gen(node, a, side)
-            node.children[key] = child
-            val = -float(child.q)
-        else:
-            val = -(yield from self._simulate_gen(child, side))
-        node.record_child(edge_idx, val)
-        return val
-
-    def _order_halving_gen(self, root: Node, side):
-        cfg = self.cfg
-        if root.is_terminal:
-            return None
-        c_visit, c_scale = self.scales[side]
-        m0 = min(cfg.m0, len(root.legal))
-        cands = gumbel_topm(root, m0=m0, rng=self.rng, g=0.0)
-        m = len(cands)
-        rounds = _n_rounds(m)
-        surv = [_Candidate(action=a, noise=ns) for a, ns in cands]
-        base, rem = divmod(cfg.n_sims, rounds)
-        budget_per_round = [base + (1 if i < rem else 0) for i in range(rounds)]
-
-        def do_sim_root(c: _Candidate):
-            if c.child is None:
-                child = yield from self._expand_gen(root, c.action, side)
-                c.child = child
-                val = -float(child.q)
-            elif c.child.is_terminal:
-                val = -float(c.child.q)
-            else:
-                val = -(yield from self._simulate_gen(c.child, side))
-            idx = int(np.flatnonzero(root.legal == c.action)[0])
-            root.record_child(idx, val)
-
-        sims_used = 0
-        for r, budget in enumerate(budget_per_round):
-            if len(surv) == 1:
-                budget = sum(budget_per_round[r:])
-            per_base, per_rem = divmod(budget, len(surv))
-            for i, c in enumerate(surv):
-                k = per_base + (1 if i < per_rem else 0)
-                for _ in range(k):
-                    yield from do_sim_root(c)
-                    sims_used += 1
-            if len(surv) == 1:
-                break
-            l_root = {int(a): float(x) for a, x in zip(root.legal, root.logits)}
-            s_root_vals = qtransform_completed(root, c_visit, c_scale)
-            s_map = {int(a): float(x) for a, x in zip(root.legal, s_root_vals)}
-            scored = sorted(((c.noise + l_root[c.action] + s_map[c.action], c) for c in surv),
-                            key=lambda t: -t[0])
-            keep = max(1, (len(surv) + 1) // 2)
-            surv = [c for _, c in scored[:keep]]
-        return int(surv[0].action)
-
-    # ---- 主流程 ----
-
-    def run(self):
-        cfg = self.cfg
-        board = self.board
-
-        if self.opening_san:
-            for token in self.opening_san.split():
-                if board.is_game_over(claim_draw=True):
-                    break
-                yield from self._advance_both()
-                board.push_san(token)
-
-        for _ply in range(cfg.max_plies):
-            if board.is_game_over(claim_draw=True):
-                break
-            turn = board.turn
-            logits_np, wdl_np = yield from self._advance_both()
-            legal_actions = _legal_actions_of(board)
-            if not legal_actions:
-                break
-            q_root = wdl_logits_to_q(wdl_np)
-            legal_arr = np.array(legal_actions, dtype=np.int64)
-            logits_legal = logits_np[legal_arr].astype(np.float32)
-            root = Node(legal=legal_arr.copy(), logits=logits_legal.copy(), q=q_root)
-
-            chosen = yield from self._order_halving_gen(root, turn)
-            if chosen is None:
-                self.anomaly = "order_halving returned None"
-                break
-            self.actions.append(int(chosen))
-            mv = _resolve_move(chosen, board)
-            if mv is None:
-                self.anomaly = f"chosen action resolves to None: {chosen}"
-                break
-            board.push(mv)
-
-        our_result, term_reason, is_truncated = classify_final_board(board)
-        result_str = _result_str(board)
-        game_pgn = chess.pgn.Game.from_board(board)
-        return {
-            "opening_id": self.opening_id,
-            "seed": self.seed,
-            "ckpt_white": self.models[self.slot[chess.WHITE]].ckpt_path,
-            "ckpt_black": self.models[self.slot[chess.BLACK]].ckpt_path,
-            "n_plies": len(self.actions),
-            "termination_reason": term_reason,
-            "is_truncated": is_truncated,
-            "board_result": result_str,
-            "arena_result": our_result,
-            "anomaly": self.anomaly,
-            "pgn": str(game_pgn) if game_pgn is not None else "",
-            "expand_depth_hist": self.expand_hist,
-        }
-
-
-class BatchedArenaDriver:
-    """跨局攒批驱动器：并发跑 N 局协程，按模型槽位分组批处理前向。"""
-
-    def __init__(self, games: list[BatchedArenaGame], concurrency: int, args,
-                 progress_every: int = 8, internal_sprt: bool = True, stop_check=None):
-        self.games = games
-        self.concurrency = max(1, concurrency)
-        self.args = args
-        self.progress_every = progress_every
-        self.internal_sprt = internal_sprt
-        self.stop_check = stop_check  # 外部早停信号（父进程 SPRT），None=不检查
-        self.results: list[dict] = []
-        self.sprt_info = None
-        self.t0 = time.time()
-        self.n_forwards = 0
-        self.n_plies = 0
-        # SPRT 参数（H0: p<=0.50 vs H1: p>=0.55；候选为 A）
-        self._p0, self._p1 = 0.50, 0.55
-        self._bound_b = math.log(args.sprt_beta / (1.0 - args.sprt_alpha))
-        self._log_p1_p0 = math.log(self._p1 / self._p0)
-        self._log_1p1_1p0 = math.log((1.0 - self._p1) / (1.0 - self._p0))
-        self._pairs_done = 0
-        self._num_pairs = max(1, len(games) // 2)
-        self._stop_queue = False
-
-    def _model_step(self, reqs: list):
-        """reqs: [(game, (slot, feats, tc, elo, color, cache)] → [(game, result)]（同序）。"""
-        self.n_forwards += len(reqs)
-        groups: dict[int, list[int]] = {}
-        for idx, (_game, req) in enumerate(reqs):
-            groups.setdefault(req[0], []).append(idx)
-        out: list = [None] * len(reqs)
-        for slot, idxs in groups.items():
-            model = reqs[idxs[0]][0].models[slot]
-            feats = np.stack([reqs[i][1][1] for i in idxs]).astype(np.float32)
-            tc = [reqs[i][1][2] for i in idxs]
-            elo = [reqs[i][1][3] for i in idxs]
-            color = [reqs[i][1][4] for i in idxs]
-            cache = _concat_caches([reqs[i][1][5] for i in idxs])
-            logits, wdl, mlh, x, cache_new = model.step(feats, tc, elo, color, cache)
-            caches = _split_cache(cache_new, len(idxs))
-            for j, i in enumerate(idxs):
-                out[i] = (reqs[i][0], (logits[j], wdl[j],
-                                       None if mlh is None else mlh[j],
-                                       None if x is None else x[j], caches[j]))
-        return out
-
-    def _sprt_check(self) -> None:
-        """成对边界处检查 Wald 早停（候选落后则拒绝 H1，省算力）。"""
-        if not self.internal_sprt or not self.args.sprt or self.sprt_info is not None:
-            return
-        n = len(self.results)
-        if n < self.args.sprt_min_games or n >= self.args.games:
-            return
-        s_a = sum(1.0 if g["arena_result"] == 0 else 0.5 if g["arena_result"] == 1 else 0.0
-                  for g in self.results)
-        llr = s_a * self._log_p1_p0 + (n - s_a) * self._log_1p1_1p0
-        if llr <= self._bound_b:
-            saved = self.args.games - n
-            self.sprt_info = {
-                "early_stopped": True,
-                "stop_reason": "sprt_reject_h1",
-                "llr": float(llr),
-                "llr_bound": float(self._bound_b),
-                "alpha": self.args.sprt_alpha,
-                "beta": self.args.sprt_beta,
-                "p0": self._p0,
-                "p1": self._p1,
-                "games_played": n,
-                "games_planned": self.args.games,
-                "compute_saved_games": saved,
-                "compute_saved_percent": saved / self.args.games * 100,
-            }
-            self._stop_queue = True
-            print(f"\n[SPRT Early Stop] LLR={llr:.3f} <= bound={self._bound_b:.3f} at game "
-                  f"{n}/{self.args.games}；候选被拒，省 {saved} 局\n", flush=True)
-
-    def _finish(self, game: BatchedArenaGame, gd: dict) -> None:
-        gd["game_idx"] = len(self.results)
-        self.n_plies += int(gd.get("n_plies", 0))
-        gd["pair_idx"] = game.pair_idx
-        gd["white_ckpt_side"] = "A" if game.slot[chess.WHITE] == 0 else "B"
-        gd["black_ckpt_side"] = "B" if game.slot[chess.WHITE] == 0 else "A"
-        if gd["white_ckpt_side"] == "B":
-            r = gd["arena_result"]
-            gd["arena_result"] = 0 if r == 2 else 2 if r == 0 else 1
-        self.results.append(gd)
-        if gd["pair_idx"] == self._pairs_done:
-            self._pairs_done += 1
-            self._sprt_check()
-        n = len(self.results)
-        if n % self.progress_every == 0 or n == len(self.games):
-            print("  [%.0fs] games %d/%d (pair %d/%d)" % (
-                time.time() - self.t0, n, len(self.games), self._pairs_done, self._num_pairs),
-                flush=True)
-
-    def _start_slot(self, i: int, queue: list) -> None:
-        if self._stop_queue or (self.stop_check is not None and self.stop_check()):
-            self.slots[i] = None
-            return
-        while queue and not self._stop_queue:
-            game = queue.pop(0)
-            gen = game.run()
-            try:
-                req = gen.send(None)
-            except StopIteration as e:
-                self._finish(game, e.value)
-                continue
-            self.slots[i] = {"game": game, "gen": gen, "req": req}
-            return
-        self.slots[i] = None
-
-    def run(self) -> None:
-        queue = list(self.games)
-        self.slots: list = [None] * self.concurrency
-        for i in range(self.concurrency):
-            self._start_slot(i, queue)
-        while True:
-            active = [(i, s) for i, s in enumerate(self.slots) if s is not None]
-            if not active:
-                break
-            reqs = [(s["game"], s["req"]) for _i, s in active]
-            results = self._model_step(reqs)
-            for (i, s), (game, result) in zip(active, results):
-                try:
-                    s["req"] = s["gen"].send(result)
-                except StopIteration as e:
-                    self._finish(game, e.value)
-                    self._start_slot(i, queue)
-        el = time.time() - self.t0
-        print("[driver] %d 局 %d ply %d 前向，%.0fs → %.2f ply/s，%.0f 前向/s，"
-              "%.0f 前向/ply" % (len(self.results), self.n_plies, self.n_forwards, el,
-                            self.n_plies / max(el, 1e-6), self.n_forwards / max(el, 1e-6),
-                            self.n_forwards / max(self.n_plies, 1)), flush=True)
-
-
-def run_batched_arena(args: argparse.Namespace, num_pairs: int, openings: list[tuple[int, str]],
-                      t0: float, models: list | None = None) -> tuple[list[dict], dict | None]:
-    """单进程跨局攒批 arena：batch≈并发局数，替代 batch=1 的串行/多进程模式。"""
-    if models is None:
-        models = [ArenaModel(args.ckpt_a), ArenaModel(args.ckpt_b)]
-    models[0].c_visit = models[1].c_visit = args.c_visit
-    models[0].c_scale = args.c_scale_a
-    models[1].c_scale = args.c_scale_b
-
-    cfg = lambda: None
-    cfg.n_sims = args.n_sims
-    cfg.m0 = args.m0
-    cfg.max_plies = args.max_plies
-    cfg.c_visit = args.c_visit
-    cfg.c_scale = C_SCALE
-
-    games: list[BatchedArenaGame] = []
-    for pair_idx in range(num_pairs):
-        oi, opening_san = openings[pair_idx]
-        for a_is_white in (True, False):
-            games.append(BatchedArenaGame(
-                game_idx=len(games), pair_idx=pair_idx, models=models,
-                a_is_white=a_is_white, cfg=cfg, opening_san=opening_san,
-                opening_id=oi, seed=args.seed + len(games)))
-
-    driver = BatchedArenaDriver(games, concurrency=args.concurrency, args=args)
-    driver.run()
-    # 按 (pair, 局序) 排序输出：协程完成顺序不固定，排序后与串行模式的 games.jsonl 逐行可比
-    driver.results.sort(key=lambda g: (g["pair_idx"], 0 if g["white_ckpt_side"] == "A" else 1))
-    for i, gd in enumerate(driver.results):
-        gd["game_idx"] = i
-    return driver.results, driver.sprt_info
-
-
-# ---- 批量 + 多进程 arena（资源调度优化）----
-#
-# 单进程攒批的瓶颈在 Python 树逻辑（~400 节点/秒/核，GPU 常年空闲）；生成器的经验是
-# 多进程各自攒批才能同时喂满 GPU。因此批量模式同样支持 --workers N：N 个进程各自加载
-# 双模型、以 concurrency 局攒批跑分到的开局对，父进程收集结果并按成对边界做 SPRT。
-
-
-def _batched_worker_fn(worker_id: int, assigned_pairs: list[tuple[int, int, str]],
-                       args: argparse.Namespace, result_queue, stop_event) -> None:
-    try:
-        models = [ArenaModel(args.ckpt_a), ArenaModel(args.ckpt_b)]
-        models[0].c_visit = models[1].c_visit = args.c_visit
-        models[0].c_scale = args.c_scale_a
-        models[1].c_scale = args.c_scale_b
-
-        cfg = lambda: None
-        cfg.n_sims = args.n_sims
-        cfg.m0 = args.m0
-        cfg.max_plies = args.max_plies
-        cfg.c_visit = args.c_visit
-        cfg.c_scale = C_SCALE
-
-        # 该 worker 的全部对局放进同一个驱动器：批大小≈concurrency（不是每对 2 局）
-        games: list[BatchedArenaGame] = []
-        for pair_idx, oi, opening_san in assigned_pairs:
-            for a_is_white in (True, False):
-                games.append(BatchedArenaGame(
-                    game_idx=0, pair_idx=pair_idx, models=models, a_is_white=a_is_white,
-                    cfg=cfg, opening_san=opening_san, opening_id=oi,
-                    seed=args.seed + worker_id * 1000 + pair_idx * 2 + (0 if a_is_white else 1)))
-        driver = BatchedArenaDriver(games, concurrency=args.concurrency, args=args,
-                                    internal_sprt=False,
-                                    stop_check=lambda: stop_event.is_set(),
-                                    progress_every=4)
-        driver.run()
-
-        by_pair: dict[int, list[dict]] = {}
-        for gd in driver.results:
-            by_pair.setdefault(gd["pair_idx"], []).append(gd)
-        for pair_idx in sorted(by_pair):
-            gds = sorted(by_pair[pair_idx],
-                         key=lambda g: 0 if g["white_ckpt_side"] == "A" else 1)
-            for j, gd in enumerate(gds):
-                gd["game_idx"] = pair_idx * 2 + j
-                gd["worker_id"] = worker_id
-            result_queue.put(("game_pair", (pair_idx, gds)))
-        result_queue.put(("worker_done", worker_id))
-    except Exception as e:  # noqa: BLE001
-        import traceback
-        result_queue.put(("worker_error", (worker_id, str(e), traceback.format_exc())))
-
-
-def run_batched_parallel_arena(args: argparse.Namespace, num_pairs: int,
-                               openings: list[tuple[int, str]], t0: float) -> tuple[list[dict], dict | None]:
-    """批量 + 多进程：round-robin 分配开局对，父进程收集并按成对边界做 SPRT 早停。"""
-    n_workers = min(args.workers, num_pairs)
-    worker_pairs: list[list[tuple[int, int, str]]] = [[] for _ in range(n_workers)]
-    for pair_idx in range(num_pairs):
-        oi, opening_san = openings[pair_idx]
-        worker_pairs[pair_idx % n_workers].append((pair_idx, oi, opening_san))
-
-    ctx = mp.get_context("spawn")
-    result_queue = ctx.Queue()
-    stop_event = ctx.Event()
-    workers = []
-    for wid in range(n_workers):
-        p = ctx.Process(target=_batched_worker_fn,
-                        args=(wid, worker_pairs[wid], args, result_queue, stop_event),
-                        daemon=True)
-        p.start()
-        p._arena_done = False  # 收到 worker_done/worker_error 后置 True
-        workers.append(p)
-        print(f"[worker {wid}] 启动 pid={p.pid} pairs={len(worker_pairs[wid])}", flush=True)
-
-    p0, p1 = 0.50, 0.55
-    bound_b = math.log(args.sprt_beta / (1.0 - args.sprt_alpha))
-    log_p1_p0 = math.log(p1 / p0)
-    log_1p1_1p0 = math.log((1.0 - p1) / (1.0 - p0))
-
-    received_pairs: dict[int, list[dict]] = {}
-    completed_workers = 0
-    sprt_info = None
-
-    while completed_workers < n_workers:
-        try:
-            msg_type, payload = result_queue.get(timeout=1.0)
-        except Exception:
-            # 队列空闲：只统计"已宣告结束"（worker_done / worker_error）的 worker。
-            # 不能用进程 is_alive() 判定完成——外部 pkill 或静默崩溃时会把仍在上工的
-            # worker 误判为已完成而提前 break，丢掉其余对局（32/64 局事故的根因）。
-            dead_silent = [i for i, p in enumerate(workers)
-                           if not p.is_alive() and not getattr(p, "_arena_done", False)]
-            if dead_silent:
-                stop_event.set()
-                raise RuntimeError(
-                    f"worker {dead_silent} 未宣告结束即退出（被外部杀死或静默崩溃）；"
-                    f"已收 {len(received_pairs)}/{num_pairs} 对，结果不完整不予采信")
-            if completed_workers >= n_workers:
-                while not result_queue.empty():
-                    try:
-                        msg_type, payload = result_queue.get_nowait()
-                        if msg_type == "game_pair":
-                            pair_idx, games = payload
-                            if pair_idx not in received_pairs:
-                                received_pairs[pair_idx] = games
-                    except Exception:
-                        break
-                break
-            continue
-
-        if msg_type == "game_pair":
-            pair_idx, games = payload
-            received_pairs[pair_idx] = games
-            total_games_so_far = sum(len(g) for g in received_pairs.values())
-            if len(received_pairs) % 4 == 0 or len(received_pairs) == num_pairs:
-                print("  [%.0fs] games %d/%d (pair %d/%d)" % (
-                    time.time() - t0, total_games_so_far, args.games,
-                    len(received_pairs), num_pairs), flush=True)
-            if (args.sprt and total_games_so_far >= args.sprt_min_games
-                    and total_games_so_far < args.games and not stop_event.is_set()):
-                all_current = []
-                for p_idx in sorted(received_pairs.keys()):
-                    all_current.extend(received_pairs[p_idx])
-                cur_n = len(all_current)
-                s_a = sum(1.0 if g["arena_result"] == 0 else 0.5 if g["arena_result"] == 1 else 0.0
-                          for g in all_current)
-                llr = s_a * log_p1_p0 + (cur_n - s_a) * log_1p1_1p0
-                if llr <= bound_b:
-                    saved_games = args.games - cur_n
-                    sprt_info = {
-                        "early_stopped": True, "stop_reason": "sprt_reject_h1",
-                        "llr": float(llr), "llr_bound": float(bound_b),
-                        "alpha": args.sprt_alpha, "beta": args.sprt_beta,
-                        "p0": p0, "p1": p1, "games_played": cur_n,
-                        "games_planned": args.games, "compute_saved_games": saved_games,
-                        "compute_saved_percent": saved_games / args.games * 100,
-                    }
-                    stop_event.set()
-                    print(f"\n[SPRT Early Stop Triggered] LLR={llr:.3f} <= bound={bound_b:.3f} "
-                          f"at game {cur_n}/{args.games}", flush=True)
-                    print(f"Candidate rejected early. Compute saved: {saved_games} games "
-                          f"({saved_games / args.games * 100:.1f}%)\n", flush=True)
-        elif msg_type == "worker_done":
-            completed_workers += 1
-            # payload = worker_id（进程列表下标）；标记为"已宣告结束"
-            if isinstance(payload, int) and 0 <= payload < len(workers):
-                workers[payload]._arena_done = True
-        elif msg_type == "worker_error":
-            wid, err_str, tb_str = payload
-            stop_event.set()
-            if isinstance(wid, int) and 0 <= wid < len(workers):
-                workers[wid]._arena_done = True
-            print(f"[worker {wid} ERROR]: {err_str}\n{tb_str}", file=sys.stderr, flush=True)
-            raise RuntimeError(f"Worker {wid} failed with error: {err_str}")
-
-    if stop_event.is_set():
-        time.sleep(0.5)
-        while not result_queue.empty():
-            try:
-                msg_type, payload = result_queue.get_nowait()
-                if msg_type == "game_pair":
-                    pair_idx, games = payload
-                    if pair_idx not in received_pairs:
-                        received_pairs[pair_idx] = games
-            except Exception:
-                break
-
-    for p in workers:
-        p.join(timeout=5.0)
-
-    all_games_log = []
-    for p_idx in sorted(received_pairs.keys()):
-        all_games_log.extend(received_pairs[p_idx])
-    for i, gd in enumerate(all_games_log):
-        gd["game_idx"] = i
-    return all_games_log, sprt_info
+    if "sprt" in summary:
+        s = summary["sprt"]
+        played = len(games_log)
+        sprt_info = {**s, "early_stopped": bool(summary.get("stopped_by_sprt")),
+                     "stop_reason": s.get("verdict"), "games_played": played,
+                     "games_planned": 2 * num_pairs,
+                     "compute_saved_games": 2 * num_pairs - played,
+                     "compute_saved_percent": (2 * num_pairs - played) / (2 * num_pairs) * 100.0}
+    return games_log, sprt_info, summary
 
 
 def main():
@@ -1253,207 +356,62 @@ def main():
     ap.add_argument("--pairs", type=int, default=8,
                     help="已废弃：曾误用于裁剪开局数（64 局实际只跑出 16 个不同对局）；"
                          "开局多样性由 --openings-file 决定")
-    ap.add_argument("--openings-file", default="data/openings_200.txt",
-                    help="开局库文件（每行一条 SAN 序列）；留空则用内置 16 条。"
+    ap.add_argument("--openings-file", default=os.path.join(HERE, "data", "openings_200.txt"),
+                    help="开局库文件（每行一条 SAN/UCI 序列）；留空或缺失则用内置 16 条。"
                          "g=0 的 arena 无随机性，开局多样性是对局多样性唯一来源")
     ap.add_argument("--n_sims", type=int, default=256)
     ap.add_argument("--m0", type=int, default=16)
-    ap.add_argument("--max_plies", type=int, default=300)
+    ap.add_argument("--max_plies", type=int, default=300, help="开局之后的 ply 上限")
     ap.add_argument("--seed", type=int, default=20260917)
-    ap.add_argument("--workers", type=int, default=1, help="并行工作进程数（默认 1：串行运行）")
+    ap.add_argument("--workers", type=int, default=1, help="并行工作进程数（每进程各自攒批）")
     ap.add_argument("--batched", action="store_true",
-                    help="跨局攒批模式（推荐）：每进程并发多局、前向按模型槽位拼批；"
-                         "配合 --workers N 做多进程×进程内攒批，兼顾 GPU 批量与树逻辑并行")
+                    help="已废弃（恒为跨局攒批，保留以兼容旧脚本）")
     ap.add_argument("--concurrency", type=int, default=24,
-                    help="--batched 模式每进程的并发局数（批大小≈该值×模型数，默认 24）")
+                    help="每进程的并发局数（批大小≈该值×模型数，默认 24）")
     ap.add_argument("--test-scoring", action="store_true")
     ap.add_argument("--c_visit", type=float, default=C_VISIT, help="双方共用的 c_visit")
     ap.add_argument("--c_scale_a", type=float, default=C_SCALE, help="A 侧 c_scale")
     ap.add_argument("--c_scale_b", type=float, default=C_SCALE, help="B 侧 c_scale")
-    ap.add_argument("--sprt", action="store_true", help="启用 Wald SPRT 早期停止（针对落后候选）")
-    ap.add_argument("--sprt-min-games", type=int, default=64, help="SPRT 判决最少局数（成对边界）")
-    ap.add_argument("--sprt-alpha", type=float, default=0.05, help="SPRT Type I error (False Positive) bound")
-    ap.add_argument("--sprt-beta", type=float, default=0.05, help="SPRT Type II error (False Negative) bound")
+    ap.add_argument("--sprt", action="store_true",
+                    help=f"五项式 GSPRT 早停（H0 Elo 0 vs H1 Elo {SPRT_ELO1:g}）")
+    ap.add_argument("--sprt-min-games", type=int, default=64, help="SPRT 判决最少局数")
+    ap.add_argument("--sprt-alpha", type=float, default=0.05, help="SPRT Type I error bound")
+    ap.add_argument("--sprt-beta", type=float, default=0.05, help="SPRT Type II error bound")
     args = ap.parse_args()
 
     if args.test_scoring:
         _run_scoring_test(args.out)
         return
+    if not args.ckpt_a or not args.ckpt_b:
+        ap.error("需要 --ckpt-a 与 --ckpt-b")
+    if args.games < 2 or args.games % 2:
+        ap.error("--games 必须是 >= 2 的偶数（成对开局）")
 
     os.makedirs(args.out, exist_ok=True)
-    # 模型身份验证
-    ckpt_a_data = torch.load(args.ckpt_a, map_location="cpu", weights_only=False)
-    sd_a = ckpt_a_data.get("model", ckpt_a_data)
-    ckpt_b_data = torch.load(args.ckpt_b, map_location="cpu", weights_only=False)
-    sd_b = ckpt_b_data.get("model", ckpt_b_data)
-    id_a = _model_id(sd_a)
-    id_b = _model_id(sd_b)
-
-    if args.workers <= 1 and not args.batched:
-        model_a = ArenaModel(args.ckpt_a)
-        model_b = ArenaModel(args.ckpt_b)
-        dummy_feats = np.zeros((1, 785), dtype=np.float32)
-        dummy_tc = [2]
-        dummy_elo = [float(standardize_elo(2567.5))]
-        dummy_color = [1]
-        la, wa, _, _, _ = model_a.step(dummy_feats, dummy_tc, dummy_elo, dummy_color, model_a.initial_cache(1))
-        lb, wb, _, _, _ = model_b.step(dummy_feats, dummy_tc, dummy_elo, dummy_color, model_b.initial_cache(1))
-        import torch.nn.functional as F
-        pa = F.softmax(torch.from_numpy(la[0]), dim=0).numpy()
-        pb = F.softmax(torch.from_numpy(lb[0]), dim=0).numpy()
-        policy_diff = float(np.max(np.abs(pa - pb)))
-        wdl_diff = float(np.max(np.abs(wa - wb)))
-    else:
-        policy_diff = 0.0 if id_a == id_b else 1.0
-        wdl_diff = 0.0 if id_a == id_b else 1.0
-        model_a = None
-        model_b = None
-
-    model_ids = {"a": {"hash": id_a}, "b": {"hash": id_b}, "same_hash": id_a == id_b,
-                 "forward_comparison": {"max_policy_prob_diff": policy_diff,
-                                        "max_wdl_diff": wdl_diff,
-                                        "models_differ_functionally": policy_diff > 1e-6}}
+    model_ids = _compare_models(args.ckpt_a, args.ckpt_b)
     with open(os.path.join(args.out, "model_ids.json"), "w") as fh:
         json.dump(model_ids, fh, indent=1)
-    print("A hash=%s B hash=%s same=%s policy_diff=%.2e" % (id_a, id_b, id_a == id_b, policy_diff))
+    print("A hash=%s B hash=%s same=%s policy_diff=%.2e" % (
+        model_ids["a"]["hash"], model_ids["b"]["hash"], model_ids["same_hash"],
+        model_ids["forward_comparison"]["max_policy_prob_diff"]))
+    if args.pairs != 8:
+        print("[info] --pairs 已废弃（开局多样性由 --openings-file 决定）", flush=True)
 
-    # 运行对局：成对开局与颜色互换
-    # pair i 包含 2 局：第 1 局 A 白 B 黑，第 2 局 B 白 A 黑（复用相同开局）
-    num_pairs = args.games // 2
     t0 = time.time()
-
-    # 开局库：默认从 data/openings_200.txt 加载（g=0 下开局多样性是对局多样性唯一来源），
-    # 文件缺失时退回内置 OPENINGS。分配保证 pair 开局互不重复（库足够时）。
-    library = load_openings_file(args.openings_file) if args.openings_file else list(OPENINGS)
-    if not library:
-        print(f"[warn] 开局文件 {args.openings_file} 未产生有效开局，退回内置列表")
-        library = list(OPENINGS)
-    openings = opening_plan(num_pairs, library, args.seed)
-    n_openings = len(library)
-    if num_pairs > n_openings:
-        print(f"[warn] 对数 {num_pairs} > 开局数 {n_openings}：开局必然重复，"
-              f"g=0 下同开局 pair 的对局逐字节相同，统计功效被稀释", flush=True)
-    print(f"[openings] 库规模 {n_openings}，对数 {num_pairs}，"
-          f"实际不同对局数 {len(set(o for o, _ in openings)) * 2}", flush=True)
-    if args.pairs and args.pairs != n_openings:
-        print(f"[info] --pairs 已废弃（曾误用于裁剪开局数，导致 64 局实际仅 16 个不同对局）；"
-              f"现用 --openings-file 指定开局库", flush=True)
-
-    if args.batched:
-        if args.workers > 1:
-            # 批量 + 多进程：N 进程各自攒批跑分到的开局对（树逻辑并行 + GPU 批量兼得）
-            games_log, sprt_info = run_batched_parallel_arena(args, num_pairs, openings, t0)
-        else:
-            # 单进程跨局攒批（batch≈并发局数）
-            model_a = ArenaModel(args.ckpt_a)
-            model_b = ArenaModel(args.ckpt_b)
-            dummy_feats = np.zeros((1, 785), dtype=np.float32)
-            la, wa, _, _, _ = model_a.step(dummy_feats, [2], [float(standardize_elo(2567.5))], [1],
-                                           model_a.initial_cache(1))
-            lb, wb, _, _, _ = model_b.step(dummy_feats, [2], [float(standardize_elo(2567.5))], [1],
-                                           model_b.initial_cache(1))
-            import torch.nn.functional as F
-            policy_diff = float(np.max(np.abs(
-                F.softmax(torch.from_numpy(la[0]), dim=0).numpy()
-                - F.softmax(torch.from_numpy(lb[0]), dim=0).numpy())))
-            print("A hash=%s B hash=%s same=%s policy_diff=%.2e" % (
-                id_a, id_b, id_a == id_b, policy_diff))
-            games_log, sprt_info = run_batched_arena(args, num_pairs, openings, t0,
-                                                     models=[model_a, model_b])
-    elif args.workers > 1:
-        # 多进程并行模式
-        games_log, sprt_info = run_parallel_arena(args, num_pairs, openings, t0)
-    else:
-        # 串行模式（workers == 1）
-        cfg = lambda: None
-        cfg.n_sims = args.n_sims
-        cfg.m0 = args.m0
-        cfg.max_plies = args.max_plies
-        cfg.c_visit = args.c_visit
-        cfg.c_scale = C_SCALE
-        model_a.c_visit = model_b.c_visit = args.c_visit
-        model_a.c_scale = args.c_scale_a
-        model_b.c_scale = args.c_scale_b
-        games_log = []
-
-        # SPRT 参数与阈值
-        # H0: p <= 0.50 vs H1: p >= 0.55
-        p0, p1 = 0.50, 0.55
-        bound_b = math.log(args.sprt_beta / (1.0 - args.sprt_alpha))  # ~ -2.944 (落后时提前拒绝 H1)
-        log_p1_p0 = math.log(p1 / p0)
-        log_1p1_1p0 = math.log((1.0 - p1) / (1.0 - p0))
-
-        sprt_stopped = False
-        sprt_info = None
-
-        for pair_idx in range(num_pairs):
-            oi, opening_san = openings[pair_idx]
-
-            # 局 1: A 白 B 黑
-            g1_idx = len(games_log)
-            seed_1 = args.seed + 0 * 1000 + g1_idx
-            gd1 = play_one_game(model_a, model_b, cfg, opening_san=opening_san, opening_id=oi, seed=seed_1)
-            gd1["game_idx"] = g1_idx
-            gd1["pair_idx"] = pair_idx
-            gd1["white_ckpt_side"] = "A"
-            gd1["black_ckpt_side"] = "B"
-            games_log.append(gd1)
-
-            # 局 2: B 白 A 黑
-            g2_idx = len(games_log)
-            seed_2 = args.seed + 0 * 1000 + g2_idx
-            gd2 = play_one_game(model_b, model_a, cfg, opening_san=opening_san, opening_id=oi, seed=seed_2)
-            r2 = gd2["arena_result"]
-            # 对齐到 A 视角：原结果 0(白胜/B胜) -> 2(A负), 2(黑胜/A胜) -> 0(A胜), 1 -> 1
-            gd2["arena_result"] = 0 if r2 == 2 else 2 if r2 == 0 else 1
-            gd2["game_idx"] = g2_idx
-            gd2["pair_idx"] = pair_idx
-            gd2["white_ckpt_side"] = "B"
-            gd2["black_ckpt_side"] = "A"
-            games_log.append(gd2)
-
-            if len(games_log) % 8 == 0 or len(games_log) == args.games:
-                print("  [%.0fs] games %d/%d (pair %d/%d)" % (
-                    time.time() - t0, len(games_log), args.games, pair_idx + 1, num_pairs))
-
-            # 成对边界处检查 SPRT 早停（候选为 A）
-            current_n = len(games_log)
-            if args.sprt and current_n >= args.sprt_min_games and current_n < args.games:
-                s_a = sum(1.0 if g["arena_result"] == 0 else 0.5 if g["arena_result"] == 1 else 0.0
-                          for g in games_log)
-                llr = s_a * log_p1_p0 + (current_n - s_a) * log_1p1_1p0
-                if llr <= bound_b:
-                    saved_games = args.games - current_n
-                    saved_pct = saved_games / args.games * 100.0
-                    sprt_stopped = True
-                    sprt_info = {
-                        "early_stopped": True,
-                        "stop_reason": "sprt_reject_h1",
-                        "llr": float(llr),
-                        "llr_bound": float(bound_b),
-                        "alpha": float(args.sprt_alpha),
-                        "beta": float(args.sprt_beta),
-                        "p0": float(p0),
-                        "p1": float(p1),
-                        "games_played": current_n,
-                        "games_planned": args.games,
-                        "compute_saved_games": saved_games,
-                        "compute_saved_percent": saved_pct,
-                    }
-                    print(f"\n[SPRT Early Stop Triggered] LLR={llr:.3f} <= bound={bound_b:.3f} at game {current_n}/{args.games}")
-                    print(f"Candidate rejected early. Compute saved: {saved_games} games ({saved_pct:.1f}%)\n")
-                    break
-
+    games_log, sprt_info, summary = run_arena(args)
     elapsed = time.time() - t0
-    manifest = _aggregate_results(games_log, len(games_log) // 2, args, sprt_info=sprt_info)
+    manifest = _aggregate_results(games_log, args, sprt_info=sprt_info)
     manifest["elapsed_s"] = elapsed
+    manifest["kit"] = {k: summary.get(k) for k in (
+        "elo", "elo_ci95", "los", "pentanomial", "elo_pentanomial", "elo_pentanomial_ci95",
+        "by_color", "mean_plies", "batch", "config_hash", "provenance")}
 
     with open(os.path.join(args.out, "arena.json"), "w") as fh:
         json.dump(manifest, fh, indent=1)
     with open(os.path.join(args.out, "games.jsonl"), "w") as fh:
         for gd in games_log:
             fh.write(json.dumps(gd) + "\n")
-    print(json.dumps(manifest, indent=1))
+    print(json.dumps({k: v for k, v in manifest.items() if k != "kit"}, indent=1))
     print("用时 %.0fs" % elapsed)
 
 

@@ -4,7 +4,7 @@
 kit 的搜索只通过 ``Leaf.parent_handle`` / ``NodeEval.handle`` 与状态交接，状态管理全在本模块：
 
 - ``SsmEvaluator``：一次批量 ``SeqModel.step``。负载 = (feats785, tc, elo, color, cache)，
-  cache 为 batch=1 的状态；torch 调用序列与 ``tools/ssm_gumbel_arena.py::ArenaModel.step``
+  cache 为 batch=1 的状态；torch 调用序列与原 ``tools/ssm_gumbel_arena.py::ArenaModel.step``（git 历史）
   / 批量驱动器 ``_model_step`` 完全相同（同批大小下逐位一致）。
 - ``SsmExpander``（ReplayStore）：句柄 = 该步搜索根的 ``RootState``（根 cache + occurrence）。
   展开深度 d 的叶子时从根 cache 重放 d−1 步再评估 1 次——与 arena/生成器的

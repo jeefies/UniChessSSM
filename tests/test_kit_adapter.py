@@ -1,15 +1,15 @@
 """S 的 kit 接入（``stateseq.kit_adapter``）单元测试。需要 CUDA 与兄弟仓库 Kit。
 
-核心断言：kit ``play_game`` 驱动两个 ``SsmPlayer`` 下出的棋，与 S arena 原版
-``play_one_game`` **着法逐个相同**（随机初始化模型、并发 1），扩展深度直方图逐位相同。
-前向数 ≤ 原版 − 1：懒追赶省掉最后一步非行棋方的 1 次步进；kit 的 Gumbel 在调 Expander
-之前就判终局，终局叶子不再重放路径（原版先重放 d−1 步才发现终局），省下的正是这部分。
+切换前与 S arena 原版 ``play_one_game`` 着法逐个相同、扩展深度直方图逐位相同（随机初始化
+模型、并发 1；真实权重见 git 历史中的 ``tools/kit_arena_parity.py``）。原版已删除，这里锁死：
+1. 同输入的对局完全可复现（g=0），逐步 info 里的直方图之和 == Player 累计直方图；
+2. 前向数 = 追赶步进 + 重放 + 叶子评估，落在由直方图推出的区间内（kit 的 Gumbel 在调
+   Expander 之前判终局，终局叶子不重放路径）；
+3. 懒追赶与逐 ply 步进等价；多叶子同步重放与逐个展开等价；并发批量对弈可跑通。
 """
 
 from __future__ import annotations
 
-import importlib.util
-import io
 import os
 import sys
 import unittest
@@ -18,12 +18,11 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 KIT_ROOT = os.environ.get("UNICHESS_KIT_ROOT", os.path.join(os.path.dirname(HERE), "Kit"))
 if os.path.isdir(KIT_ROOT) and KIT_ROOT not in sys.path:
-    sys.path.insert(0, KIT_ROOT)
+    sys.path.append(KIT_ROOT)  # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
 
 try:
     import torch
     import chess
-    import chess.pgn
     import numpy as np
 
     _HAS_CUDA = torch.cuda.is_available()
@@ -40,20 +39,6 @@ except ImportError:  # pragma: no cover
     _HAS_KIT = False
 
 
-def _load_tool():
-    path = os.path.join(HERE, "tools", "ssm_gumbel_arena.py")
-    spec = importlib.util.spec_from_file_location("ssm_gumbel_arena_kit", path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def _pgn_ucis(pgn: str) -> list:
-    game = chess.pgn.read_game(io.StringIO(pgn))
-    return [m.uci() for m in game.mainline_moves()]
-
-
 @unittest.skipUnless(_HAS_CUDA and _HAS_KIT, "需要 CUDA（mamba 步进核）与兄弟仓库 Kit")
 class TestKitAdapter(unittest.TestCase):
     @classmethod
@@ -62,22 +47,12 @@ class TestKitAdapter(unittest.TestCase):
         from stateseq.model import SeqModel
 
         cls.ka = ka
-        cls.tool = _load_tool()
         cls.seqs = {}
         for seed in (1, 2):
             torch.manual_seed(seed)
             cls.seqs[seed] = SeqModel(dropout=0.0).to("cuda").eval()
 
     # ---- 构造 ----
-
-    def _arena_model(self, seed):
-        m = self.tool.ArenaModel.__new__(self.tool.ArenaModel)
-        m.ckpt_path = f"rand{seed}"
-        m.device = "cuda"
-        m.seq = self.seqs[seed]
-        m._tc_cache, m._elo_cache = {}, {}
-        m.c_visit, m.c_scale = 50.0, 0.1
-        return m
 
     def _evaluator(self, seed):
         return self.ka.SsmEvaluator(self.seqs[seed], "cuda", f"S:rand{seed}")
@@ -87,12 +62,7 @@ class TestKitAdapter(unittest.TestCase):
         return self.ka.SsmPlayerFactory(f"S{seed}", self._evaluator(seed),
                                         GumbelConfig(simulations=n_sims, m0=m0, g=0.0))
 
-    def _cfg(self, n_sims, m0, max_plies):
-        cfg = lambda: None  # noqa: E731
-        cfg.n_sims, cfg.m0, cfg.max_plies, cfg.c_visit, cfg.c_scale = n_sims, m0, max_plies, 50.0, 0.1
-        return cfg
-
-    def _kit_game(self, fa, fb, opening_uci, a_is_white, max_plies, seed=7):
+    def _kit_game(self, fa, fb, opening_uci, a_is_white, max_plies, seed=7, observer=None):
         from unichess_kit.api import SearchBudget
         from unichess_kit.pipelines.match import GameTask, play_game
         from unichess_kit.rules.referee import StandardReferee
@@ -102,42 +72,39 @@ class TestKitAdapter(unittest.TestCase):
                         seed_a=seed, seed_b=seed)
         referee = StandardReferee(max_plies=len(opening_uci) + max_plies)
         self._last_players = (fa(), fb())
-        return run_sync(play_game(task, *self._last_players, referee, SearchBudget()))
-
-    def _s_batched(self, ma, mb, a_is_white, cfg, opening_san, seed=7):
-        game = self.tool.BatchedArenaGame(0, 0, [ma, mb], a_is_white, cfg, opening_san, 0, seed=seed)
-        args = self.tool.argparse.Namespace(sprt=False, games=1, sprt_alpha=0.05, sprt_beta=0.05,
-                                            sprt_min_games=64)
-        driver = self.tool.BatchedArenaDriver([game], concurrency=1, args=args,
-                                              internal_sprt=False)
-        driver.run()
-        return driver.results[0], driver.n_forwards
+        return run_sync(play_game(task, *self._last_players, referee, SearchBudget(),
+                                  observer=observer))
 
     # ---- 测试 ----
 
-    def test_game_parity_with_s_arena(self):
-        cases = [("e4 e5", ("e2e4", "e7e5"), True, 12, 4, 8),
-                 ("d4 Nf6 c4", ("d2d4", "g8f6", "c2c4"), False, 16, 16, 6),
-                 ("", (), True, 8, 2, 5)]
-        for san, uci, a_white, n_sims, m0, plies in cases:
-            with self.subTest(opening=san, a_is_white=a_white):
-                cfg = self._cfg(n_sims, m0, plies)
-                ma, mb = self._arena_model(1), self._arena_model(2)
-                mw, mblk = (ma, mb) if a_white else (mb, ma)
-                gd = self.tool.play_one_game(mw, mblk, cfg, opening_san=san or None, seed=7)
-                gd_b, n_fwd_s = self._s_batched(ma, mb, a_white, cfg, san)
-                self.assertEqual(gd["pgn"], gd_b["pgn"])
+    def test_game_reproducible_and_forward_accounting(self):
+        cases = [(("e2e4", "e7e5"), True, 12, 4, 8),
+                 (("d2d4", "g8f6", "c2c4"), False, 16, 16, 6),
+                 ((), True, 8, 2, 5)]
+        for uci, a_white, n_sims, m0, plies in cases:
+            with self.subTest(opening=uci, a_is_white=a_white):
+                runs = []
+                for _ in range(2):
+                    fa, fb = self._factory(1, n_sims, m0), self._factory(2, n_sims, m0)
+                    events = []
+                    rec = self._kit_game(fa, fb, uci, a_white, plies, observer=events.append)
+                    hist = hist_merge(self._last_players[0].expand_hist,
+                                      self._last_players[1].expand_hist)
+                    n_fwd = fa.evaluator.n_forwards + fb.evaluator.n_forwards
+                    runs.append((rec["moves"], hist, n_fwd))
 
-                fa, fb = self._factory(1, n_sims, m0), self._factory(2, n_sims, m0)
-                rec = self._kit_game(fa, fb, uci, a_white, plies)
-                self.assertEqual(rec["opening"] + rec["moves"], _pgn_ucis(gd["pgn"]))
-                self.assertEqual(len(rec["moves"]), gd["n_plies"])
-                hist_k = hist_merge(self._last_players[0].expand_hist,
-                                    self._last_players[1].expand_hist)
-                self.assertEqual(hist_k, gd["expand_depth_hist"])
-                n_fwd_k = fa.evaluator.n_forwards + fb.evaluator.n_forwards
-                self.assertLessEqual(n_fwd_k, n_fwd_s - 1)
-                self.assertGreaterEqual(n_fwd_k, n_fwd_s - 1 - hist_summary(hist_k)["replay_forwards"])
+                    from_info: list = []
+                    for ev in events:
+                        if ev["type"] == "move":
+                            from_info = hist_merge(from_info, ev["info"]["expand_hist"])
+                    self.assertEqual(from_info, hist)
+                    self.assertEqual(len(rec["moves"]), plies)
+                    total = len(uci) + plies
+                    s = hist_summary(hist)
+                    # 追赶：每方步进到自己最后一次行棋的局面（B_0..），合计 ≤ 2·total
+                    self.assertGreaterEqual(n_fwd, total + s["replay_forwards"])
+                    self.assertLessEqual(n_fwd, 2 * total + s["replay_forwards"] + s["expansions"])
+                self.assertEqual(runs[0], runs[1], "g=0 下同输入对局必须完全可复现")
 
     def test_catch_up_equals_per_ply_stepping(self):
         """懒追赶（choose 时一次补齐）与逐 ply 步进得到同一 cache 与根评估。"""

@@ -10,7 +10,12 @@ import unittest
 
 import torch
 
-from tests.test_consistency import _synthetic_game_features
+try:
+    from tests.test_consistency import _synthetic_game_features
+except ImportError:
+    # 本仓库 tests/ 无 __init__.py（命名空间包）；sys.path 上有 Kit 时，Kit 的常规 tests 包
+    # 会胜出（PEP 420），此时按 discover 放进 sys.path 的 tests 目录直接导入
+    from test_consistency import _synthetic_game_features
 
 from stateseq.conditions import TimeControlBucket
 
