@@ -54,6 +54,16 @@ def _resolve(path) -> Path:
     return p if p.is_absolute() else ROOT / p
 
 
+def load_seq_model(checkpoint, device: str = "cuda") -> tuple:
+    """→ (eval 模式的 SeqModel, 解析后的绝对路径)。"""
+    path = _resolve(checkpoint).resolve()
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    seq = SeqModel(dropout=0.0)
+    seq.load_state_dict(ckpt.get("model", ckpt))
+    seq.to(device).eval()
+    return seq, path
+
+
 def _concat_caches(caches: Sequence) -> list:
     """N 份 batch=1 的 Cache 沿 batch 维拼成一份 batch=N（torch.cat 总是新张量，不改入参）。"""
     return [(torch.cat([c[li][0] for c in caches], dim=0),
@@ -83,7 +93,31 @@ def legal_moves_and_ids(board: chess.Board) -> tuple:
 
 # ------------------------------------------------------------------ 前向
 
-class SsmEvaluator:
+class ReferenceStateAPI:
+    """参考实现的状态句柄 API（SsmPlayer 用）：句柄 = cache，负载 = (feats, tc, elo, color, cache)，
+    搜索根 = RootState，展开走 ReplayStore。快速实现见 ``fast_eval.SsmFastEvaluator``。
+    子类需提供 ``initial_cache()`` 与 ``evaluate()``。"""
+
+    def root_state(self):
+        return self.initial_cache()
+
+    def child(self, parent, feats, tc, elo, color, root_occ=None, path_keys=()):
+        return (feats, int(tc), float(elo), int(color), parent)
+
+    def hold(self, state) -> None:
+        pass
+
+    def release(self, state) -> None:
+        pass
+
+    def make_root(self, ply: int, state, occurrence: dict) -> "RootState":
+        return RootState(ply=ply, cache=state, occurrence=occurrence)
+
+    def make_expander(self):
+        return SsmExpander(self)
+
+
+class SsmEvaluator(ReferenceStateAPI):
     """``SeqModel.step`` 的批量前向。结果 = (logits[1936] fp32, wdl[3], 新 cache(batch=1))。"""
 
     def __init__(self, seq: SeqModel, device: str, model_key: str):
@@ -96,11 +130,7 @@ class SsmEvaluator:
 
     @classmethod
     def from_checkpoint(cls, checkpoint, device: str = "cuda") -> "SsmEvaluator":
-        path = _resolve(checkpoint).resolve()
-        ckpt = torch.load(path, map_location=device, weights_only=False)
-        seq = SeqModel(dropout=0.0)
-        seq.load_state_dict(ckpt.get("model", ckpt))
-        seq.to(device).eval()
+        seq, path = load_seq_model(checkpoint, device)
         return cls(seq, device, f"S:{path}:{device}")
 
     def initial_cache(self):
@@ -214,6 +244,36 @@ class SsmExpander:
                 for s, (lg, wd, _) in zip(states, outs)]
 
 
+class SsmFastExpander:
+    """SlabStore（P4）：句柄 = 父节点的 ``NodeState``（GPU 槽）。每个叶子 1 次前向：
+    父槽复制到新槽后原地单步；父节点若已被池淘汰，先经 ``evaluator.ensure`` 重算。
+    occurrence = 根处计数 + 根到父节点路径上的出现次数（与 ReplayStore 的逐步 +1 相同）。"""
+
+    def __init__(self, evaluator):
+        self.evaluator = evaluator
+
+    def expand(self, leaves: Sequence):
+        ev = self.evaluator
+        prepared = []
+        for leaf in leaves:
+            parent = leaf.parent_handle
+            if parent is None or getattr(parent, "root_occ", None) is None:
+                raise ValueError("S 的叶子必须带父节点状态句柄（根评估由 SsmPlayer 提供）")
+            key = _board_key(leaf.board)
+            occ = parent.root_occ.get(key, 0) + parent.path_keys.count(key)
+            feats, tc, elo, color = encode_board(leaf.board, occ)
+            prepared.append((leaf, parent, key, np.asarray(feats, dtype=np.float32).reshape(-1),
+                             tc, elo, color))
+        yield from ev.ensure([p[1] for p in prepared])      # 返回时父节点各被钉住一次
+        nodes = [ev.child(parent, f, tc, elo, color, parent.root_occ, parent.path_keys + (key,))
+                 for _, parent, key, f, tc, elo, color in prepared]
+        for p in prepared:
+            ev.pool.unpin(p[1])         # child 已另行钉住父节点，直到前向完成
+        outs = yield EvalRequest(ev, nodes)
+        return [node_eval_from_output(p[0].board, lg, wd, node)
+                for p, (lg, wd, node) in zip(prepared, outs)]
+
+
 # ------------------------------------------------------------------ Player
 
 class SsmPlayer:
@@ -223,13 +283,13 @@ class SsmPlayer:
         self.name = name
         self.evaluator = evaluator
         self.cfg = cfg
-        self.search = Gumbel(SsmExpander(evaluator), cfg)
+        self.search = Gumbel(evaluator.make_expander(), cfg)
         self._reset()
 
     def _reset(self):
         self.start_fen: Optional[str] = None
         self.seed = 0
-        self.cache = None
+        self.cache = None         # 当前局面的状态句柄（参考实现 = cache，快速实现 = NodeState）
         self.occurrence: dict = {}
         self.stepped = 0          # 已步进的局面数：B_0..B_{stepped-1}
         self.last = None          # 最后一次步进的 (logits, wdl)
@@ -239,8 +299,15 @@ class SsmPlayer:
         self._reset()
         self.start_fen = start.fen
         self.seed = int(start.seed)
-        self.cache = self.evaluator.initial_cache()
+        self._set_state(self.evaluator.root_state())
         return immediate(None)
+
+    def _set_state(self, state) -> None:
+        ev = self.evaluator
+        old, self.cache = self.cache, state
+        if state is not None:
+            ev.hold(state)
+        ev.release(old)
 
     def _catch_up(self, board: chess.Board):
         """按序步进 B_stepped..B_t（B_t = board）。encode-before-increment，与 arena 同口径。"""
@@ -258,9 +325,12 @@ class SsmPlayer:
             if k > first:
                 replay.push(stack[k - 1])
             key = _board_key(replay)
-            payload = encode_payload(replay, self.occurrence.get(key, 0), self.cache)
+            feats, tc, elo, color = encode_board(replay, self.occurrence.get(key, 0))
+            payload = self.evaluator.child(self.cache, np.asarray(feats, dtype=np.float32)
+                                           .reshape(-1), tc, elo, color)
             (out,) = yield EvalRequest(self.evaluator, [payload])
-            lg, wd, self.cache = out
+            lg, wd, state = out
+            self._set_state(state)
             self.occurrence[key] = self.occurrence.get(key, 0) + 1
             self.last = (lg, wd)
         self.stepped = t + 1
@@ -269,7 +339,7 @@ class SsmPlayer:
         """追赶到当前局面，返回 (根 NodeEval, 根合法着的动作 id)。"""
         ply = len(board.move_stack)
         yield from self._catch_up(board)
-        root_state = RootState(ply=ply, cache=self.cache, occurrence=dict(self.occurrence))
+        root_state = self.evaluator.make_root(ply, self.cache, dict(self.occurrence))
         root = node_eval_from_output(board, self.last[0], self.last[1], root_state)
         return root, legal_moves_and_ids(board)[1]
 
@@ -293,7 +363,7 @@ class SsmPlayer:
         return immediate(None)
 
     def close(self) -> None:
-        self.cache = None
+        self._set_state(None)
         self.last = None
 
 
@@ -307,12 +377,58 @@ class SsmPlayerFactory:
         return SsmPlayer(self.name, self.evaluator, self.cfg)
 
 
+ENGINES = ("server", "fast", "reference")
+
+
+def make_evaluator(checkpoint, device: str = "cuda", engine: str = "fast", *,
+                   server_dir: Optional[str] = None, **fast_kw):
+    """engine：
+
+    - "server"：连到共享 GPU 服务（``gpu_server``，需 server_dir）；本进程不碰 GPU，多进程跨进程拼批，
+      批不变 ⇒ 结果逐位可复现、与进程数 / 并发无关（P4，多进程工具默认）；
+    - "fast"：同进程 GPU 槽池 + CUDA graph（P4）；
+    - "reference"：原 cat/split + 重放实现（与 P3 及更早的 S arena 逐位对照用）。
+    """
+    if engine == "server":
+        if not server_dir:
+            raise ValueError('engine="server" 需要 server_dir（由启动方的 GpuServer 提供）')
+        from .gpu_server import remote_evaluator
+        return remote_evaluator(server_dir, checkpoint, chunk=fast_kw.get("server_chunk", 0))
+    if engine == "fast":
+        from .fast_eval import SsmFastEvaluator
+        return SsmFastEvaluator.from_checkpoint(checkpoint, device, **fast_kw)
+    if engine == "reference":
+        return SsmEvaluator.from_checkpoint(checkpoint, device)
+    raise ValueError(f"未知 engine={engine!r}，可选 {ENGINES}")
+
+
+def _engine_kw(engine, pool_slots, cuda_graphs, server_dir, server_chunk=0) -> dict:
+    if engine == "fast":
+        return {"pool_slots": pool_slots, "cuda_graphs": cuda_graphs}
+    if engine == "server":
+        return {"server_dir": server_dir, "server_chunk": server_chunk}
+    return {}
+
+
+def _gumbel_cfg(evaluator, simulations, m0, g, c_visit, c_scale, parallel) -> GumbelConfig:
+    if parallel is None:        # 快速实现默认轮内并发；参考实现保持原串行次序（逐位对照）
+        parallel = bool(getattr(evaluator, "fast", False))
+    return GumbelConfig(simulations=simulations, m0=m0, g=g, c_visit=c_visit, c_scale=c_scale,
+                        parallel=parallel)
+
+
 def make_player_factory(checkpoint, *, name: str = "S", device: str = "cuda",
                         simulations: int = N_SIMS, m0: int = M0, g: float = 0.0,
-                        c_visit: float = C_VISIT, c_scale: float = C_SCALE) -> SsmPlayerFactory:
+                        c_visit: float = C_VISIT, c_scale: float = C_SCALE,
+                        engine: str = "fast", parallel: Optional[bool] = None,
+                        pool_slots: int = 2048, cuda_graphs: bool = True,
+                        server_dir: Optional[str] = None,
+                        server_chunk: int = 0) -> SsmPlayerFactory:
     """加载一次权重，返回每局一个 SsmPlayer 的工厂。默认 g=0（arena 口径，确定性）。"""
-    evaluator = SsmEvaluator.from_checkpoint(checkpoint, device)
-    cfg = GumbelConfig(simulations=simulations, m0=m0, g=g, c_visit=c_visit, c_scale=c_scale)
+    evaluator = make_evaluator(checkpoint, device, engine,
+                               **_engine_kw(engine, pool_slots, cuda_graphs, server_dir,
+                                            server_chunk))
+    cfg = _gumbel_cfg(evaluator, simulations, m0, g, c_visit, c_scale, parallel)
     return SsmPlayerFactory(name, evaluator, cfg)
 
 
@@ -374,7 +490,7 @@ class SsmSelfPlayer(SsmPlayer):
             raise ValueError("自对弈从标准初始局面开始")
         self._reset()
         self.seed = int(start.seed)
-        self.cache = self.evaluator.initial_cache()
+        self._set_state(self.evaluator.root_state())
         self.rng = np.random.default_rng(
             np.random.SeedSequence(self.seed, spawn_key=(int(start.index),)))
         self.book = [chess.Move.from_uci(u) for u in start.book]
@@ -428,14 +544,20 @@ class SsmSelfPlayerFactory:
         return SsmSelfPlayer(self.name, self.evaluator, self.cfg, self.shared)
 
 
-def make_selfplay_factory(checkpoint=None, *, evaluator: Optional[SsmEvaluator] = None,
+def make_selfplay_factory(checkpoint=None, *, evaluator=None,
                           name: str = "S", device: str = "cuda", simulations: int = N_SIMS,
                           m0: int = M0, g: float = 1.0, c_visit: float = C_VISIT,
-                          c_scale: float = C_SCALE) -> SsmSelfPlayerFactory:
+                          c_scale: float = C_SCALE, engine: str = "fast",
+                          parallel: Optional[bool] = None, pool_slots: int = 2048,
+                          cuda_graphs: bool = True,
+                          server_dir: Optional[str] = None,
+                          server_chunk: int = 0) -> SsmSelfPlayerFactory:
     """自对弈工厂（默认 g=1）。给 evaluator 时复用已加载的模型，否则从 checkpoint 加载。"""
     if evaluator is None:
-        evaluator = SsmEvaluator.from_checkpoint(checkpoint, device)
-    cfg = GumbelConfig(simulations=simulations, m0=m0, g=g, c_visit=c_visit, c_scale=c_scale)
+        evaluator = make_evaluator(checkpoint, device, engine,
+                                   **_engine_kw(engine, pool_slots, cuda_graphs, server_dir,
+                                                server_chunk))
+    cfg = _gumbel_cfg(evaluator, simulations, m0, g, c_visit, c_scale, parallel)
     return SsmSelfPlayerFactory(name, evaluator, cfg)
 
 

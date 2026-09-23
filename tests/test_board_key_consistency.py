@@ -29,6 +29,38 @@ class BoardKeyConsistencyTest(unittest.TestCase):
             self.skipTest("需要 torch 与兄弟仓库 Kit")
         self.assertIs(ka._board_key, _board_key)
 
+    def test_equivalent_to_piece_map_key(self):
+        """位棋盘键与原 piece_map 键的相等关系完全相同（随机对局 + 来回走子）。"""
+        import random
+
+        def slow(board):
+            return (tuple(sorted(board.piece_map().items())), board.turn, board.castling_rights,
+                    board.ep_square if board.has_legal_en_passant() else None)
+
+        rng = random.Random(0)
+        fast_to_slow: dict = {}
+        slow_to_fast: dict = {}
+        n = 0
+        for g in range(60):
+            board = chess.Board()
+            for _ in range(120):
+                f, s = _board_key(board), slow(board)
+                self.assertEqual(fast_to_slow.setdefault(f, s), s)
+                self.assertEqual(slow_to_fast.setdefault(s, f), f)
+                n += 1
+                moves = list(board.legal_moves)
+                if not moves:
+                    break
+                if g % 2 and len(board.move_stack) >= 2 and rng.random() < 0.7:
+                    last = board.move_stack[-2]
+                    back = chess.Move(last.to_square, last.from_square)
+                    if back in moves:
+                        board.push(back)
+                        continue
+                board.push(rng.choice(moves))
+        self.assertGreater(n, 5000)
+        self.assertLess(len(fast_to_slow), n)       # 确有重复局面参与比较
+
     def test_cycle_returns_same_key(self):
         start = chess.Board()
         cycle = chess.Board()

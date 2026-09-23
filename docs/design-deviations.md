@@ -59,3 +59,12 @@
 - **自对弈多进程**：原实现每个 worker 局号从 0 起、种子由 `SeedSequence(seed).spawn(workers)` 派生，多 worker 时 `game_key` 重复（只影响 train/val 划分）。现各 worker 取不相交的全局局号区间、同一 seed，每局的 rng / book 分配 / `game_key` 只取决于全局局号，与 worker 数无关（`tests/test_kit_selfplay.py` 拆段 == 整段）。**同 seed 的多 worker 生成结果因此与旧版不同**；单 worker 结果不变。
 - **开局文件**：由 kit `OpeningBook` 解析（SAN/UCI 均可、去重、不裁切）；非法行改为直接报错，不再静默跳过（静默跳过会悄悄缩小开局库）。
 - **arena 断点续跑**：逐局结果写 `kit_results.jsonl`，同一命令重跑会核对配置哈希后续跑；逐局扩展深度直方图另存 `expand_hist.jsonl` 以便续跑读回。出错整批停止（kit 语义），`anomaly` 字段保留恒为 None。
+
+### 2.5 P4：对局 / 自对弈吞吐（2026-09-24）
+- **三种引擎**（`--engine`，arena 与自对弈共用）：`reference` = P3 实现（cat/split + 从根重放 + 串行），保留作逐位对照；`fast` = 每进程自己的 GPU 状态槽池（`stateseq/fast_eval.py`：父槽复制 + 原地单步 + 分桶 CUDA graph，每次模拟恰好 1 次前向）；`server`（**默认**）= 搜索进程纯 CPU，经 `/dev/shm` 共享内存 + FIFO 把请求交给唯一的 GPU 服务进程（`stateseq/gpu_server.py`）跨进程拼批。
+- **批不变 ⇒ 结果与并行度无关**：server 恒用固定块（`FIXED_CHUNK=64` 行，不满也按整块算）。前向没有跨行归约，同形状下每行结果只取决于本行输入，所以整场 arena / 自对弈与 workers、concurrency、拼批时机、槽淘汰重算都无关，逐位可复现（`tests/test_gpu_server.py`：多进程 / 小池淘汰与同进程逐位相同）。**块大小决定数值**，因此 `server_chunk` 进配置哈希；它与 reference / fast 的数值差 ~1e-5 量级（与 P3 并发 > 1 时的批大小差异同性质），同 seed 的对局会与 P3 不同。
+- **运行期参数不进哈希**：kit `EngineSpec.runtime`（`pool_slots`、临时 `server_dir`）传给工厂但不进 `identity()`，续跑可换服务目录 / 槽数。
+- **状态张量按层优先**（`conv (L,S,W,D)`、`ssm (L,S,H,P,N)`）：mamba 的 `*_indices` 内核用 int32 算槽偏移，原先按槽优先布局在 16 进程 × 大池时溢出成非法显存访问；现单层视图的元素数 < 2³¹，超出直接报错。
+- **攒批**：服务端不等待（`UNICHESS_GPU_MAX_WAIT_MS=0`）。实测在闭环里“等满一块再算”反而拖慢客户端（12×32：128 块 49.7 → 48.6 plies/s）。
+- **吞吐**（5070 Ti，gen2 vs gen3，256 模拟、m0=16、384 局 × 10 ply）：P3 reference 3.83 plies/s → fast 6×32 48.6 → **server 16×24 55.4**（约 14.5 倍；GPU 利用率约 80%，服务进程 busy 93%，客户端 CPU 仅约 24%）。块 128 → 64 快约 5%。自对弈（gen3，g=1，整盘 ≤40 ply，含 book）：reference 4×24 7.55 plies/s → server 16×24 81.3 plies/s（约 10.8 倍，含服务启动）。
+- **显存上限**：状态槽约 1 MB/槽，服务端按空闲显存（留 3 GiB）给每客户端分槽，超出预算自动降槽（淘汰 / 重算增多，结果不变）。workers × concurrency 过大时（如 20×24、12×48）单客户端在途节点把槽全部钉住 → “状态池耗尽”报错。推荐 arena `--workers 16 --concurrency 24`。

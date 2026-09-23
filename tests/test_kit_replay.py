@@ -39,7 +39,7 @@ except ImportError:  # pragma: no cover - 本机无 torch 或缺兄弟仓库 Kit
     _OK = False
 
 
-class _FakeEvaluator:
+class _FakeEvaluator(ka.ReferenceStateAPI if _OK else object):
     """记录每个负载（局面特征 + 输入 cache）；cache 是步进计数，便于核对重放链。"""
 
     model_key = "fake"

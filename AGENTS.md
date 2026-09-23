@@ -157,6 +157,10 @@ UniChessSSM/
 已验证可行档位：round2 用 `--concurrency 24 --workers 4`（GPU 利用率 97%）；成功的 fix500 用
 `workers=4`，0.427 games/s（500 局约 20 分钟）。**显存预算按 workers × concurrency 算，不是 concurrency**。
 失败时生成器**故意不合并**已产出的部分分片，避免未验证批次混入正式数据。
+**P4（2026-09-24）后上述陷阱只适用于 `--engine fast/reference`**：默认 `--engine server` 下 worker 纯 CPU、
+不建 CUDA context，显存只有一个 GPU 服务进程（权重 + 全体状态槽，按空闲显存自动限槽）。
+推荐 `--workers 16 --concurrency 24`（arena 55 plies/s，P3 为 3.83）；再大会报“状态池耗尽”。
+结果与 workers / concurrency 无关、逐位可复现。细节见 `docs/design-deviations.md` §2.5。
 
 ## 5. Stage B 硬约束（阶段① 实现+单测）
 

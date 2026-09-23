@@ -16,6 +16,7 @@ Gumbel 顺序减半 + book ply 的 π′ 跨局共享）与 RecordSink（``V3Sin
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import shutil
@@ -64,15 +65,59 @@ class SelfPlayConfig:
     openings_path: str = ""
     book_plies: int = 6  # 开局注入 ply 数（着法仍走 book，π′ 由搜索产生并跨局共享）
     first_game: int = 0  # 全局局序号起点（多进程分片）
+    # server = 共享 GPU 服务跨进程拼批（P4 默认，批不变 ⇒ 与进程数无关、逐位可复现）；
+    # fast = 本进程 GPU 槽池 + CUDA graph；reference = 原实现（逐位对照）
+    engine: str = "server"
+    pool_slots: int = 0  # 每进程状态槽数（每槽约 1 MB）；0 = 按并发自动
+    server_dir: str = ""  # engine=server：已启动的服务目录（多进程时由主进程给出；空 = 自己起一个）
+    server_chunk: int = 0  # engine=server：批不变块大小（决定数值）；0 = FIXED_CHUNK
 
 
 # ------------------------- 生成主循环 -------------------------
 
+def resolve_server_chunk(chunk: int) -> int:
+    from stateseq.fast_eval import FIXED_CHUNK
+    return int(chunk or FIXED_CHUNK)
+
+
+def resolve_pool_slots(cfg: SelfPlayConfig) -> int:
+    """pool_slots 0 = 按并发自动（自对弈一局只钉住一个当前局面）。"""
+    if cfg.pool_slots > 0 or cfg.engine == "reference":
+        return cfg.pool_slots or 2048
+    from stateseq.fast_eval import auto_pool_slots
+    return auto_pool_slots(cfg.concurrency, cfg.m0, holds_per_game=1)
+
+
+def _update_manifest_gen(out_dir: str, stats: dict) -> None:
+    manifest_path = os.path.join(out_dir, "manifest.json")
+    try:
+        with open(manifest_path, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except FileNotFoundError:
+        manifest = {}
+    manifest["gen"] = stats
+    with open(manifest_path, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, ensure_ascii=False, indent=1)
+
+
 def generate(cfg: SelfPlayConfig, progress_every: int = 20) -> dict:
+    if cfg.engine == "server" and not cfg.server_dir:
+        from stateseq.gpu_server import GpuServer
+
+        with GpuServer([os.path.abspath(cfg.ckpt)], n_clients=1,
+                       slots_per_client=resolve_pool_slots(cfg), device=cfg.device,
+                       chunk=resolve_server_chunk(cfg.server_chunk)) as srv:
+            stats = generate(dataclasses.replace(cfg, server_dir=srv.dir), progress_every)
+        stats["gpu_server"] = srv.final_stats
+        _update_manifest_gen(cfg.out_dir, stats)
+        return stats
     writer = V3ShardWriter(cfg.out_dir, cfg.tag)
     factory = make_selfplay_factory(cfg.ckpt, device=cfg.device, simulations=cfg.n_sims,
                                     m0=cfg.m0, g=cfg.gumbel_g, c_visit=cfg.c_visit,
-                                    c_scale=cfg.c_scale)
+                                    c_scale=cfg.c_scale, engine=cfg.engine,
+                                    pool_slots=resolve_pool_slots(cfg),
+                                    server_dir=cfg.server_dir or None,
+                                    server_chunk=resolve_server_chunk(cfg.server_chunk))
     sink = V3Sink(writer, gen_id=cfg.gen_id, ckpt_step=cfg.ckpt_step, elo=cfg.elo,
                   tc_bucket=cfg.tc_bucket)
     kcfg = KitSelfPlayConfig(games=cfg.num_games, seed=cfg.seed, max_plies=cfg.max_plies,
@@ -124,17 +169,13 @@ def generate(cfg: SelfPlayConfig, progress_every: int = 20) -> dict:
         "seed": cfg.seed,
         "first_game": cfg.first_game,
         "model_forwards": factory.evaluator.n_forwards,
+        "engine": cfg.engine,
+        **({"server_chunk": resolve_server_chunk(cfg.server_chunk)}
+           if cfg.engine == "server" else {}),
+        "evaluator": (factory.evaluator.stats() if hasattr(factory.evaluator, "stats") else {}),
         "batch": summary["batch"],
     }
-    manifest_path = os.path.join(cfg.out_dir, "manifest.json")
-    try:
-        with open(manifest_path, encoding="utf-8") as fh:
-            manifest = json.load(fh)
-    except FileNotFoundError:
-        manifest = {}
-    manifest["gen"] = stats
-    with open(manifest_path, "w", encoding="utf-8") as fh:
-        json.dump(manifest, fh, ensure_ascii=False, indent=1)
+    _update_manifest_gen(cfg.out_dir, stats)
 
     print(f"生成完毕：{sink.games} 局，{elapsed:.1f}s，"
           f"{stats['games_per_s']:.3f} games/s，{stats['plies_per_s']:.2f} plies/s，"
@@ -187,7 +228,8 @@ def _merge_worker_outputs(out_dir: str, worker_dirs: list[str], wall_elapsed: fl
         book_hits += gen.get("book_memo_hits", 0)
         book_misses += gen.get("book_memo_misses", 0)
         last_cfg = {k: gen.get(k) for k in ("concurrency", "n_sims", "m0", "gen_id", "ckpt_step",
-                                            "c_visit", "c_scale", "book_plies", "max_plies")
+                                            "c_visit", "c_scale", "book_plies", "max_plies",
+                                            "engine", "server_chunk")
                     if k in gen}
         shutil.rmtree(wd, ignore_errors=True)
 
@@ -233,6 +275,35 @@ def worker_ranges(games: int, workers: int, first_game: int = 0) -> list[tuple[i
 def run_workers(args: argparse.Namespace) -> None:
     n = args.workers
     os.makedirs(args.out, exist_ok=True)
+    server = None
+    if args.engine == "server":
+        from stateseq.gpu_server import GpuServer
+
+        active = sum(1 for _, k in worker_ranges(args.games, n, args.first_game) if k > 0)
+        slots = resolve_pool_slots(SelfPlayConfig(ckpt=args.ckpt, out_dir=args.out, tag=args.tag,
+                                                  num_games=args.games,
+                                                  concurrency=args.concurrency, m0=args.m0,
+                                                  engine=args.engine,
+                                                  pool_slots=args.pool_slots))
+        server = GpuServer([os.path.abspath(args.ckpt)], n_clients=max(1, active),
+                           slots_per_client=slots,
+                           chunk=resolve_server_chunk(args.server_chunk)).start()
+        print(f"[gpu_server] {server.dir} 客户端 {active}，每客户端槽 "
+              f"{server.meta['slots_per_client']}", flush=True)
+    try:
+        _run_worker_procs(args, server)
+    finally:
+        if server is not None:
+            server.stop()
+    if server is not None and os.path.exists(os.path.join(args.out, "manifest.json")):
+        with open(os.path.join(args.out, "manifest.json"), encoding="utf-8") as fh:
+            gen = json.load(fh).get("gen", {})
+        gen["gpu_server"] = server.final_stats
+        _update_manifest_gen(args.out, gen)
+
+
+def _run_worker_procs(args: argparse.Namespace, server) -> None:
+    n = args.workers
     procs = []
     t0 = time.time()
     for i, (first, n_games) in enumerate(worker_ranges(args.games, n, args.first_game)):
@@ -249,7 +320,11 @@ def run_workers(args: argparse.Namespace) -> None:
                "--gen_id", str(args.gen_id), "--ckpt_step", str(args.ckpt_step),
                "--g", str(args.g),
                "--c_visit", str(args.c_visit), "--c_scale", str(args.c_scale),
-               "--book-plies", str(args.book_plies)]
+               "--book-plies", str(args.book_plies),
+               "--engine", args.engine, "--pool-slots", str(args.pool_slots),
+               "--server-chunk", str(args.server_chunk)]
+        if server is not None:
+            cmd.extend(["--gpu-server", server.dir])
         if args.openings:
             cmd.extend(["--openings", args.openings])
         log_path = os.path.join(wdir, "worker.log")
@@ -292,7 +367,7 @@ def main() -> None:
     ap.add_argument("--max_plies", type=int, default=300, help="整盘 ply 上限（含 book）")
     ap.add_argument("--gen_id", type=int, default=1)
     ap.add_argument("--workers", type=int, default=1,
-                    help="并行 OS 进程数（跨核；每进程独立 CUDA context）。>1 时委派给 run_workers。")
+                    help="并行 OS 进程数（跨核）。>1 时委派给 run_workers；server 引擎下 worker 纯 CPU、共用一个 GPU 服务进程。")
     ap.add_argument("--ckpt_step", type=int, default=0)
     ap.add_argument("--g", type=float, default=1.0,
                     help="Gumbel 噪声尺度；1.0 训练/生成，0.0 评测/换代 arena")
@@ -304,6 +379,16 @@ def main() -> None:
                     help="开局着法文件路径（每行 SAN/UCI 着法序列，如 data/openings_200.txt）")
     ap.add_argument("--book-plies", type=int, default=6,
                     help="开局注入 ply 数：着法走 book，π′ 由搜索产生并按 (开局, ply) 跨局共享")
+    ap.add_argument("--engine", choices=("server", "fast", "reference"), default="server",
+                    help="server：共享 GPU 服务跨进程拼批（P4 默认；批不变，结果与 workers/concurrency "
+                         "无关、逐位可复现）；fast：每进程各自的 GPU 槽池 + CUDA graph；"
+                         "reference：原 cat/split + 重放 + 串行（与 P3 逐位对照）")
+    ap.add_argument("--pool-slots", type=int, default=0,
+                    help="每进程（每客户端）状态槽数（每槽约 1 MB；不足时 LRU 淘汰 + 重算）。"
+                         "0 = 按 concurrency×(1+m0) 自动")
+    ap.add_argument("--server-chunk", type=int, default=0,
+                    help="server：批不变块大小（行，取 fast_eval.BUCKETS 之一，如 32/64/128）。决定数值；0 = 默认 FIXED_CHUNK")
+    ap.add_argument("--gpu-server", default="", help=argparse.SUPPRESS)  # 内部：主进程传给 worker
     args = ap.parse_args()
 
     if args.workers > 1:
@@ -328,6 +413,10 @@ def main() -> None:
         openings_path=args.openings,
         book_plies=args.book_plies,
         first_game=args.first_game,
+        engine=args.engine,
+        pool_slots=args.pool_slots,
+        server_dir=args.gpu_server,
+        server_chunk=args.server_chunk,
     )
     generate(cfg)
 

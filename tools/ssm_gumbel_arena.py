@@ -265,11 +265,34 @@ def _compare_models(ckpt_a: str, ckpt_b: str) -> dict:
                                    "models_differ_functionally": policy_diff > 1e-6}}
 
 
-def engine_spec(ckpt: str, label: str, args, c_scale: float) -> EngineSpec:
-    return EngineSpec(factory=FACTORY, root=HERE, label=label,
-                      kwargs={"checkpoint": os.path.abspath(ckpt), "name": label,
-                              "simulations": args.n_sims, "m0": args.m0, "g": 0.0,
-                              "c_visit": args.c_visit, "c_scale": c_scale})
+def engine_spec(ckpt: str, label: str, args, c_scale: float,
+                server_dir: str | None = None) -> EngineSpec:
+    kwargs = {"checkpoint": os.path.abspath(ckpt), "name": label,
+              "simulations": args.n_sims, "m0": args.m0, "g": 0.0,
+              "c_visit": args.c_visit, "c_scale": c_scale,
+              "engine": getattr(args, "engine", "server")}
+    if kwargs["engine"] == "server":        # 块大小决定数值 → 进配置哈希
+        kwargs["server_chunk"] = server_chunk(args)
+    # 槽数（淘汰 + 重算逐位不变）与服务目录（每次运行不同）都不影响结果 → runtime：
+    # 照样传给工厂，但不进配置哈希，续跑时可以不同
+    runtime = {"pool_slots": resolve_pool_slots(args)}
+    if server_dir:
+        runtime["server_dir"] = server_dir
+    return EngineSpec(factory=FACTORY, root=HERE, label=label, kwargs=kwargs, runtime=runtime)
+
+
+def server_chunk(args) -> int:
+    from stateseq.fast_eval import FIXED_CHUNK
+    return int(getattr(args, "server_chunk", 0) or FIXED_CHUNK)
+
+
+def resolve_pool_slots(args) -> int:
+    """--pool-slots 0 = 按并发自动（每进程 A/B 共用一套槽，每局钉住两方当前局面）。"""
+    slots = int(getattr(args, "pool_slots", 0) or 0)
+    if slots > 0 or getattr(args, "engine", "server") == "reference":
+        return slots or 2048
+    from stateseq.fast_eval import auto_pool_slots
+    return auto_pool_slots(args.concurrency, args.m0, holds_per_game=2)
 
 
 def run_arena(args) -> tuple[list, dict | None, dict]:
@@ -291,8 +314,18 @@ def run_arena(args) -> tuple[list, dict | None, dict]:
     cfg = MatchConfig(pairs=num_pairs, seed=args.seed, max_plies=args.max_plies,
                       concurrency=args.concurrency, openings=openings, sprt=sprt,
                       workers=max(1, args.workers), max_plies_after_opening=True)
-    spec_a = engine_spec(args.ckpt_a, "A", args, args.c_scale_a)
-    spec_b = engine_spec(args.ckpt_b, "B", args, args.c_scale_b)
+    server = None
+    if getattr(args, "engine", "server") == "server":
+        from stateseq.gpu_server import GpuServer
+
+        server = GpuServer([os.path.abspath(args.ckpt_a), os.path.abspath(args.ckpt_b)],
+                           n_clients=max(1, args.workers),
+                           slots_per_client=resolve_pool_slots(args),
+                           chunk=server_chunk(args)).start()
+        print(f"[gpu_server] {server.dir} 每客户端槽 {server.meta['slots_per_client']}", flush=True)
+    server_dir = server.dir if server is not None else None
+    spec_a = engine_spec(args.ckpt_a, "A", args, args.c_scale_a, server_dir)
+    spec_b = engine_spec(args.ckpt_b, "B", args, args.c_scale_b, server_dir)
 
     kit_path = os.path.join(args.out, "kit_results.jsonl")
     hist_path = os.path.join(args.out, "expand_hist.jsonl")
@@ -332,6 +365,10 @@ def run_arena(args) -> tuple[list, dict | None, dict]:
                             progress=progress, observer=observer)
     finally:
         hist_fh.close()
+        if server is not None:
+            server.stop()
+    if server is not None:
+        summary["gpu_server"] = server.final_stats
     ckpts = {"A": args.ckpt_a, "B": args.ckpt_b}
     games_log = [game_dict(r, ckpts, opening_ids, done_hists.get(r["game"]))
                  for r in _read_kit_games(kit_path)]
@@ -369,6 +406,16 @@ def main():
     ap.add_argument("--concurrency", type=int, default=24,
                     help="每进程的并发局数（批大小≈该值×模型数，默认 24）")
     ap.add_argument("--test-scoring", action="store_true")
+    ap.add_argument("--engine", choices=("server", "fast", "reference"), default="server",
+                    help="server：共享 GPU 服务跨进程拼批（P4 默认；批不变，结果与 workers/concurrency "
+                         "无关、逐位可复现）；fast：每进程各自的 GPU 槽池 + CUDA graph；"
+                         "reference：原 cat/split + 重放 + 串行（与 P3 逐位对照）")
+    ap.add_argument("--pool-slots", type=int, default=0,
+                    help="server/fast：每进程（每客户端）状态槽数（A/B 共用；每槽约 1 MB，不足时 LRU 淘汰"
+                         " + 重算）。0 = 按 concurrency×(2+m0) 自动")
+    ap.add_argument("--server-chunk", type=int, default=0,
+                    help="server：批不变块大小（行，取 fast_eval.BUCKETS 之一，如 32/64/128）。块越小低负载时浪费越少、满载时吞吐越低；"
+                         "块大小决定数值（进配置哈希）。0 = 默认 FIXED_CHUNK")
     ap.add_argument("--c_visit", type=float, default=C_VISIT, help="双方共用的 c_visit")
     ap.add_argument("--c_scale_a", type=float, default=C_SCALE, help="A 侧 c_scale")
     ap.add_argument("--c_scale_b", type=float, default=C_SCALE, help="B 侧 c_scale")
@@ -405,6 +452,8 @@ def main():
     manifest["kit"] = {k: summary.get(k) for k in (
         "elo", "elo_ci95", "los", "pentanomial", "elo_pentanomial", "elo_pentanomial_ci95",
         "by_color", "mean_plies", "batch", "config_hash", "provenance")}
+    if "gpu_server" in summary:
+        manifest["gpu_server"] = summary["gpu_server"]
 
     with open(os.path.join(args.out, "arena.json"), "w") as fh:
         json.dump(manifest, fh, indent=1)

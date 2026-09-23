@@ -36,9 +36,15 @@ class StepRecord:
 
 
 def _board_key(board: chess.Board) -> tuple:
-    """局面重复判定键：棋子布置 + 走子方 + 易位权 + 合法过路兵（等价于 FEN 前三段+ep，裁判口径）。"""
+    """局面重复判定键：棋子布置 + 走子方 + 易位权 + 合法过路兵（等价于 FEN 前三段+ep，裁判口径）。
+
+    棋子布置用六类位棋盘 + 白方占位表示（与排序后的 piece_map 一一对应，相等关系完全相同，
+    tests/test_board_key_consistency.py 对照），比逐格 piece_map 快一个数量级——搜索里每个
+    新节点都要算一次。键只在进程内比较相等，从不落盘。
+    """
     return (
-        tuple(sorted(board.piece_map().items())),
+        board.pawns, board.knights, board.bishops, board.rooks, board.queens, board.kings,
+        board.occupied_co[chess.WHITE],
         board.turn,
         board.castling_rights,
         board.ep_square if board.has_legal_en_passant() else None,
