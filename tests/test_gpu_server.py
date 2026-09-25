@@ -1,4 +1,4 @@
-"""P4 共享 GPU 服务（``stateseq.gpu_server``）。需要 CUDA、Linux（/dev/shm + FIFO）与兄弟仓库 Kit。
+"""P4 共享 GPU 服务（``SSM.infer.gpu_server``）。需要 CUDA、Linux（/dev/shm + FIFO）与兄弟仓库 Kit。
 
 1. 服务端求值器与同进程批不变求值器整次搜索逐位相同（含小槽池淘汰 + 重算）；
 2. 两个模型按模型号分派，互不串台；
@@ -6,6 +6,17 @@
 4. 出错传播：坏请求 → 客户端 RuntimeError（带服务端 traceback）；坏权重 → 启动即报错。
 """
 from __future__ import annotations
+import os as _os
+import sys as _sys
+_HERE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_IMPORT_ROOT = _os.path.dirname(_HERE)   # import 根：~/UniChess：SSM 与 Kit 都是它的顶层包
+HERE = _HERE
+KIT_ROOT = _os.environ.get("UNICHESS_KIT_ROOT", _os.path.join(_IMPORT_ROOT, "Kit"))
+if _IMPORT_ROOT not in _sys.path:
+    _sys.path.insert(0, _IMPORT_ROOT)
+if _os.path.isdir(KIT_ROOT) and KIT_ROOT not in _sys.path:
+    _sys.path.append(KIT_ROOT)   # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
+
 
 import os
 import pickle
@@ -15,11 +26,6 @@ import sys
 import tempfile
 import unittest
 
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, HERE)
-KIT_ROOT = os.environ.get("UNICHESS_KIT_ROOT", os.path.join(os.path.dirname(HERE), "Kit"))
-if os.path.isdir(KIT_ROOT) and KIT_ROOT not in sys.path:
-    sys.path.append(KIT_ROOT)  # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
 
 try:
     import torch
@@ -31,7 +37,7 @@ except ImportError:  # pragma: no cover - 本机（Windows）无 torch
     _HAS_CUDA = False
 
 try:
-    import unichess_kit  # noqa: F401
+    import Kit  # noqa: F401
 
     _HAS_KIT = True
 except ImportError:  # pragma: no cover
@@ -46,10 +52,10 @@ FENS = [
 
 def _search(evaluator, fen: str, sims: int = 64, parallel: bool = True) -> tuple:
     """一次完整 Gumbel 搜索 → (着法, 根访问数 bytes, Q 累加 bytes, π′ bytes, 节点数)。"""
-    from stateseq import kit_adapter as ka
-    from unichess_kit.api import GameStart
-    from unichess_kit.runtime import Batcher, run_sync
-    from unichess_kit.search.gumbel import GumbelConfig
+    import SSM.kit as ka
+    from Kit.api import GameStart
+    from Kit.runtime import Batcher, run_sync
+    from Kit.search.gumbel import GumbelConfig
 
     board = chess.Board(fen)
     cfg = GumbelConfig(simulations=sims, m0=8, g=0.0, parallel=parallel)
@@ -66,7 +72,7 @@ def _search(evaluator, fen: str, sims: int = 64, parallel: bool = True) -> tuple
 
 def _worker_main(server_dir: str, ckpt: str, out: str) -> None:
     """子进程入口（``python test_gpu_server.py --worker DIR CKPT OUT``）：连服务、依次搜索，结果 pickle 到 OUT。"""
-    from stateseq.gpu_server import remote_evaluator
+    from SSM.infer.gpu_server import remote_evaluator
 
     ev = remote_evaluator(server_dir, ckpt)
     res = [_search(ev, f) for f in FENS]
@@ -79,9 +85,9 @@ def _worker_main(server_dir: str, ckpt: str, out: str) -> None:
 class TestGpuServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from stateseq import fast_eval as fe
-        from stateseq.gpu_server import GpuServer
-        from stateseq.model import SeqModel
+        from SSM.infer import fast_eval as fe
+        from SSM.infer.gpu_server import GpuServer
+        from SSM.model import SeqModel
 
         cls.fe = fe
         cls.tmp = tempfile.mkdtemp(prefix="p4_gpusrv_test_")
@@ -100,7 +106,7 @@ class TestGpuServer(unittest.TestCase):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def _local(self, k: int, slots: int = 1024):
-        from stateseq.kit_adapter import load_seq_model
+        from SSM.kit import load_seq_model
 
         fe = self.fe
         seq, _ = load_seq_model(self.ckpts[k], "cuda")
@@ -110,7 +116,7 @@ class TestGpuServer(unittest.TestCase):
                                          store=store)
 
     def _remote(self, k: int):
-        from stateseq.gpu_server import remote_evaluator
+        from SSM.infer.gpu_server import remote_evaluator
 
         return remote_evaluator(self.server.dir, self.ckpts[k])
 
@@ -122,7 +128,7 @@ class TestGpuServer(unittest.TestCase):
 
     def test_tiny_server_pool_eviction_bitwise(self):
         """每客户端仅 12 槽（串行模拟）：大量淘汰 + 重算，结果仍与同进程大池逐位相同。"""
-        from stateseq.gpu_server import GpuServer, remote_evaluator
+        from SSM.infer.gpu_server import GpuServer, remote_evaluator
 
         with GpuServer(self.ckpts[:1], n_clients=1, slots_per_client=12) as srv:
             remote = remote_evaluator(srv.dir, self.ckpts[0])
@@ -158,7 +164,7 @@ class TestGpuServer(unittest.TestCase):
 
     def test_tf32_precision(self):
         """tf32 服务：数值确实与 fp32 不同（开关生效）、自身可复现；配置与服务精度不符即拒绝。"""
-        from stateseq.gpu_server import GpuServer, remote_evaluator
+        from SSM.infer.gpu_server import GpuServer, remote_evaluator
 
         with self.assertRaises(ValueError):
             remote_evaluator(self.server.dir, self.ckpts[0], precision="tf32")
@@ -176,7 +182,7 @@ class TestGpuServer(unittest.TestCase):
             GpuServer(self.ckpts[:1], n_clients=1, slots_per_client=64, precision="bf16")
 
     def test_unknown_checkpoint_rejected(self):
-        from stateseq.gpu_server import remote_evaluator
+        from SSM.infer.gpu_server import remote_evaluator
 
         with self.assertRaises(KeyError):
             remote_evaluator(self.server.dir, os.path.join(self.tmp, "nope.pt"))
@@ -186,15 +192,15 @@ class TestGpuServer(unittest.TestCase):
                      "需要 CUDA、Linux /dev/shm 与兄弟仓库 Kit")
 class TestGpuServerErrors(unittest.TestCase):
     def test_bad_checkpoint_fails_at_start(self):
-        from stateseq.gpu_server import GpuServer
+        from SSM.infer.gpu_server import GpuServer
 
         with self.assertRaises(RuntimeError) as cm:
             GpuServer(["/nonexistent/model.pt"], n_clients=1, slots_per_client=64).start()
         self.assertIn("启动失败", str(cm.exception))
 
     def test_server_error_propagates_to_client(self):
-        from stateseq.gpu_server import GpuServer, RemoteBackend
-        from stateseq.model import SeqModel
+        from SSM.infer.gpu_server import GpuServer, RemoteBackend
+        from SSM.model import SeqModel
 
         tmp = tempfile.mkdtemp(prefix="p4_gpusrv_err_")
         try:

@@ -36,15 +36,15 @@ import unittest
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# 模拟 / 隔离 stateseq.conditions，使得无需 torch 即可导入 gshards.py
+# 模拟 / 隔离 SSM.conditions，使得无需 torch 即可导入 gshards.py
 # ---------------------------------------------------------------------------
-_stateseq_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "stateseq"))
-_data_dir = os.path.join(_stateseq_dir, "data")
+_ssm_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_data_dir = os.path.join(_ssm_dir, "dataset")
 _gshards_path = os.path.join(_data_dir, "gshards.py")
 
-# 如果 sys.modules 中没有 stateseq.conditions，注入一个纯 python 版本
-if "stateseq.conditions" not in sys.modules:
-    fake_conditions = types.ModuleType("stateseq.conditions")
+# 如果 sys.modules 中没有 SSM.conditions，注入一个纯 python 版本
+if "SSM.conditions" not in sys.modules:
+    fake_conditions = types.ModuleType("SSM.conditions")
 
     from enum import IntEnum
 
@@ -78,11 +78,10 @@ if "stateseq.conditions" not in sys.modules:
     fake_conditions.TimeControlBucket = TimeControlBucket
     fake_conditions.time_control_bucket = time_control_bucket
 
-    # 注册进入 sys.modules
-    sys.modules["stateseq"] = types.ModuleType("stateseq")
-    sys.modules["stateseq.conditions"] = fake_conditions
+    # 注册进 sys.modules
+    sys.modules["SSM.conditions"] = fake_conditions
 
-_spec = importlib.util.spec_from_file_location("stateseq.data.gshards", _gshards_path)
+_spec = importlib.util.spec_from_file_location("SSM.dataset.gshards", _gshards_path)
 gshards = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gshards)
 

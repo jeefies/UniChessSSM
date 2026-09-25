@@ -1,4 +1,4 @@
-"""S 的 kit 接入（``stateseq.kit_adapter``）单元测试。需要 CUDA 与兄弟仓库 Kit。
+"""S 的 kit 接入（``SSM.kit``）单元测试。需要 CUDA 与兄弟仓库 Kit。
 
 切换前与 S arena 原版 ``play_one_game`` 着法逐个相同、扩展深度直方图逐位相同（随机初始化
 模型、并发 1；真实权重见 git 历史中的 ``tools/kit_arena_parity.py``）。原版已删除，这里锁死：
@@ -9,16 +9,22 @@
 """
 
 from __future__ import annotations
+import os as _os
+import sys as _sys
+_HERE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_IMPORT_ROOT = _os.path.dirname(_HERE)   # import 根：~/UniChess：SSM 与 Kit 都是它的顶层包
+HERE = _HERE
+KIT_ROOT = _os.environ.get("UNICHESS_KIT_ROOT", _os.path.join(_IMPORT_ROOT, "Kit"))
+if _IMPORT_ROOT not in _sys.path:
+    _sys.path.insert(0, _IMPORT_ROOT)
+if _os.path.isdir(KIT_ROOT) and KIT_ROOT not in _sys.path:
+    _sys.path.append(KIT_ROOT)   # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
+
 
 import os
 import sys
 import unittest
 
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, HERE)
-KIT_ROOT = os.environ.get("UNICHESS_KIT_ROOT", os.path.join(os.path.dirname(HERE), "Kit"))
-if os.path.isdir(KIT_ROOT) and KIT_ROOT not in sys.path:
-    sys.path.append(KIT_ROOT)  # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
 
 try:
     import torch
@@ -29,10 +35,10 @@ try:
 except ImportError:  # pragma: no cover - 本机（Windows）无 torch
     _HAS_CUDA = False
 
-from stateseq.depth_hist import hist_merge, hist_summary  # noqa: E402
+from SSM.kit import hist_merge, hist_summary  # noqa: E402
 
 try:
-    import unichess_kit  # noqa: F401
+    import Kit  # noqa: F401
 
     _HAS_KIT = True
 except ImportError:  # pragma: no cover
@@ -43,8 +49,8 @@ except ImportError:  # pragma: no cover
 class TestKitAdapter(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from stateseq import kit_adapter as ka
-        from stateseq.model import SeqModel
+        import SSM.kit as ka
+        from SSM.model import SeqModel
 
         cls.ka = ka
         cls.seqs = {}
@@ -58,15 +64,15 @@ class TestKitAdapter(unittest.TestCase):
         return self.ka.SsmEvaluator(self.seqs[seed], "cuda", f"S:rand{seed}")
 
     def _factory(self, seed, n_sims, m0):
-        from unichess_kit.search.gumbel import GumbelConfig
+        from Kit.search.gumbel import GumbelConfig
         return self.ka.SsmPlayerFactory(f"S{seed}", self._evaluator(seed),
                                         GumbelConfig(simulations=n_sims, m0=m0, g=0.0))
 
     def _kit_game(self, fa, fb, opening_uci, a_is_white, max_plies, seed=7, observer=None):
-        from unichess_kit.api import SearchBudget
-        from unichess_kit.pipelines.match import GameTask, play_game
-        from unichess_kit.rules.referee import StandardReferee
-        from unichess_kit.runtime import run_sync
+        from Kit.api import SearchBudget
+        from Kit.pipelines.match import GameTask, play_game
+        from Kit.rules.referee import StandardReferee
+        from Kit.runtime import run_sync
 
         task = GameTask(game=0, pair=0, a_is_white=a_is_white, opening=tuple(opening_uci),
                         seed_a=seed, seed_b=seed)
@@ -108,15 +114,15 @@ class TestKitAdapter(unittest.TestCase):
 
     def test_catch_up_equals_per_ply_stepping(self):
         """懒追赶（choose 时一次补齐）与逐 ply 步进得到同一 cache 与根评估。"""
-        from unichess_kit.api import GameStart, SearchBudget
-        from unichess_kit.runtime import run_sync
+        from Kit.api import GameStart, SearchBudget
+        from Kit.runtime import run_sync
 
         ev = self._evaluator(1)
         board = chess.Board()
         for san in ("e4", "e5", "Nf3", "Nc6", "Bb5"):
             board.push_san(san)
         # 参考：逐局面步进（encode-before-increment）
-        from stateseq.data.sequences import _board_key
+        from SSM.dataset.sequences import _board_key
         cache, occ, out = ev.initial_cache(), {}, None
         replay = chess.Board()
         for k in range(len(board.move_stack) + 1):
@@ -138,14 +144,14 @@ class TestKitAdapter(unittest.TestCase):
 
     def test_expander_multi_leaf_lockstep(self):
         """多叶子同步重放与逐个展开一致（批大小不同，只要求浮点级接近）。"""
-        from unichess_kit.api import Leaf
-        from unichess_kit.runtime import run_sync
+        from Kit.api import Leaf
+        from Kit.runtime import run_sync
 
         ev = self._evaluator(2)
         exp = self.ka.SsmExpander(ev)
         root_board = chess.Board()
         (out,) = ev.evaluate([self.ka.encode_payload(root_board, 0, ev.initial_cache())])
-        from stateseq.data.sequences import _board_key
+        from SSM.dataset.sequences import _board_key
         root = self.ka.RootState(ply=0, cache=out[2], occurrence={_board_key(root_board): 1})
         lines = [("e2e4",), ("d2d4", "d7d5"), ("g1f3", "g8f6", "c2c4")]
         leaves = []
@@ -168,8 +174,8 @@ class TestKitAdapter(unittest.TestCase):
         self.assertEqual(root.occurrence, {_board_key(root_board): 1})
 
     def test_expander_rejects_missing_root(self):
-        from unichess_kit.api import Leaf
-        from unichess_kit.runtime import run_sync
+        from Kit.api import Leaf
+        from Kit.runtime import run_sync
 
         exp = self.ka.SsmExpander(self._evaluator(1))
         with self.assertRaises(ValueError):
@@ -178,7 +184,7 @@ class TestKitAdapter(unittest.TestCase):
     def test_run_match_concurrent(self):
         """并发 4 的 kit 批量对弈能跑通（批大小变化 → 只验证合法与计数，不验逐位）。"""
         import tempfile
-        from unichess_kit.pipelines.match import MatchConfig, run_match
+        from Kit.pipelines.match import MatchConfig, run_match
 
         fa, fb = self._factory(1, 8, 4), self._factory(2, 8, 4)
         with tempfile.TemporaryDirectory() as d:

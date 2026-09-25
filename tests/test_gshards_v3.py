@@ -10,20 +10,20 @@ import unittest
 
 import numpy as np
 
-# 直接加载 gshards 模块，绕过 stateseq.data.__init__ 的 chess 依赖
-_gshards_path = os.path.join(os.path.dirname(__file__), "..", "stateseq", "data", "gshards.py")
+# 直接加载 gshards 模块，绕过 SSM.dataset 的 chess 依赖
+_gshards_path = os.path.join(os.path.dirname(__file__), "..", "dataset", "gshards.py")
 _gshards_dir = os.path.dirname(_gshards_path)
 if _gshards_dir not in sys.path:
     sys.path.insert(0, _gshards_dir)
 
 # 先加载 conditions（无 chess 依赖）
-_conditions_path = os.path.join(_gshards_dir, "..", "conditions.py")
-_conditions_spec = importlib.util.spec_from_file_location("stateseq.conditions", _conditions_path)
+_conditions_path = os.path.join(os.path.dirname(__file__), "..", "conditions.py")
+_conditions_spec = importlib.util.spec_from_file_location("SSM.conditions", _conditions_path)
 _conditions_mod = importlib.util.module_from_spec(_conditions_spec)
 _conditions_spec.loader.exec_module(_conditions_mod)
 
 # 再加载 gshards
-_gshards_spec = importlib.util.spec_from_file_location("stateseq.data.gshards", _gshards_path)
+_gshards_spec = importlib.util.spec_from_file_location("SSM.dataset.gshards", _gshards_path)
 gshards = importlib.util.module_from_spec(_gshards_spec)
 _gshards_spec.loader.exec_module(gshards)
 

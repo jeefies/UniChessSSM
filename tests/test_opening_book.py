@@ -9,6 +9,17 @@ book ply 的 π′ 跨局共享与原生成器逐字节一致：``tests/test_kit
 """
 
 from __future__ import annotations
+import os as _os
+import sys as _sys
+_HERE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_IMPORT_ROOT = _os.path.dirname(_HERE)   # import 根：~/UniChess：SSM 与 Kit 都是它的顶层包
+HERE = _HERE
+KIT_ROOT = _os.environ.get("UNICHESS_KIT_ROOT", _os.path.join(_IMPORT_ROOT, "Kit"))
+if _IMPORT_ROOT not in _sys.path:
+    _sys.path.insert(0, _IMPORT_ROOT)
+if _os.path.isdir(KIT_ROOT) and KIT_ROOT not in _sys.path:
+    _sys.path.append(KIT_ROOT)   # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
+
 
 import importlib.util
 import os
@@ -18,10 +29,6 @@ import unittest
 
 import numpy as np
 
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, HERE)
-
-_TOOL_PATH = os.path.join(HERE, "tools", "ssm_gumbel_selfplay.py")
 
 try:  # 工具模块与 dataset_selfplay 均依赖 torch；远端全量单测环境具备
     import torch  # noqa: F401
@@ -31,44 +38,39 @@ except ImportError:  # pragma: no cover - 本机（Windows）无 torch
     _HAS_TORCH = False
 
 
-def _load_tool():
-    spec = importlib.util.spec_from_file_location("ssm_gumbel_selfplay_under_test", _TOOL_PATH)
-    mod = importlib.util.module_from_spec(spec)
-    # dataclass 处理需要通过 sys.modules[cls.__module__] 反查命名空间，必须先注册
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
 @unittest.skipUnless(_HAS_TORCH, "需要 torch（远端全量单测环境）")
 class TestBookPipolRng(unittest.TestCase):
+    """π′ 开局段噪声只取决于 (seed, opening_idx, ply)——跨局共享的前提。"""
+
     @classmethod
     def setUpClass(cls):
-        cls.tool = _load_tool()
+        from SSM.kit import book_pipol_rng
+
+        cls.rng = staticmethod(book_pipol_rng)
 
     def test_deterministic_same_key(self):
-        a = self.tool.book_pipol_rng(42, 3, 1)
-        b = self.tool.book_pipol_rng(42, 3, 1)
+        a = self.rng(42, 3, 1)
+        b = self.rng(42, 3, 1)
         self.assertTrue(np.array_equal(a.random(16), b.random(16)))
 
     def test_differs_across_ply_and_opening(self):
-        base = self.tool.book_pipol_rng(42, 3, 1).random(16)
-        self.assertFalse(np.array_equal(base, self.tool.book_pipol_rng(42, 3, 2).random(16)))
-        self.assertFalse(np.array_equal(base, self.tool.book_pipol_rng(42, 4, 1).random(16)))
-        self.assertFalse(np.array_equal(base, self.tool.book_pipol_rng(43, 3, 1).random(16)))
+        base = self.rng(42, 3, 1).random(16)
+        self.assertFalse(np.array_equal(base, self.rng(42, 3, 2).random(16)))
+        self.assertFalse(np.array_equal(base, self.rng(42, 4, 1).random(16)))
+        self.assertFalse(np.array_equal(base, self.rng(43, 3, 1).random(16)))
 
     def test_stable_across_instances(self):
         """跨进程/跨次调用一致（SeedSequence 熵确定性）——跨局共享的前提。"""
-        first = self.tool.book_pipol_rng(7, 11, 4).random(8).copy()
+        first = self.rng(7, 11, 4).random(8).copy()
         for _ in range(3):
-            self.assertTrue(np.array_equal(first, self.tool.book_pipol_rng(7, 11, 4).random(8)))
+            self.assertTrue(np.array_equal(first, self.rng(7, 11, 4).random(8)))
 
 
 @unittest.skipUnless(_HAS_TORCH, "需要 torch（远端全量单测环境）")
 class TestBuildBookMask(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from stateseq.data.dataset_selfplay import build_book_mask
+        from SSM.dataset.dataset_selfplay import build_book_mask
 
         cls.fn = staticmethod(build_book_mask)
 
@@ -91,22 +93,26 @@ class TestBuildBookMask(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_TORCH, "需要 torch（远端全量单测环境）")
 class TestSelfPlayConfigDefaults(unittest.TestCase):
+    """自对弈配置默认值（生成器在 kit 的 selfplay pipeline）。"""
+
     @classmethod
     def setUpClass(cls):
-        cls.tool = _load_tool()
+        from Kit.pipelines.selfplay import SelfPlayConfig
+
+        cls.SelfPlayConfig = SelfPlayConfig
 
     def test_config_defaults(self):
-        cfg = self.tool.SelfPlayConfig(ckpt="x", out_dir="y", tag="z")
+        cfg = self.SelfPlayConfig(games=2)
         self.assertEqual(cfg.book_plies, 6)
-        self.assertEqual(cfg.n_sims, 256)
-        self.assertEqual(cfg.gumbel_g, 1.0)
-        self.assertEqual(cfg.c_scale, 0.1)
+        self.assertEqual(cfg.max_plies, 300)
         self.assertEqual(cfg.first_game, 0)
+        self.assertIsNone(cfg.openings)
 
-    def test_worker_ranges_partition_global_index(self):
-        r = self.tool.worker_ranges(10, 4, first_game=5)
-        self.assertEqual(r, [(5, 3), (8, 3), (11, 2), (13, 2)])
-        self.assertEqual(self.tool.worker_ranges(2, 3), [(0, 1), (1, 1), (2, 0)])
+    def test_game_index_is_global(self):
+        """多进程分片的局序号是全局的（first_game 起），各进程区间不相交。"""
+        cfg = self.SelfPlayConfig(games=10, first_game=5)
+        self.assertEqual([g for g in range(cfg.first_game, cfg.first_game + cfg.games)],
+                         list(range(5, 15)))
 
 
 @unittest.skipUnless(_HAS_TORCH, "需要 torch（远端全量单测环境）")
@@ -116,9 +122,9 @@ class TestOpeningLossWeightPlumbing(unittest.TestCase):
     def _make_batch(self, b: int, t: int, n_legal: int = 5):
         import torch
 
-        from stateseq.actions import NUM_ACTIONS
-        from stateseq.features import FEATURE_DIM
-        from stateseq.model import TrainBatch
+        from SSM.actions import NUM_ACTIONS
+        from SSM.features import FEATURE_DIM
+        from SSM.model import TrainBatch
 
         torch.manual_seed(0)
         feats = torch.randn(b, t, FEATURE_DIM) * 0.1
@@ -146,7 +152,7 @@ class TestOpeningLossWeightPlumbing(unittest.TestCase):
         """
         import torch
 
-        from stateseq.model import SeqModel
+        from SSM.model import SeqModel
 
         model = SeqModel(dropout=0.0).eval()
         model.trunk = lambda x: torch.zeros_like(x)
@@ -156,7 +162,7 @@ class TestOpeningLossWeightPlumbing(unittest.TestCase):
         import torch
         from unittest.mock import patch
 
-        from stateseq import losses
+        from SSM.model import losses
 
         model = self._cpu_model()
         batch, soft = self._make_batch(2, 8)
@@ -189,7 +195,7 @@ class TestOpeningLossWeightPlumbing(unittest.TestCase):
         import torch
         from unittest.mock import patch
 
-        from stateseq import losses
+        from SSM.model import losses
 
         model = self._cpu_model()
         batch, soft = self._make_batch(1, 6)

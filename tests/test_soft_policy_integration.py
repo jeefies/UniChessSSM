@@ -1,29 +1,40 @@
 """A#6 补充（集成级）：train/stage_b2.py 实际使用的 forward_train(policy_soft_target=...)
 路径——含 padding、终局无合法着、bf16 autocast——前向+反向全部有限。
 
-tests/test_gumbel.py::SoftCESafetyTest 只验证 stateseq.gumbel.pi_prime 这一纯数学函数；
+tests/test_gumbel.py::SoftCESafetyTest 只验证 Kit/search/gumbel.pi_prime 这一纯数学函数；
 本测试覆盖的是训练器真正调用的集成路径（model.forward_train 新增的软目标分支 +
 policy_soft_loss + bf16 autocast），防止两者实现不同步。
 需要 CUDA（R 主干前向/反向仅 GPU 可行）；无 GPU 时跳过。
 """
 
 from __future__ import annotations
+import os as _os
+import sys as _sys
+_HERE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_IMPORT_ROOT = _os.path.dirname(_HERE)   # import 根：~/UniChess：SSM 与 Kit 都是它的顶层包
+HERE = _HERE
+KIT_ROOT = _os.environ.get("UNICHESS_KIT_ROOT", _os.path.join(_IMPORT_ROOT, "Kit"))
+if _IMPORT_ROOT not in _sys.path:
+    _sys.path.insert(0, _IMPORT_ROOT)
+if _os.path.isdir(KIT_ROOT) and KIT_ROOT not in _sys.path:
+    _sys.path.append(KIT_ROOT)   # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
+
 
 import math
 import unittest
 
 import torch
 
-from stateseq.conditions import TimeControlBucket
+from SSM.conditions import TimeControlBucket
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "R 主干前向/反向需 CUDA")
 class SoftPolicyIntegrationSafetyTest(unittest.TestCase):
     def test_forward_backward_finite_with_soft_target(self):
-        from stateseq import losses
-        from stateseq.actions import NUM_ACTIONS
-        from stateseq.features import FEATURE_DIM
-        from stateseq.model import SeqModel, TrainBatch
+        from SSM.model import losses
+        from SSM.actions import NUM_ACTIONS
+        from SSM.features import FEATURE_DIM
+        from SSM.model import SeqModel, TrainBatch
 
         torch.manual_seed(0)
         device = "cuda"

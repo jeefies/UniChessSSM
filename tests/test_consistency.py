@@ -5,6 +5,17 @@
 """
 
 from __future__ import annotations
+import os as _os
+import sys as _sys
+_HERE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_IMPORT_ROOT = _os.path.dirname(_HERE)   # import 根：~/UniChess：SSM 与 Kit 都是它的顶层包
+HERE = _HERE
+KIT_ROOT = _os.environ.get("UNICHESS_KIT_ROOT", _os.path.join(_IMPORT_ROOT, "Kit"))
+if _IMPORT_ROOT not in _sys.path:
+    _sys.path.insert(0, _IMPORT_ROOT)
+if _os.path.isdir(KIT_ROOT) and KIT_ROOT not in _sys.path:
+    _sys.path.append(KIT_ROOT)   # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
+
 
 import unittest
 
@@ -17,8 +28,8 @@ try:
 except ImportError:  # pragma: no cover
     _HAS_CHESS = False
 
-from stateseq.conditions import TimeControlBucket
-from stateseq.features import encode
+from SSM.conditions import TimeControlBucket
+from SSM.features import encode
 
 
 def _synthetic_game_features(n_ply: int, seed: int = 0):
@@ -39,7 +50,7 @@ def _synthetic_game_features(n_ply: int, seed: int = 0):
 @unittest.skipUnless(torch.cuda.is_available(), "mamba_ssm 单步 kernel 仅支持 CUDA")
 class SequenceConsistencyTest(unittest.TestCase):
     def test_full_vs_step(self):
-        from stateseq.model import SeqModel
+        from SSM.model import SeqModel
 
         torch.manual_seed(0)
         model = SeqModel(dropout=0.0).float().cuda().eval()

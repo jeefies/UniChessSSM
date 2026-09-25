@@ -8,6 +8,17 @@ arena/生成器开局的 encode-before-move 口径（B₀ 入 R、无重复步�
 """
 
 from __future__ import annotations
+import os as _os
+import sys as _sys
+_HERE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_IMPORT_ROOT = _os.path.dirname(_HERE)   # import 根：~/UniChess：SSM 与 Kit 都是它的顶层包
+HERE = _HERE
+KIT_ROOT = _os.environ.get("UNICHESS_KIT_ROOT", _os.path.join(_IMPORT_ROOT, "Kit"))
+if _IMPORT_ROOT not in _sys.path:
+    _sys.path.insert(0, _IMPORT_ROOT)
+if _os.path.isdir(KIT_ROOT) and KIT_ROOT not in _sys.path:
+    _sys.path.append(KIT_ROOT)   # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
+
 
 import os
 import sys
@@ -16,13 +27,9 @@ import unittest
 import chess
 import numpy as np
 
-from stateseq.adapter import classify_final_board
-from stateseq.gumbel import TERM_CODES
+from SSM.kit import classify_final_board
+from SSM.kit import TERM_CODES
 
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-KIT_ROOT = os.environ.get("UNICHESS_KIT_ROOT", os.path.join(os.path.dirname(HERE), "Kit"))
-if os.path.isdir(KIT_ROOT) and KIT_ROOT not in sys.path:
-    sys.path.append(KIT_ROOT)  # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
 
 
 def _claimable_threefold_board() -> chess.Board:
@@ -72,8 +79,8 @@ class TerminationClassifyTest(unittest.TestCase):
     def test_generator_sink_uses_same_verdict(self):
         """生成器落盘（kit_adapter.V3Sink）的终局字段必须与 classify_final_board 同口径。"""
         try:
-            from stateseq.kit_adapter import V3Sink
-            from unichess_kit.api import MoveDecision
+            from SSM.kit import V3Sink
+            from Kit.api import MoveDecision
         except ImportError:
             self.skipTest("需要 torch 与兄弟仓库 Kit")
 

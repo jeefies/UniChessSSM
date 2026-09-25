@@ -1,4 +1,4 @@
-"""P4 快速前向（``stateseq.fast_eval``）对照参考实现。需要 CUDA 与兄弟仓库 Kit。
+"""P4 快速前向（``SSM.infer.fast_eval``）对照参考实现。需要 CUDA 与兄弟仓库 Kit。
 
 1. 单步：与 ``SsmEvaluator``（SeqModel.step + cat/split）同批大小下 logits / wdl / 状态逐位相同，
    eager 与 CUDA graph 均是；
@@ -10,17 +10,23 @@
 5. 对局级：快速实现的 SsmPlayer 与参考实现的着法序列一致（并发 1、串行）。
 """
 from __future__ import annotations
+import os as _os
+import sys as _sys
+_HERE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_IMPORT_ROOT = _os.path.dirname(_HERE)   # import 根：~/UniChess：SSM 与 Kit 都是它的顶层包
+HERE = _HERE
+KIT_ROOT = _os.environ.get("UNICHESS_KIT_ROOT", _os.path.join(_IMPORT_ROOT, "Kit"))
+if _IMPORT_ROOT not in _sys.path:
+    _sys.path.insert(0, _IMPORT_ROOT)
+if _os.path.isdir(KIT_ROOT) and KIT_ROOT not in _sys.path:
+    _sys.path.append(KIT_ROOT)   # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
+
 
 import gc
 import os
 import sys
 import unittest
 
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, HERE)
-KIT_ROOT = os.environ.get("UNICHESS_KIT_ROOT", os.path.join(os.path.dirname(HERE), "Kit"))
-if os.path.isdir(KIT_ROOT) and KIT_ROOT not in sys.path:
-    sys.path.append(KIT_ROOT)  # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
 
 try:
     import torch
@@ -32,7 +38,7 @@ except ImportError:  # pragma: no cover - 本机（Windows）无 torch
     _HAS_CUDA = False
 
 try:
-    import unichess_kit  # noqa: F401
+    import Kit  # noqa: F401
 
     _HAS_KIT = True
 except ImportError:  # pragma: no cover
@@ -49,9 +55,9 @@ FENS = [
 class TestFastEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from stateseq import fast_eval as fe
-        from stateseq import kit_adapter as ka
-        from stateseq.model import SeqModel
+        from SSM.infer import fast_eval as fe
+        import SSM.kit as ka
+        from SSM.model import SeqModel
 
         cls.ka, cls.fe = ka, fe
         torch.manual_seed(3)
@@ -78,7 +84,7 @@ class TestFastEval(unittest.TestCase):
         return out
 
     def _encode(self, board, occ=0):
-        from stateseq.adapter import encode_board
+        from SSM.kit import encode_board
         feats, tc, elo, color = encode_board(board, occ)
         return np.asarray(feats, dtype=np.float32).reshape(-1), tc, elo, color
 
@@ -150,7 +156,7 @@ class TestFastEval(unittest.TestCase):
         from einops import repeat
         from mamba_ssm.ops.triton.selective_state_update import selective_state_update
 
-        from stateseq.ssm_update import ssm_update_src_dst
+        from SSM.infer.ssm_update import ssm_update_src_dst
 
         g = torch.Generator(device="cuda").manual_seed(0)
         blk = self.seq.r.blocks[0]
@@ -204,12 +210,12 @@ class TestFastEval(unittest.TestCase):
     # ---- 2-4. 搜索 ----
 
     def _search(self, evaluator, board, sims=48, m0=8, parallel=False, g=0.0):
-        from unichess_kit.runtime import Batcher, run_sync
-        from unichess_kit.search.gumbel import GumbelConfig
+        from Kit.runtime import Batcher, run_sync
+        from Kit.search.gumbel import GumbelConfig
 
         cfg = GumbelConfig(simulations=sims, m0=m0, g=g, parallel=parallel)
         player = self.ka.SsmPlayer("S", evaluator, cfg)
-        from unichess_kit.api import GameStart
+        from Kit.api import GameStart
         start_fen = None if board.move_stack else board.fen()
         run_sync(player.new_game(GameStart(color=board.turn, fen=start_fen, seed=11)))
         # 追赶到 board（从起始局面按着法步进）
@@ -257,9 +263,9 @@ class TestFastEval(unittest.TestCase):
     def test_shared_tiny_pool_two_evaluators_concurrent(self):
         """arena 口径：A/B 两个求值器共用一个极小的池、同一拍交错分配。一方刚重算出的祖先
         不得被另一方的分配淘汰（ensure 全链钉住），结果与各自大池单跑逐位相同。"""
-        from unichess_kit.api import GameStart, gather
-        from unichess_kit.runtime import Batcher, run_sync
-        from unichess_kit.search.gumbel import GumbelConfig
+        from Kit.api import GameStart, gather
+        from Kit.runtime import Batcher, run_sync
+        from Kit.search.gumbel import GumbelConfig
 
         boards = self._boards()[:2]
         solo = [self._search(self._fast(slots=1024), b, sims=64)[0] for b in boards]
@@ -307,11 +313,11 @@ class TestFastEval(unittest.TestCase):
     # ---- 5. 对局 ----
 
     def test_game_moves_match_reference(self):
-        from unichess_kit.api import SearchBudget
-        from unichess_kit.pipelines.match import GameTask, play_game
-        from unichess_kit.rules.referee import StandardReferee
-        from unichess_kit.runtime import run_sync
-        from unichess_kit.search.gumbel import GumbelConfig
+        from Kit.api import SearchBudget
+        from Kit.pipelines.match import GameTask, play_game
+        from Kit.rules.referee import StandardReferee
+        from Kit.runtime import run_sync
+        from Kit.search.gumbel import GumbelConfig
 
         def game(evaluator):
             cfg = GumbelConfig(simulations=16, m0=4, g=0.0, parallel=False)

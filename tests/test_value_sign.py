@@ -6,14 +6,25 @@
 """
 
 from __future__ import annotations
+import os as _os
+import sys as _sys
+_HERE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_IMPORT_ROOT = _os.path.dirname(_HERE)   # import 根：~/UniChess：SSM 与 Kit 都是它的顶层包
+HERE = _HERE
+KIT_ROOT = _os.environ.get("UNICHESS_KIT_ROOT", _os.path.join(_IMPORT_ROOT, "Kit"))
+if _IMPORT_ROOT not in _sys.path:
+    _sys.path.insert(0, _IMPORT_ROOT)
+if _os.path.isdir(KIT_ROOT) and KIT_ROOT not in _sys.path:
+    _sys.path.append(KIT_ROOT)   # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
+
 
 import io
 import unittest
 
 import chess.pgn
 
-from stateseq.data.sequences import T_MAX, game_to_sequence
-from stateseq.losses import RESULT_DRAW, RESULT_LOSS, RESULT_WIN
+from SSM.dataset.sequences import T_MAX, game_to_sequence
+from SSM.model.losses import RESULT_DRAW, RESULT_LOSS, RESULT_WIN
 
 PGN_DECISIVE = """[Event "t"]
 [Result "1-0"]
@@ -69,7 +80,7 @@ class ValueSignTest(unittest.TestCase):
         """验证 mlh_loss 的 log_target=True 支持及其变换行为。"""
         import torch
         import torch.nn.functional as F
-        from stateseq.losses import mlh_loss
+        from SSM.model.losses import mlh_loss
 
         pred = torch.tensor([0.0, 5.0, 10.0, 50.0], dtype=torch.float32)
         target = torch.tensor([0.0, 4.0, 15.0, 60.0], dtype=torch.float32)

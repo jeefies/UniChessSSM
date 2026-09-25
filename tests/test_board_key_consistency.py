@@ -1,11 +1,22 @@
 """Review round-3 回归：生成器/arena 与训练重放必须使用同一局面键（规格 §1.2/§2.4）。
 
-`stateseq/data/sequences.py::_board_key` 是训练侧 occurrence 计数的权威口径
+`SSM/dataset/sequences.py::_board_key` 是训练侧 occurrence 计数的权威口径
 （棋子布置 + 走子方 + 易位权 + 合法过路兵）。生成器与 arena 必须复用同一函数，
 不得再用"仅棋子布置"的 FEN 前缀哈希（会造成生成/训练重复位不一致）。
 """
 
 from __future__ import annotations
+import os as _os
+import sys as _sys
+_HERE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_IMPORT_ROOT = _os.path.dirname(_HERE)   # import 根：~/UniChess：SSM 与 Kit 都是它的顶层包
+HERE = _HERE
+KIT_ROOT = _os.environ.get("UNICHESS_KIT_ROOT", _os.path.join(_IMPORT_ROOT, "Kit"))
+if _IMPORT_ROOT not in _sys.path:
+    _sys.path.insert(0, _IMPORT_ROOT)
+if _os.path.isdir(KIT_ROOT) and KIT_ROOT not in _sys.path:
+    _sys.path.append(KIT_ROOT)   # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
+
 
 import os
 import sys
@@ -13,18 +24,14 @@ import unittest
 
 import chess
 
-from stateseq.data.sequences import _board_key
+from SSM.dataset.sequences import _board_key
 
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-KIT_ROOT = os.environ.get("UNICHESS_KIT_ROOT", os.path.join(os.path.dirname(HERE), "Kit"))
-if os.path.isdir(KIT_ROOT) and KIT_ROOT not in sys.path:
-    sys.path.append(KIT_ROOT)  # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
 
 
 class BoardKeyConsistencyTest(unittest.TestCase):
     def test_tool_modules_reuse_sequences_key(self):
         try:  # 自对弈与 arena 的 Player 都在 kit_adapter（需要 torch 与兄弟仓库 Kit）
-            import stateseq.kit_adapter as ka
+            import SSM.kit as ka
         except ImportError:
             self.skipTest("需要 torch 与兄弟仓库 Kit")
         self.assertIs(ka._board_key, _board_key)

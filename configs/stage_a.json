@@ -1,0 +1,29 @@
+{
+  "task": {
+    "factory": "SSM.tasks:make_task",
+    "kwargs": {
+      "kind": "stage_a",
+      "data": {"dir": "/home/jeefy/UniChess/SSM/data/shards", "t_max": 200},
+      "microbatch": 32,
+      "workers": 12,
+      "val_batches": 8
+    }
+  },
+  "out": "/home/jeefy/UniChess/SSM/runs/stage_a_v2",
+  "steps": 0,
+  "accum": 16,
+  "seed": 0,
+  "device": "cuda",
+  "precision": "bf16",
+  "grad_scaler": false,
+  "clip": 1.0,
+  "nonfinite": "raise",
+  "optimizer": {"lr": 0.0001, "weight_decay": 0.1, "betas": [0.9, 0.999]},
+  "schedule": {"kind": "warmup_then_cosine", "warmup": 4000,
+               "floor": 0.1, "scale": 0.9},
+  "torch": {"tf32": true},
+  "log_every": 50,
+  "save_every": 1000,
+  "validate_every": 1000,
+  "export": {"best": "best.pt", "final": "final.pt", "every": 1000}
+}

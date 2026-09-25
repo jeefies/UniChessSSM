@@ -1,15 +1,26 @@
 """A 组算法单测（§2.8）：覆盖 Gumbel 搜索核心性质。
 
-全部使用 stateseq.gumbel 纯 numpy 实现，无需 torch / python-chess。
+全部使用 Kit/search/gumbel 纯 numpy 实现，无需 torch / python-chess。
 """
 
 from __future__ import annotations
+import os as _os
+import sys as _sys
+_HERE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_IMPORT_ROOT = _os.path.dirname(_HERE)   # import 根：~/UniChess：SSM 与 Kit 都是它的顶层包
+HERE = _HERE
+KIT_ROOT = _os.environ.get("UNICHESS_KIT_ROOT", _os.path.join(_IMPORT_ROOT, "Kit"))
+if _IMPORT_ROOT not in _sys.path:
+    _sys.path.insert(0, _IMPORT_ROOT)
+if _os.path.isdir(KIT_ROOT) and KIT_ROOT not in _sys.path:
+    _sys.path.append(KIT_ROOT)   # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
+
 
 import unittest
 
 import numpy as np
 
-from stateseq.gumbel import (
+from Kit.search.gumbel import (
     C_SCALE,
     C_VISIT,
     EPS,

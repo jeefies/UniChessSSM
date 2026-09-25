@@ -1,4 +1,4 @@
-"""S 的 ReplayStore 不变量（``stateseq.kit_adapter``）：CPU 上用假 evaluator 验证送进网络的局面。
+"""S 的 ReplayStore 不变量（``SSM.kit``）：CPU 上用假 evaluator 验证送进网络的局面。
 
 移植自原 arena 的 ``test_arena_expand`` / ``ArenaOpeningHistoryTest``（Review round-3 回归）：
 1. 深度 ≥2 的叶子从根 cache 重放路径（不是把深层动作错套在根局面上），被评估局面
@@ -12,27 +12,33 @@
 """
 
 from __future__ import annotations
+import os as _os
+import sys as _sys
+_HERE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_IMPORT_ROOT = _os.path.dirname(_HERE)   # import 根：~/UniChess：SSM 与 Kit 都是它的顶层包
+HERE = _HERE
+KIT_ROOT = _os.environ.get("UNICHESS_KIT_ROOT", _os.path.join(_IMPORT_ROOT, "Kit"))
+if _IMPORT_ROOT not in _sys.path:
+    _sys.path.insert(0, _IMPORT_ROOT)
+if _os.path.isdir(KIT_ROOT) and KIT_ROOT not in _sys.path:
+    _sys.path.append(KIT_ROOT)   # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
+
 
 import os
 import sys
 import unittest
 
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, HERE)
-KIT_ROOT = os.environ.get("UNICHESS_KIT_ROOT", os.path.join(os.path.dirname(HERE), "Kit"))
-if os.path.isdir(KIT_ROOT) and KIT_ROOT not in sys.path:
-    sys.path.append(KIT_ROOT)  # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
 
 try:
     import chess
     import numpy as np
 
-    from stateseq import kit_adapter as ka
-    from stateseq.adapter import encode_board
-    from stateseq.data.sequences import _board_key
-    from unichess_kit.api import GameStart, Leaf, SearchBudget
-    from unichess_kit.runtime import run_sync
-    from unichess_kit.search.gumbel import GumbelConfig
+    import SSM.kit as ka
+    from SSM.kit import encode_board
+    from SSM.dataset.sequences import _board_key
+    from Kit.api import GameStart, Leaf, SearchBudget
+    from Kit.runtime import run_sync
+    from Kit.search.gumbel import GumbelConfig
 
     _OK = True
 except ImportError:  # pragma: no cover - 本机无 torch 或缺兄弟仓库 Kit

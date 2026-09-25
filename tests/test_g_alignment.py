@@ -11,6 +11,17 @@
 """
 
 from __future__ import annotations
+import os as _os
+import sys as _sys
+_HERE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_IMPORT_ROOT = _os.path.dirname(_HERE)   # import 根：~/UniChess：SSM 与 Kit 都是它的顶层包
+HERE = _HERE
+KIT_ROOT = _os.environ.get("UNICHESS_KIT_ROOT", _os.path.join(_IMPORT_ROOT, "Kit"))
+if _IMPORT_ROOT not in _sys.path:
+    _sys.path.insert(0, _IMPORT_ROOT)
+if _os.path.isdir(KIT_ROOT) and KIT_ROOT not in _sys.path:
+    _sys.path.append(KIT_ROOT)   # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
+
 
 import os
 import unittest
@@ -31,10 +42,10 @@ except ImportError:  # pragma: no cover
     _HAS_CHESS = False
 
 if _HAS_CHESS:
-    from stateseq.actions import action_to_move, move_to_action
-    from stateseq.data.dataset import SequenceDataset
-    from stateseq.data.sequences import _board_key
-    from stateseq.features import encode
+    from SSM.actions import action_to_move, move_to_action
+    from SSM.dataset.dataset import SequenceDataset
+    from SSM.dataset.sequences import _board_key
+    from SSM.features import encode
 
 
 @unittest.skipUnless(_HAS_CHESS, "需要 v2 数据分片（设置 UNICHESS_SSM_SHARDS 或远端 data/shards）")

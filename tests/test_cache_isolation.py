@@ -5,6 +5,17 @@
 """
 
 from __future__ import annotations
+import os as _os
+import sys as _sys
+_HERE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_IMPORT_ROOT = _os.path.dirname(_HERE)   # import 根：~/UniChess：SSM 与 Kit 都是它的顶层包
+HERE = _HERE
+KIT_ROOT = _os.environ.get("UNICHESS_KIT_ROOT", _os.path.join(_IMPORT_ROOT, "Kit"))
+if _IMPORT_ROOT not in _sys.path:
+    _sys.path.insert(0, _IMPORT_ROOT)
+if _os.path.isdir(KIT_ROOT) and KIT_ROOT not in _sys.path:
+    _sys.path.append(KIT_ROOT)   # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
+
 
 import unittest
 
@@ -17,14 +28,14 @@ except ImportError:
     # 会胜出（PEP 420），此时按 discover 放进 sys.path 的 tests 目录直接导入
     from test_consistency import _synthetic_game_features
 
-from stateseq.conditions import TimeControlBucket
+from SSM.conditions import TimeControlBucket
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "mamba_ssm 单步 kernel 仅支持 CUDA")
 class CacheIsolationTest(unittest.TestCase):
     def test_branch_isolation(self):
-        from stateseq.model import SeqModel
-        from stateseq.model_r import clone_cache
+        from SSM.model import SeqModel
+        from SSM.model.r import clone_cache
 
         torch.manual_seed(1)
         model = SeqModel(dropout=0.0).float().cuda().eval()

@@ -9,6 +9,17 @@
 """
 
 from __future__ import annotations
+import os as _os
+import sys as _sys
+_HERE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_IMPORT_ROOT = _os.path.dirname(_HERE)   # import 根：~/UniChess：SSM 与 Kit 都是它的顶层包
+HERE = _HERE
+KIT_ROOT = _os.environ.get("UNICHESS_KIT_ROOT", _os.path.join(_IMPORT_ROOT, "Kit"))
+if _IMPORT_ROOT not in _sys.path:
+    _sys.path.insert(0, _IMPORT_ROOT)
+if _os.path.isdir(KIT_ROOT) and KIT_ROOT not in _sys.path:
+    _sys.path.append(KIT_ROOT)   # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
+
 
 import glob
 import os
@@ -17,11 +28,6 @@ import sys
 import tempfile
 import unittest
 
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, HERE)
-KIT_ROOT = os.environ.get("UNICHESS_KIT_ROOT", os.path.join(os.path.dirname(HERE), "Kit"))
-if os.path.isdir(KIT_ROOT) and KIT_ROOT not in sys.path:
-    sys.path.append(KIT_ROOT)  # 追加而非前插：Kit 的 tests 包不得遮蔽本仓库的 tests
 
 try:
     import torch
@@ -32,7 +38,7 @@ except ImportError:  # pragma: no cover - 本机（Windows）无 torch
     _HAS_CUDA = False
 
 try:
-    import unichess_kit  # noqa: F401
+    import Kit  # noqa: F401
 
     _HAS_KIT = True
 except ImportError:  # pragma: no cover
@@ -88,8 +94,8 @@ def games_by_key(shard_dir: str) -> dict:
 class TestKitSelfPlay(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from stateseq import kit_adapter as ka
-        from stateseq.model import SeqModel
+        import SSM.kit as ka
+        from SSM.model import SeqModel
 
         cls.ka = ka
         torch.manual_seed(7)
@@ -109,8 +115,8 @@ class TestKitSelfPlay(unittest.TestCase):
 
     def _run_kit(self, games, seed, n_sims, max_plies, openings, book_plies, g, concurrency=1,
                  first_game=0, name=None):
-        from stateseq.data.gshards import V3ShardWriter
-        from unichess_kit.pipelines.selfplay import SelfPlayConfig, run_selfplay
+        from SSM.dataset.gshards import V3ShardWriter
+        from Kit.pipelines.selfplay import SelfPlayConfig, run_selfplay
 
         ka = self.ka
         out = os.path.join(self.tmp, name or f"k{concurrency}")
@@ -151,7 +157,7 @@ class TestKitSelfPlay(unittest.TestCase):
 
     def test_concurrent_run_valid(self):
         """并发 > 1 不求逐字节（拼批浮点差），只验结构：局号全、book 着法与 flags、π′ 归一。"""
-        from stateseq.actions import move_to_action
+        from SSM.actions import move_to_action
         import chess
 
         path = self._openings(["e4 e5 Nf3", "d4 d5"])
@@ -163,7 +169,7 @@ class TestKitSelfPlay(unittest.TestCase):
         (meta_path,) = glob.glob(os.path.join(out, "*.meta.npz"))
         with np.load(meta_path) as z:
             metas = z["metas"]
-        from stateseq.data.gshards import make_game_key
+        from SSM.dataset.gshards import make_game_key
         dec = lambda k: k.decode() if isinstance(k, bytes) else str(k)   # noqa: E731
         self.assertEqual(sorted(dec(k) for k in metas["game_key"]),
                          sorted(make_game_key("selfplay_gen3", g) for g in range(6)))
