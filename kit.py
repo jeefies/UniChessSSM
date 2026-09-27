@@ -24,6 +24,7 @@ kit 的搜索只通过 ``Leaf.parent_handle`` / ``NodeEval.handle`` 与状态交
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
@@ -44,7 +45,13 @@ from .dataset.sequences import _board_key
 from Kit.search.gumbel import C_SCALE, C_VISIT, M0, N_SIMS
 from .model import SeqModel
 
-KIT_SPI_VERSION = 1
+#: kit 的引擎插件协议版本（Kit/__init__.py::SPI_VERSION）。协议有不兼容改动时两边一起加。
+#: 2 = 扁平化后的 EngineSpec(root=import 根) / planes19 契约。**改这里前先看 Kit 的版本号**——
+#: 不一致时 registry 直接拒绝加载，Server 竞技场/观战、Kit match/selfplay/loop 全部起不来。
+KIT_SPI_VERSION = 2
+
+#: SSM 仓库根目录（包目录自身）。注意与下面的 ROOT 区分：后者是 import 根（~/UniChess）。
+SSM_ROOT = Path(__file__).resolve().parent
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -52,6 +59,29 @@ ROOT = Path(__file__).resolve().parents[1]
 def _resolve(path) -> Path:
     p = Path(path).expanduser()
     return p if p.is_absolute() else ROOT / p
+
+
+# ---------------------------------------------------------------- Server 预设（config.json）
+# config.json 里的键 → make_player_factory 参数。S 的预设本来就用的正式参数名，
+# 这里除历史别名（ckpt / mcts_sims）外都是恒等映射；description 是给 UI 看的说明，不进参数表。
+# 新增无法映射的键要显式报错，不静默丢弃（与 R/T 同一套纪律）。
+_PRESET_IGNORED = {"description"}
+_PRESET_KEYS = {k: k for k in (
+    "checkpoint", "name", "device", "simulations", "m0", "g", "c_visit", "c_scale", "engine",
+    "parallel", "pool_slots", "cuda_graphs", "server_dir", "server_chunk", "server_precision")}
+_PRESET_KEYS.update({"ckpt": "checkpoint", "mcts_sims": "simulations"})
+
+
+def load_preset(name: str) -> dict:
+    """``SSM/config.json`` 的预设 → make_player_factory 的关键字参数。"""
+    presets = json.loads((SSM_ROOT / "config.json").read_text(encoding="utf-8"))
+    if name not in presets:
+        raise KeyError(f"config.json 没有预设 {name!r}（可选：{', '.join(presets)}）")
+    unknown = set(presets[name]) - set(_PRESET_KEYS) - _PRESET_IGNORED
+    if unknown:
+        raise KeyError(f"预设 {name!r} 里有无法映射的键 {sorted(unknown)}"
+                       f"（可忽略的只有 {sorted(_PRESET_IGNORED)}）")
+    return {_PRESET_KEYS[k]: v for k, v in presets[name].items() if k in _PRESET_KEYS}
 
 
 # ---------------------------------------------------------------- 终局裁决（v3 meta 口径）
@@ -587,20 +617,48 @@ def _gumbel_cfg(evaluator, simulations, m0, g, c_visit, c_scale, parallel) -> Gu
                         parallel=parallel)
 
 
-def make_player_factory(checkpoint, *, name: str = "S", device: str = "cuda",
-                        simulations: int = N_SIMS, m0: int = M0, g: float = 0.0,
-                        c_visit: float = C_VISIT, c_scale: float = C_SCALE,
+def make_player_factory(checkpoint=None, *, preset: Optional[str] = None, name: str = "S",
+                        device: str = "cuda", simulations: int = N_SIMS, m0: int = M0,
+                        g: float = 0.0, c_visit: float = C_VISIT, c_scale: float = C_SCALE,
                         engine: str = "fast", parallel: Optional[bool] = None,
                         pool_slots: int = 2048, cuda_graphs: bool = True,
                         server_dir: Optional[str] = None,
                         server_chunk: int = 0,
-                        server_precision: str = "fp32") -> SsmPlayerFactory:
-    """加载一次权重，返回每局一个 SsmPlayer 的工厂。默认 g=0（arena 口径，确定性）。"""
-    evaluator = make_evaluator(checkpoint, device, engine,
-                               **_engine_kw(engine, pool_slots, cuda_graphs, server_dir,
-                                            server_chunk, server_precision))
-    cfg = _gumbel_cfg(evaluator, simulations, m0, g, c_visit, c_scale, parallel)
-    return SsmPlayerFactory(name, evaluator, cfg)
+                        server_precision: str = "fp32",
+                        **search_kwargs) -> SsmPlayerFactory:
+    """加载一次权重，返回每局一个 SsmPlayer 的工厂。默认 g=0（arena 口径，确定性）。
+
+    ``preset`` 取 ``SSM/config.json`` 里同名预设的值作默认，显式传参优先。Server 的观战 /
+    批量对弈走 kit 原生 Player 时按 ``preset=<预设名>`` 调用（``Server/jobs.py``），所以这里
+    必须认 preset；``checkpoint`` 仍是位参，``python -m Kit match`` 直接给权重路径也能用。
+    """
+    opts = load_preset(preset) if preset else {}
+    opts.update(search_kwargs)
+    allowed = set(_PRESET_KEYS)
+    unknown = sorted(set(opts) - allowed)
+    if unknown:
+        raise TypeError(f"未知参数 {unknown}（白名单：{sorted(allowed)}）")
+
+    def pick(key, default):
+        return opts[key] if key in opts else default
+
+    ck = pick("checkpoint", checkpoint)
+    if ck is None:
+        raise FileNotFoundError("没有给权重：必须传 checkpoint 或 preset"
+                                "（SSM/config.json 里的预设名）")
+    ck = _resolve(ck)
+    if not Path(ck).exists():
+        raise FileNotFoundError(f"权重不存在：{ck}")
+    eng = pick("engine", engine)
+    evaluator = make_evaluator(
+        ck, pick("device", device), eng,
+        **_engine_kw(eng, pick("pool_slots", pool_slots), pick("cuda_graphs", cuda_graphs),
+                     pick("server_dir", server_dir), pick("server_chunk", server_chunk),
+                     pick("server_precision", server_precision)))
+    cfg = _gumbel_cfg(evaluator, pick("simulations", simulations), pick("m0", m0),
+                      pick("g", g), pick("c_visit", c_visit), pick("c_scale", c_scale),
+                      pick("parallel", parallel))
+    return SsmPlayerFactory(pick("name", name), evaluator, cfg)
 
 
 # ------------------------------------------------------------------ 自对弈（Stage B 生成器）

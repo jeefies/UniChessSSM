@@ -3,14 +3,6 @@
     "checkpoint": "/home/jeefy/UniChess/SSM/runs/champion.pt",
     "simulations": 256,
     "engine": "fast",
-    "description": "UniChess-SSM champion（Gumbel 256 次模拟，g=0 arena 口径；GPU 槽池 + CUDA graph，同进程拼批）"
-  },
-  "champion_server": {
-    "checkpoint": "/home/jeefy/UniChess/SSM/runs/champion.pt",
-    "simulations": 256,
-    "engine": "server",
-    "server_dir": "/tmp/unichess_ssm_gpu",
-    "server_precision": "fp32",
-    "description": "UniChess-SSM champion（同上，但走共享 GPU 服务进程：跨进程拼批、批不变 ⇒ 结果与进程数/并发无关；多进程 arena / 批量对弈用这个）"
+    "description": "UniChess-SSM champion（Gumbel 256 次模拟，g=0 arena 口径；GPU 槽池 + CUDA graph，同进程拼批）。engine=\"server\" 的共享 GPU 服务模式只在自对弈/arena 管线里用（由管线自己起 GpuServer），Web 服务不常驻那个进程，故不在此发布成预设。"
   }
 }
