@@ -40,6 +40,8 @@ UniChessSSM 是 UniChess 的**状态序列模型（state-sequence model）**：�
 【锁定】不可改）。
 **设计偏差与审计**：`docs/design-deviations.md`（c_scale=0.1 的决定在 §9）。
 **Stage B 实施规格**：`docs/stage-b-implementation.md`（唯一规格来源，与 handoff 冲突时以规格为准）。
+**Stage B 下一步计划**：`docs/stage-b-next-plan.md`（现状盘点 + 阻塞项 + Phase 0/1/2 推进计划，
+2026-09-27 立；已确认的口径变更以规格 §5 变更表为准）。
 
 ## 2. 双设备路由
 
@@ -116,7 +118,12 @@ SSM/
 
 - `make_evaluator(checkpoint, device, engine)`：`engine` ∈ `reference`（cat/split 重放，逐位对照用）/
   `fast`（GPU 槽池 + CUDA graph）/ `server`（连 `infer/gpu_server.py` 跨进程拼批，批不变 ⇒ 结果与
-  进程数/并发无关）。
+  进程数/并发无关）。**`server` 模式要求调用方自己起好 `GpuServer`**（`infer/gpu_server.py`），
+  Web 服务不常驻那个进程——所以 `config.json` 只发布 `champion`（`fast`）一个预设，
+  别把 `champion_server` 那类预设放回去，选了只会得到"GPU 服务未就绪"。
+- `make_player_factory(checkpoint=None, *, preset=None, ..., **search_kwargs)`：`preset` 读
+  `SSM/config.json`（显式传参优先）。**Server 的观战/批量对弈就是按 `preset=<arg>` 调工厂的**
+  （`Server/jobs.py`），所以这个参数不是可选项；`python -m Kit match` 直接给 `checkpoint` 也能用。
 - `make_player_factory(...)` → `SsmPlayerFactory`（Gumbel 搜索；默认 `g=0`，arena 确定性口径）。
 - `make_selfplay_factory(...)`、`SsmExpander` / `SsmFastExpander`、`V3Sink`（v3 分片落盘）。
 - 终局裁决唯一入口 `classify_final_board`、`get_terminal_q`、`wdl_logits_to_q`、
