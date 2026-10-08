@@ -1,0 +1,34 @@
+{
+  "engine": {
+    "factory": "SSM.kit:make_selfplay_factory",
+    "root": "/home/jeefy/UniChess",
+    "kwargs": {
+      "checkpoint": "/home/jeefy/UniChess/SSM/runs/champion.pt",
+      "simulations": 64,
+      "m0": 16,
+      "c_scale": 0.02,
+      "c_visit": 50.0,
+      "g": 1.0,
+      "engine": "fast"
+    }
+  },
+  "selfplay": {
+    "games": 5000,
+    "seed": 20261008,
+    "max_plies": 300,
+    "concurrency": 24,
+    "openings": "/home/jeefy/UniChess/SSM/data/openings_200.txt",
+    "book_plies": 6,
+    "first_game": 0,
+    "workers": 1
+  },
+  "sink": {
+    "factory": "SSM.kit:make_v3_sink",
+    "kwargs": {
+      "out_dir": "/home/jeefy/UniChess/SSM/runs/stage_b_gen_5000_cs002",
+      "gen_id": 1,
+      "ckpt_step": 34,
+      "elo": 2567.5
+    }
+  }
+}
