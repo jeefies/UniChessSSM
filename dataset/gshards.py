@@ -248,6 +248,16 @@ class V3ShardWriter:
         self.shard_files: list[str] = []
         self.games = 0
         self.steps = 0
+        manifest_path = os.path.join(out_dir, "manifest.json")
+        if os.path.exists(manifest_path):
+            try:
+                with open(manifest_path, encoding="utf-8") as fh:
+                    m = json.load(fh)
+                self.shard_files = [os.path.join(out_dir, s) for s in m.get("shards", [])]
+                self.games = int(m.get("games", 0))
+                self.steps = int(m.get("steps", 0))
+            except Exception:
+                pass
 
     def add(self, meta: np.ndarray, actions: np.ndarray, pipol: bytes, pipol_offset: np.ndarray) -> None:
         self._metas.append(meta)

@@ -39,7 +39,7 @@ from Kit.search.gumbel import Gumbel, GumbelConfig, softmax
 from .actions import TO_ACTION as _TO_ACTION
 from .actions import move_to_action
 from .conditions import TimeControlBucket, standardize_elo
-from .dataset.gshards import META_V3_DTYPE, encode_v3_pipol, make_game_key
+from .dataset.gshards import GAMES_PER_SHARD, META_V3_DTYPE, V3ShardWriter, encode_v3_pipol, make_game_key
 from .dataset.sequences import _board_key
 
 from Kit.search.gumbel import C_SCALE, C_VISIT, M0, N_SIMS
@@ -803,16 +803,32 @@ class V3Sink:
     """kit RecordSink → v3 分片（actions + pipol + 扩展 meta），字段与原生成器逐项相同。"""
 
     def __init__(self, writer, *, gen_id: int, ckpt_step: int = 0, elo: float = 2567.5,
-                 tc_bucket=TimeControlBucket.RAPID):
+                 tc_bucket=TimeControlBucket.RAPID, out_dir: Optional[str | Path] = None):
         self.writer = writer
         self.gen_id = int(gen_id)
         self.ckpt_step = int(ckpt_step)
         self.elo = float(elo)
         self.tc_bucket = tc_bucket
+        od = out_dir if out_dir is not None else getattr(writer, "out_dir", None)
+        self.out_dir = Path(od) if od is not None else None
+        self.meta_path = (self.out_dir / ".games.jsonl") if self.out_dir else None
+        self._done: set[int] = set()
+        if self.meta_path and self.meta_path.exists():
+            for line in self.meta_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        self._done.add(int(json.loads(line)["game"]))
+                    except Exception:
+                        pass
         self.term_reason_counts = [0] * len(TERM_CODES)
         self.truncated_games = 0
-        self.games = 0
+        self.games = len(self._done)
         self.plies = 0
+
+    def done_games(self) -> set[int]:
+        """已写完并落盘的局号集合（供 run_selfplay 续跑跳过）。"""
+        return set(self._done)
 
     def on_game_end(self, record: dict, board: chess.Board, decisions) -> None:
         result, reason, is_truncated = classify_final_board(board)
@@ -831,7 +847,8 @@ class V3Sink:
         meta["result"] = result
         meta["elo_missing"] = 0
         meta["elo_mean"] = self.elo
-        meta["game_key"] = make_game_key(f"selfplay_gen{self.gen_id}", int(record["game"]))
+        game_num = int(record["game"])
+        meta["game_key"] = make_game_key(f"selfplay_gen{self.gen_id}", game_num)
         meta["gen_id"] = self.gen_id
         meta["ckpt_step"] = self.ckpt_step
         meta["termination_reason"] = term
@@ -846,3 +863,33 @@ class V3Sink:
         self.term_reason_counts[term] += 1
         if is_truncated:
             self.truncated_games += 1
+        self._done.add(game_num)
+        if self.meta_path is not None:
+            with open(self.meta_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"game": game_num, "plies": len(actions),
+                                     "result": int(result), "reason": reason},
+                                    ensure_ascii=False) + "\n")
+
+    def close(self) -> None:
+        """完成写入，刷新底层分片与元数据。"""
+        flush = getattr(self.writer, "flush", None)
+        if callable(flush):
+            flush()
+
+
+def make_v3_sink(out_dir: Optional[str | Path] = None, *, path: Optional[str | Path] = None,
+                 gen_id: int = 0, ckpt_step: int = 0, elo: float = 2567.5,
+                 tc_bucket=TimeControlBucket.RAPID, shard_size: int = GAMES_PER_SHARD,
+                 tag: str = "selfplay", **kw) -> V3Sink:
+    """创建 v3 分片自对弈 sink（用于 Kit pipelines.selfplay / loop）。
+
+    ``out_dir`` 与 ``path`` 互为别名，支持 loop 传入的占位符路径。
+    """
+    target = out_dir if out_dir is not None else path
+    if target is None:
+        raise ValueError("make_v3_sink 必须给出 out_dir 或 path")
+    target_path = Path(_resolve(target))
+    target_path.mkdir(parents=True, exist_ok=True)
+    writer = V3ShardWriter(str(target_path), tag=str(tag), shard_size=int(shard_size))
+    return V3Sink(writer, gen_id=int(gen_id), ckpt_step=int(ckpt_step), elo=float(elo),
+                  tc_bucket=tc_bucket, out_dir=target_path)

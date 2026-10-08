@@ -107,7 +107,8 @@ SSM/
   cd ~/UniChess/SSM && UNICHESS_IMPORT_ROOT=~/UniChess \
     /home/jeefy/miniconda3/envs/unichess/bin/python -m unittest discover -s tests
   ```
-  2026-09-25 重构后：**123 项 OK**（5 项按环境跳过）。
+  2026-09-25 重构后：**123 项 OK**（5 项按环境跳过）；2026-09-27 加 `test_kit_preset.py` 后
+  **129 项 OK**；2026-10-08 加 `test_v3_sink.py` 与 `test_multigen_selfplay.py` 后 **137 项 OK**。
 - **本机**：无 torch/chess/mamba-ssm，只跑语法检查（`python -m py_compile`）。
 - **Kit 先过**：动 `SSM/kit.py` 或 Trainer 相关口径前，先跑
   `cd ~/UniChess && UNICHESS_IMPORT_ROOT=~/UniChess python -m unittest discover -s Kit/tests`。

@@ -207,13 +207,18 @@ class StageB2Task(SsmTask):
         if self.human_ds is None:
             self.human_ds = SequenceDataset(self.data["dir"], workers=self.workers,
                                             t_max=self.t_max)
-            self.sp_ds = SelfPlayDataset(self.selfplay["dir"], workers=self.workers,
+            sp_dirs = self.selfplay.get("dirs")
+            if sp_dirs is None:
+                sp_dirs = self.selfplay.get("dir")
+            if not sp_dirs:
+                raise ValueError("StageB2Task 必须配置 selfplay['dir'] 或 selfplay['dirs']")
+            self.sp_ds = SelfPlayDataset(sp_dirs, workers=self.workers,
                                          t_max=self.t_max)
         if self.limit_games > 0:
             self.human_ds.train_indices = self.human_ds.train_indices[:self.limit_games]
         if not self.sp_ds.train_indices:
             raise RuntimeError(
-                f"自对弈分片 {self.selfplay['dir']} 无可训练局——Stage B2 的核心监督来源缺失，"
+                f"自对弈分片 {self.selfplay.get('dirs') or self.selfplay.get('dir')} 无可训练局——Stage B2 的核心监督来源缺失，"
                 f"不应静默退化为纯人类数据训练，请检查生成产物")
         human_it = sp_it = None
         while True:
