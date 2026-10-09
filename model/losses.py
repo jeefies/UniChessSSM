@@ -48,11 +48,21 @@ def policy_loss(logits: torch.Tensor, target_action: torch.Tensor, weights: torc
 
 
 def policy_soft_loss(logits: torch.Tensor, target_probs: torch.Tensor, weights: torch.Tensor,
-                     pos_mask: torch.Tensor | None = None, eps: float = 1e-8) -> torch.Tensor:
-    """软目标 CE：−Σ π′(a)·log p(a)；非法位置目标概率为 0，此处只做稳定求和。"""
+                     pos_mask: torch.Tensor | None = None, eps: float = 1e-8,
+                     kl_reweight: bool = False) -> torch.Tensor:
+    """软目标 CE：−Σ π′(a)·log p(a)；非法位置目标概率为 0，此处只做稳定求和。
+
+    kl_reweight: 是否启用高 KL 难样本批内自适应加权（相对均值开方压缩，双向 clamp 0.3~3.0）。
+    """
     log_p = F.log_softmax(logits, dim=-1)
     ce = -(target_probs * log_p).sum(dim=-1).reshape(-1)  # (B,T) -> (B*T,)，对齐 policy_loss 的展平口径
     w = _mask(weights.reshape(-1).float(), pos_mask.reshape(-1) if pos_mask is not None else None)
+    if kl_reweight:
+        mask_valid = (w > 0)
+        if mask_valid.any():
+            mean_ce = ce[mask_valid].mean().clamp(min=1e-5)
+            kl_w = (ce / mean_ce).pow(0.5).clamp(min=0.3, max=3.0).detach()
+            w = w * kl_w
     return (ce * w).sum() / w.sum().clamp(min=1e-8)
 
 

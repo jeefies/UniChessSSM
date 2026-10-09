@@ -161,13 +161,15 @@ class StageB2Task(SsmTask):
     """Stage B2：人类（10%）+ 自对弈 v3（85%）混合，来源权重显式写在 loss 里。"""
 
     def __init__(self, *, selfplay=None, w_selfplay=0.85, w_human=0.10, mlh_log=False,
-                 opening_loss_weight=0.25, t_max=300, limit_games=500000, **kw):
+                 opening_loss_weight=0.25, t_max=300, limit_games=500000,
+                 kl_reweight: bool = True, **kw):
         super().__init__(**kw)
         self.selfplay = dict(selfplay or {})
         self.w_selfplay = float(w_selfplay)
         self.w_human = float(w_human)
         self.mlh_log = bool(mlh_log)
         self.opening_w = float(opening_loss_weight)
+        self.kl_reweight = bool(kl_reweight)
         # §2.6：自对弈是完整 300 ply，不得静默继承 Stage A 的 T_MAX=200
         self.t_max = int(t_max)
         # 人类库是千万级（19.3M 局），只取其前 limit_games 局参与混批——先截断再 shuffle，
@@ -255,7 +257,8 @@ class StageB2Task(SsmTask):
             total_sp, m_sp = model.forward_train(
                 sp["batch"], self.weights, step, total_steps, valid_mask=sp["valid"],
                 policy_soft_target=sp["policy_soft_target"], mlh_valid_mask=sp["mlh_valid"],
-                policy_weights=self._sp_policy_weights(sp), log_target=self.mlh_log)
+                policy_weights=self._sp_policy_weights(sp), log_target=self.mlh_log,
+                kl_reweight=self.kl_reweight)
         total = self.w_selfplay * total_sp + self.w_human * total_h
         parts = {f"selfplay_{k}": v for k, v in m_sp.items()}
         parts.update({f"human_{k}": v for k, v in m_h.items()})

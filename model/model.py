@@ -73,7 +73,8 @@ class SeqModel(nn.Module):
                       policy_soft_target: torch.Tensor | None = None,
                       mlh_valid_mask: torch.Tensor | None = None,
                       policy_weights: torch.Tensor | None = None,
-                      log_target: bool = False) -> tuple[torch.Tensor, dict[str, float]]:
+                      log_target: bool = False,
+                      kl_reweight: bool = False) -> tuple[torch.Tensor, dict[str, float]]:
         """整序列前向 + 五损失；valid_mask (B,T) 屏蔽填充步。返回 (总损失, 指标 dict)。
 
         policy_soft_target (B,T,NUM_ACTIONS)：Stage B 自对弈 π′ 软目标（§2.2 修正②，
@@ -90,6 +91,7 @@ class SeqModel(nn.Module):
 
         log_target：是否对 mlh 启用 Log-Huber 变换（torch.log1p(F.relu(...)), delta=0.5）。
 
+        kl_reweight：是否启用高 KL 难样本批内自适应加权。
         """
         bsz, seqlen, _ = batch.features.shape
         x = self.encode(batch.features)                                   # (B, T, 512)
@@ -109,7 +111,7 @@ class SeqModel(nn.Module):
             pol_w = pol_w * policy_weights.reshape(bsz, seqlen).to(pol_w.dtype)
         if policy_soft_target is not None:
             l_pol = losses.policy_soft_loss(policy_logits_masked, policy_soft_target,
-                                            pol_w, valid_mask)
+                                            pol_w, valid_mask, kl_reweight=kl_reweight)
         else:
             l_pol = losses.policy_loss(policy_logits_masked, batch.actions,
                                        pol_w, valid_mask)
