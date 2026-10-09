@@ -480,6 +480,9 @@ class RemoteBackend:
         return self.cout[:m]
 
 
+_remote_evals: dict = {}
+
+
 def remote_evaluator(server_dir: str, checkpoint, chunk: int = 0,
                      precision: str = "") -> SsmFastEvaluator:
     """chunk>0 / precision 非空时核对服务端块大小 / 精度（二者决定数值，配置里写的和实际跑的
@@ -491,4 +494,9 @@ def remote_evaluator(server_dir: str, checkpoint, chunk: int = 0,
         raise ValueError(f"GPU 服务块大小 {be.meta['chunk']} 与配置 {chunk} 不符")
     if precision and precision != be.meta.get("precision", "fp32"):
         raise ValueError(f"GPU 服务精度 {be.meta.get('precision', 'fp32')} 与配置 {precision} 不符")
-    return SsmFastEvaluator(be, be.pool, f"S-srv:{path}", model_id=be.model_id(str(path)))
+    key = (id(be), str(path))
+    ev = _remote_evals.get(key)
+    if ev is None:
+        ev = _remote_evals[key] = SsmFastEvaluator(be, be.pool, f"S-srv:{path}", model_id=be.model_id(str(path)))
+    return ev
+
