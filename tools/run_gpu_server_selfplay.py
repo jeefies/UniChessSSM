@@ -62,6 +62,10 @@ def main():
     ).start()
     print(f"[GpuServer] 服务已就绪：dir={server.dir}")
 
+    t0 = time.time()
+    procs = []
+    worker_dirs = []
+
     import signal
 
     def _kill_children(*_a):
@@ -158,8 +162,11 @@ def main():
 
         # 读取主 manifest.json
         main_manifest_path = os.path.join(args.out, "manifest.json")
-        with open(main_manifest_path, "r", encoding="utf-8") as f:
-            main_mf = json.load(f)
+        if os.path.exists(main_manifest_path):
+            with open(main_manifest_path, "r", encoding="utf-8") as f:
+                main_mf = json.load(f)
+        else:
+            main_mf = {"shards": [], "games": 0, "steps": 0}
 
         existing_shards = list(main_mf.get("shards", []))
         total_games = main_mf.get("games", 0)
