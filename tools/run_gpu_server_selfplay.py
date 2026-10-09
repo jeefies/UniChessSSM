@@ -141,7 +141,9 @@ def main():
                 cpath,
             ]
             env = dict(os.environ, UNICHESS_IMPORT_ROOT=IMPORT_ROOT)
-            p = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, env=env)
+            py_path = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = f"{IMPORT_ROOT}:{py_path}" if py_path else IMPORT_ROOT
+            p = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, env=env, cwd=IMPORT_ROOT)
             procs.append((i, p, log_fh, wdir, w_first, games_per_worker))
             print(f"[Worker {i}] 已启动 (PID={p.pid})：局号区间 [{w_first}, {w_first + games_per_worker})")
 
