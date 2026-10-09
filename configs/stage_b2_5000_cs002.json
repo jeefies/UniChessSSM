@@ -1,0 +1,66 @@
+{
+  "task": {
+    "factory": "SSM.tasks:make_task",
+    "kwargs": {
+      "kind": "stage_b2",
+      "data": {
+        "dir": "/home/jeefy/UniChess/SSM/data/shards",
+        "t_max": 300
+      },
+      "selfplay": {
+        "dir": "/home/jeefy/UniChess/SSM/runs/stage_b_gen_5000_cs002"
+      },
+      "ckpt": "/home/jeefy/UniChess/SSM/runs/champion.pt",
+      "microbatch": 4,
+      "weights": {
+        "w_v": 1.0,
+        "w_r_start": 0.1,
+        "w_r_end": 0.1
+      },
+      "workers": 4,
+      "val_batches": 8,
+      "w_selfplay": 0.85,
+      "w_human": 0.10,
+      "mlh_log": true,
+      "t_max": 300
+    }
+  },
+  "out": "/home/jeefy/UniChess/SSM/runs/stage_b_training_5000_cs002",
+  "steps": 0,
+  "accum": 16,
+  "seed": 0,
+  "device": "cuda",
+  "precision": "bf16",
+  "grad_scaler": false,
+  "clip": 1.0,
+  "nonfinite": "raise",
+  "optimizer": {
+    "lr": 3e-05,
+    "weight_decay": 0.1,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "fused": true
+  },
+  "schedule": {
+    "kind": "warmup_then_cosine",
+    "warmup_frac": 0.1,
+    "warmup_max": 50,
+    "floor": 0.1,
+    "scale": 0.9
+  },
+  "torch": {
+    "tf32": true,
+    "num_threads": 4,
+    "cuda_mem_fraction": 0.65
+  },
+  "log_every": 10,
+  "save_every": 25,
+  "validate_every": 25,
+  "export": {
+    "best": "best.pt",
+    "final": "final.pt",
+    "every": 25
+  }
+}
