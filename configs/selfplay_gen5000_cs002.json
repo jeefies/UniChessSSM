@@ -9,14 +9,15 @@
       "c_scale": 0.02,
       "c_visit": 50.0,
       "g": 1.0,
-      "engine": "fast"
+      "engine": "fast",
+      "pool_slots": 4096
     }
   },
   "selfplay": {
     "games": 5000,
     "seed": 20261008,
     "max_plies": 300,
-    "concurrency": 24,
+    "concurrency": 128,
     "openings": "/home/jeefy/UniChess/SSM/data/openings_200.txt",
     "book_plies": 6,
     "first_game": 0,
