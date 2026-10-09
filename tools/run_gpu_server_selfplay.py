@@ -59,9 +59,8 @@ def main():
 
 
     os.makedirs(args.out, exist_ok=True)
-    games_per_worker = args.total_games // args.workers
-    if args.total_games % args.workers != 0:
-        raise ValueError(f"total_games ({args.total_games}) 必须能被 workers ({args.workers}) 整除")
+    base_games = args.total_games // args.workers
+    rem_games = args.total_games % args.workers
 
     ckpts = [os.path.abspath(args.ckpt)]
     if args.opp_ckpt:
@@ -95,13 +94,16 @@ def main():
     signal.signal(signal.SIGINT, _kill_children)
 
     try:
+        curr_first = args.first_game
         for i in range(args.workers):
-            w_first = args.first_game + i * games_per_worker
+            games_for_w = base_games + (1 if i < rem_games else 0)
+            w_first = curr_first
+            curr_first += games_for_w
             wdir = os.path.join(args.out, f"_w{i}")
             if os.path.exists(wdir):
                 shutil.rmtree(wdir)
             os.makedirs(wdir, exist_ok=True)
-            worker_dirs.append((i, wdir, w_first, games_per_worker))
+            worker_dirs.append((i, wdir, w_first, games_for_w))
 
             engine_kw = {
                 "checkpoint": os.path.abspath(args.ckpt),
@@ -125,7 +127,6 @@ def main():
                 "twofold_penalty": args.twofold_penalty,
             }
             if args.opp_ckpt:
-
                 engine_kw["opp_checkpoint"] = os.path.abspath(args.opp_ckpt)
 
             wconf = {
@@ -135,7 +136,7 @@ def main():
                     "kwargs": engine_kw,
                 },
                 "selfplay": {
-                    "games": games_per_worker,
+                    "games": games_for_w,
                     "seed": args.seed,
                     "max_plies": 300,
                     "concurrency": args.concurrency,
