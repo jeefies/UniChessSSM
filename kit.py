@@ -759,12 +759,7 @@ class SsmSelfPlayer(SsmPlayer):
         self.rng = np.random.default_rng(
             np.random.SeedSequence(self.seed, spawn_key=(int(start.index),)))
 
-        raw_book = [chess.Move.from_uci(u) for u in start.book]
-        if self.min_book_plies is not None and self.min_book_plies < len(raw_book):
-            k = int(self.rng.integers(self.min_book_plies, len(raw_book) + 1))
-            self.book = raw_book[:k]
-        else:
-            self.book = raw_book
+        self.book = [chess.Move.from_uci(u) for u in start.book]
         self.book_id = start.book_id
         self.a_is_white = (int(start.index) % 2 == 0)
         return immediate(None)

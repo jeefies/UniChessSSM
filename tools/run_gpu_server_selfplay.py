@@ -131,6 +131,7 @@ def main():
                     "concurrency": args.concurrency,
                     "openings": os.path.abspath(args.openings) if args.openings else None,
                     "book_plies": args.book_plies,
+                    "min_book_plies": args.min_book_plies,
                     "first_game": w_first,
                     "workers": 1,
                 },
