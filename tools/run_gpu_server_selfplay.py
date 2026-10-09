@@ -51,7 +51,12 @@ def main():
     parser.add_argument("--min-book-plies", type=int, default=6, help="开局随机截断最小深度")
     parser.add_argument("--pcr-rate", type=float, default=0.5, help="快速步 PCR 比例 (0.0~1.0)")
     parser.add_argument("--pcr-fast-sims", type=int, default=16, help="快速步模拟数")
+    parser.add_argument("--contempt", type=float, default=0.5, help="大优方三次重复罚分 (默认 0.5)")
+    parser.add_argument("--stalemate-penalty", type=float, default=1.0, help="大优方逼和对方罚分 (默认 1.0=判负)")
+    parser.add_argument("--insufficient-penalty", type=float, default=0.25, help="大优方兑光子力成和罚分 (默认 0.25)")
+    parser.add_argument("--twofold-penalty", type=float, default=0.15, help="大优方走入二次重复罚分 (默认 0.15)")
     args = parser.parse_args()
+
 
     os.makedirs(args.out, exist_ok=True)
     games_per_worker = args.total_games // args.workers
@@ -114,8 +119,13 @@ def main():
                 "min_book_plies": args.min_book_plies,
                 "pcr_rate": args.pcr_rate,
                 "pcr_fast_sims": args.pcr_fast_sims,
+                "contempt": args.contempt,
+                "stalemate_penalty": args.stalemate_penalty,
+                "insufficient_penalty": args.insufficient_penalty,
+                "twofold_penalty": args.twofold_penalty,
             }
             if args.opp_ckpt:
+
                 engine_kw["opp_checkpoint"] = os.path.abspath(args.opp_ckpt)
 
             wconf = {

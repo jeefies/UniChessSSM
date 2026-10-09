@@ -174,9 +174,9 @@ class TestOpeningLossWeightPlumbing(unittest.TestCase):
         captured = {}
         real = losses.policy_soft_loss
 
-        def spy(logits, target_probs, weights, pos_mask=None, eps=1e-8):
+        def spy(logits, target_probs, weights, pos_mask=None, *args, **kwargs):
             captured["weights"] = weights.detach().clone()
-            return real(logits, target_probs, weights, pos_mask, eps)
+            return real(logits, target_probs, weights, pos_mask, *args, **kwargs)
 
         with patch.object(losses, "policy_soft_loss", side_effect=spy):
             with torch.no_grad():
@@ -203,9 +203,9 @@ class TestOpeningLossWeightPlumbing(unittest.TestCase):
         captured = {}
         real = losses.policy_soft_loss
 
-        def spy(logits, target_probs, weights, pos_mask=None, eps=1e-8):
+        def spy(logits, target_probs, weights, pos_mask=None, *args, **kwargs):
             captured["weights"] = weights.detach().clone()
-            return real(logits, target_probs, weights, pos_mask, eps)
+            return real(logits, target_probs, weights, pos_mask, *args, **kwargs)
 
         with patch.object(losses, "policy_soft_loss", side_effect=spy):
             with torch.no_grad():

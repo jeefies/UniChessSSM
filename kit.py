@@ -68,8 +68,10 @@ def _resolve(path) -> Path:
 _PRESET_IGNORED = {"description"}
 _PRESET_KEYS = {k: k for k in (
     "checkpoint", "name", "device", "simulations", "m0", "g", "c_visit", "c_scale", "engine",
-    "parallel", "pool_slots", "cuda_graphs", "server_dir", "server_chunk", "server_precision")}
+    "parallel", "pool_slots", "cuda_graphs", "server_dir", "server_chunk", "server_precision",
+    "contempt", "stalemate_penalty", "insufficient_penalty", "twofold_penalty")}
 _PRESET_KEYS.update({"ckpt": "checkpoint", "mcts_sims": "simulations"})
+
 
 
 def load_preset(name: str) -> dict:
@@ -610,11 +612,16 @@ def _engine_kw(engine, pool_slots, cuda_graphs, server_dir, server_chunk=0,
     return {}
 
 
-def _gumbel_cfg(evaluator, simulations, m0, g, c_visit, c_scale, parallel) -> GumbelConfig:
+def _gumbel_cfg(evaluator, simulations, m0, g, c_visit, c_scale, parallel,
+                contempt: float = 0.0, stalemate_penalty: float = 0.0,
+                insufficient_penalty: float = 0.0, twofold_penalty: float = 0.0) -> GumbelConfig:
     if parallel is None:        # 快速实现默认轮内并发；参考实现保持原串行次序（逐位对照）
         parallel = bool(getattr(evaluator, "fast", False))
     return GumbelConfig(simulations=simulations, m0=m0, g=g, c_visit=c_visit, c_scale=c_scale,
-                        parallel=parallel)
+                        parallel=parallel, contempt=contempt,
+                        stalemate_penalty=stalemate_penalty,
+                        insufficient_penalty=insufficient_penalty,
+                        twofold_penalty=twofold_penalty)
 
 
 def make_player_factory(checkpoint=None, *, preset: Optional[str] = None, name: str = "S",
@@ -657,8 +664,13 @@ def make_player_factory(checkpoint=None, *, preset: Optional[str] = None, name: 
                      pick("server_precision", server_precision)))
     cfg = _gumbel_cfg(evaluator, pick("simulations", simulations), pick("m0", m0),
                       pick("g", g), pick("c_visit", c_visit), pick("c_scale", c_scale),
-                      pick("parallel", parallel))
+                      pick("parallel", parallel),
+                      contempt=pick("contempt", 0.0),
+                      stalemate_penalty=pick("stalemate_penalty", 0.0),
+                      insufficient_penalty=pick("insufficient_penalty", 0.0),
+                      twofold_penalty=pick("twofold_penalty", 0.0))
     return SsmPlayerFactory(pick("name", name), evaluator, cfg)
+
 
 
 # ------------------------------------------------------------------ 自对弈（Stage B 生成器）
@@ -805,12 +817,20 @@ class SsmSelfPlayer(SsmPlayer):
             yield from self._catch_up_opp(board)
 
         is_a_turn = (board.turn == chess.WHITE) if self.a_is_white else (board.turn == chess.BLACK)
-        cur_ev = self.evaluator if is_a_turn else self.opp_evaluator
-        cur_cache = self.cache if is_a_turn else self.opp_cache
-        cur_occ = self.occurrence if is_a_turn else self.opp_occurrence
-        cur_last = self.last if is_a_turn else self.opp_last
-        cur_search = self.search if is_a_turn else self.opp_search
-        cur_cfg = self.cfg if is_a_turn else self.opp_cfg
+        if self.opp_evaluator is not None and not is_a_turn:
+            cur_ev = self.opp_evaluator
+            cur_cache = self.opp_cache
+            cur_occ = self.opp_occurrence
+            cur_last = self.opp_last
+            cur_search = self.opp_search
+            cur_cfg = self.opp_cfg
+        else:
+            cur_ev = self.evaluator
+            cur_cache = self.cache
+            cur_occ = self.occurrence
+            cur_last = self.last
+            cur_search = self.search
+            cur_cfg = self.cfg
 
         root_state = cur_ev.make_root(ply, cur_cache, dict(cur_occ))
         root = node_eval_from_output(board, cur_last[0], cur_last[1], root_state)
@@ -914,7 +934,11 @@ def make_selfplay_factory(checkpoint=None, *, evaluator=None,
                           temperature: float = 0.0,
                           min_book_plies: Optional[int] = None,
                           pcr_rate: float = 0.0,
-                          pcr_fast_sims: int = 16) -> SsmSelfPlayerFactory:
+                          pcr_fast_sims: int = 16,
+                          contempt: float = 0.0,
+                          stalemate_penalty: float = 0.0,
+                          insufficient_penalty: float = 0.0,
+                          twofold_penalty: float = 0.0) -> SsmSelfPlayerFactory:
     """自对弈工厂（默认 g=1）。给 evaluator 时复用已加载的模型，否则从 checkpoint 加载。"""
     if evaluator is None:
         evaluator = make_evaluator(checkpoint, device, engine,
@@ -924,13 +948,18 @@ def make_selfplay_factory(checkpoint=None, *, evaluator=None,
         opp_evaluator = make_evaluator(opp_checkpoint, device, engine,
                                        **_engine_kw(engine, pool_slots, cuda_graphs, server_dir,
                                                     server_chunk, server_precision))
-    cfg = _gumbel_cfg(evaluator, simulations, m0, g, c_visit, c_scale, parallel)
-    opp_cfg = _gumbel_cfg(opp_evaluator, simulations, m0, g, c_visit, c_scale, parallel) if opp_evaluator else None
+    cfg = _gumbel_cfg(evaluator, simulations, m0, g, c_visit, c_scale, parallel,
+                      contempt=contempt, stalemate_penalty=stalemate_penalty,
+                      insufficient_penalty=insufficient_penalty, twofold_penalty=twofold_penalty)
+    opp_cfg = _gumbel_cfg(opp_evaluator, simulations, m0, g, c_visit, c_scale, parallel,
+                          contempt=contempt, stalemate_penalty=stalemate_penalty,
+                          insufficient_penalty=insufficient_penalty, twofold_penalty=twofold_penalty) if opp_evaluator else None
     return SsmSelfPlayerFactory(name, evaluator, cfg,
                                 opponent_evaluator=opp_evaluator,
                                 opp_cfg=opp_cfg,
                                 temp_plies=temp_plies,
                                 temperature=temperature,
+
                                 min_book_plies=min_book_plies,
                                 pcr_rate=pcr_rate,
                                 pcr_fast_sims=pcr_fast_sims)
