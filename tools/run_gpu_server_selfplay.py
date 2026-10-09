@@ -45,6 +45,12 @@ def main():
     parser.add_argument("--slots-per-client", type=int, default=1024)
     parser.add_argument("--chunk", type=int, default=64)
     parser.add_argument("--precision", default="fp32")
+    parser.add_argument("--opp-ckpt", default=None, help="对手模型检查点（若给出则开启跨代对弈）")
+    parser.add_argument("--temp-plies", type=int, default=15, help="前 N 步启用温度退火采样")
+    parser.add_argument("--temperature", type=float, default=1.0, help="初始采样温度")
+    parser.add_argument("--min-book-plies", type=int, default=6, help="开局随机截断最小深度")
+    parser.add_argument("--pcr-rate", type=float, default=0.5, help="快速步 PCR 比例 (0.0~1.0)")
+    parser.add_argument("--pcr-fast-sims", type=int, default=16, help="快速步模拟数")
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -52,9 +58,13 @@ def main():
     if args.total_games % args.workers != 0:
         raise ValueError(f"total_games ({args.total_games}) 必须能被 workers ({args.workers}) 整除")
 
-    print(f"[GpuServer] 正在启动 GPU 共享服务 (clients={args.workers}, slots={args.slots_per_client}, chunk={args.chunk})...")
+    ckpts = [os.path.abspath(args.ckpt)]
+    if args.opp_ckpt:
+        ckpts.append(os.path.abspath(args.opp_ckpt))
+
+    print(f"[GpuServer] 正在启动 GPU 共享服务 (models={len(ckpts)}, clients={args.workers}, slots={args.slots_per_client}, chunk={args.chunk})...")
     server = GpuServer(
-        checkpoints=[os.path.abspath(args.ckpt)],
+        checkpoints=ckpts,
         n_clients=args.workers,
         slots_per_client=args.slots_per_client,
         chunk=args.chunk,
@@ -88,22 +98,31 @@ def main():
             os.makedirs(wdir, exist_ok=True)
             worker_dirs.append((i, wdir, w_first, games_per_worker))
 
+            engine_kw = {
+                "checkpoint": os.path.abspath(args.ckpt),
+                "simulations": args.simulations,
+                "m0": args.m0,
+                "c_scale": args.c_scale,
+                "c_visit": args.c_visit,
+                "g": args.g,
+                "engine": "server",
+                "server_dir": server.dir,
+                "server_chunk": args.chunk,
+                "server_precision": args.precision,
+                "temp_plies": args.temp_plies,
+                "temperature": args.temperature,
+                "min_book_plies": args.min_book_plies,
+                "pcr_rate": args.pcr_rate,
+                "pcr_fast_sims": args.pcr_fast_sims,
+            }
+            if args.opp_ckpt:
+                engine_kw["opp_checkpoint"] = os.path.abspath(args.opp_ckpt)
+
             wconf = {
                 "engine": {
                     "factory": "SSM.kit:make_selfplay_factory",
                     "root": IMPORT_ROOT,
-                    "kwargs": {
-                        "checkpoint": os.path.abspath(args.ckpt),
-                        "simulations": args.simulations,
-                        "m0": args.m0,
-                        "c_scale": args.c_scale,
-                        "c_visit": args.c_visit,
-                        "g": args.g,
-                        "engine": "server",
-                        "server_dir": server.dir,
-                        "server_chunk": args.chunk,
-                        "server_precision": args.precision,
-                    },
+                    "kwargs": engine_kw,
                 },
                 "selfplay": {
                     "games": games_per_worker,

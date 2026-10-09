@@ -699,18 +699,45 @@ class SelfPlayShared:
 
 
 class SsmSelfPlayer(SsmPlayer):
-    """自对弈 Player：执双方（单一 cache，每个局面只步进一次——懒追赶天然如此）。
+    """自对弈 Player：执双方（单一 cache 或双 evaluator 对抗）。
 
     与原生成器 ``GameState`` 逐条对应：每局一条随机数流
-    ``default_rng(SeedSequence(seed, spawn_key=(index,)))``（= spawn(num_games)[index]），
-    跨 ply 连续消耗；book ply 走 book 着法，π′ 用 ``book_pipol_rng`` 搜索并按
+    ``default_rng(SeedSequence(seed, spawn_key=(index,)))``，跨 ply 连续消耗；
+    book ply 走 book 着法，π′ 用 ``book_pipol_rng`` 搜索并按
     (seed, book_id, ply) 跨局共享；训练目标放在 ``decision.info``（pi_ids / pi）交给 V3Sink。
+
+    打破同质化增强：
+    - 前 N 步温度退火采样（temp_plies, temperature）
+    - Playout Cap Randomization（pcr_rate, pcr_fast_sims）
+    - 开局随机截断深度（min_book_plies）
+    - 跨代历史对手池支持（opponent_evaluator）
     """
 
     def __init__(self, name: str, evaluator: SsmEvaluator, cfg: GumbelConfig,
-                 shared: SelfPlayShared):
+                 shared: SelfPlayShared, *,
+                 opponent_evaluator: Optional[SsmEvaluator] = None,
+                 opp_cfg: Optional[GumbelConfig] = None,
+                 temp_plies: int = 0,
+                 temperature: float = 0.0,
+                 min_book_plies: Optional[int] = None,
+                 pcr_rate: float = 0.0,
+                 pcr_fast_sims: int = 16):
         super().__init__(name, evaluator, cfg)
         self.shared = shared
+        self.opp_evaluator = opponent_evaluator
+        self.opp_cfg = opp_cfg or cfg
+        self.temp_plies = int(temp_plies)
+        self.temperature = float(temperature)
+        self.min_book_plies = int(min_book_plies) if min_book_plies is not None else None
+        self.pcr_rate = float(pcr_rate)
+        self.pcr_fast_sims = int(pcr_fast_sims)
+        self.opp_cache = None
+        self.opp_stepped = 0
+        self.opp_occurrence = {}
+        self.opp_last = None
+        self.opp_search = None
+        if self.opp_evaluator is not None:
+            self.opp_search = Gumbel(self.opp_evaluator.make_expander(), self.opp_cfg)
 
     def new_game(self, start: GameStart):
         if not start.both_sides:
@@ -720,57 +747,161 @@ class SsmSelfPlayer(SsmPlayer):
         self._reset()
         self.seed = int(start.seed)
         self._set_state(self.evaluator.root_state())
+        if self.opp_evaluator is not None:
+            self.opp_stepped = 0
+            self.opp_occurrence = {}
+            self.opp_last = None
+            old = self.opp_cache
+            self.opp_cache = self.opp_evaluator.root_state()
+            self.opp_evaluator.hold(self.opp_cache)
+            if old is not None:
+                self.opp_evaluator.release(old)
         self.rng = np.random.default_rng(
             np.random.SeedSequence(self.seed, spawn_key=(int(start.index),)))
-        self.book = [chess.Move.from_uci(u) for u in start.book]
+
+        raw_book = [chess.Move.from_uci(u) for u in start.book]
+        if self.min_book_plies is not None and self.min_book_plies < len(raw_book):
+            k = int(self.rng.integers(self.min_book_plies, len(raw_book) + 1))
+            self.book = raw_book[:k]
+        else:
+            self.book = raw_book
         self.book_id = start.book_id
+        self.a_is_white = (int(start.index) % 2 == 0)
         return immediate(None)
 
-    def _search_pi(self, board, root, ids, rng, simulations):
-        res = yield from self._search(board, root, rng, simulations)
-        _, probs = res.pi_prime(self.cfg)
-        stats = {k: res.stats[k] for k in ("n_nodes", "n_terminal", "sims_used", "max_depth")}
-        if stats["sims_used"] != (simulations or self.cfg.simulations):
-            self.shared.budget_violations += 1
-        self.shared.expand_hist = hist_merge(self.shared.expand_hist, res.stats.get("expand_hist"))
-        return res, ids.astype(np.uint16), probs.astype(np.float32), stats
+    def close(self) -> None:
+        super().close()
+        if self.opp_evaluator is not None and self.opp_cache is not None:
+            self.opp_evaluator.release(self.opp_cache)
+            self.opp_cache = None
+
+    def _catch_up_opp(self, board: chess.Board):
+        if self.opp_evaluator is None:
+            return
+        stack = board.move_stack
+        t = len(stack)
+        if self.opp_stepped == t + 1:
+            return
+        first = self.opp_stepped
+        replay = chess.Board(self.start_fen) if self.start_fen else chess.Board()
+        for mv in stack[:first]:
+            replay.push(mv)
+        for k in range(first, t + 1):
+            if k > first:
+                replay.push(stack[k - 1])
+            key = _board_key(replay)
+            feats, tc, elo, color = encode_board(replay, self.opp_occurrence.get(key, 0))
+            payload = self.opp_evaluator.child(self.opp_cache, np.asarray(feats, dtype=np.float32)
+                                               .reshape(-1), tc, elo, color)
+            (out,) = yield EvalRequest(self.opp_evaluator, [payload])
+            lg, wd, state = out
+            old = self.opp_cache
+            self.opp_cache = state
+            self.opp_evaluator.hold(state)
+            self.opp_evaluator.release(old)
+            self.opp_occurrence[key] = self.opp_occurrence.get(key, 0) + 1
+            self.opp_last = (lg, wd)
+        self.opp_stepped = t + 1
 
     def choose(self, board: chess.Board, budget: SearchBudget):
         ply = len(board.move_stack)
-        root, ids = yield from self._root(board)
+        yield from self._catch_up(board)
+        if self.opp_evaluator is not None:
+            yield from self._catch_up_opp(board)
+
+        is_a_turn = (board.turn == chess.WHITE) if self.a_is_white else (board.turn == chess.BLACK)
+        cur_ev = self.evaluator if is_a_turn else self.opp_evaluator
+        cur_cache = self.cache if is_a_turn else self.opp_cache
+        cur_occ = self.occurrence if is_a_turn else self.opp_occurrence
+        cur_last = self.last if is_a_turn else self.opp_last
+        cur_search = self.search if is_a_turn else self.opp_search
+        cur_cfg = self.cfg if is_a_turn else self.opp_cfg
+
+        root_state = cur_ev.make_root(ply, cur_cache, dict(cur_occ))
+        root = node_eval_from_output(board, cur_last[0], cur_last[1], root_state)
+        ids = legal_moves_and_ids(board)[1]
+
         if ply < len(self.book):
             mv = self.book[ply]
             if move_to_action(mv) is None:
                 raise RuntimeError(f"开局着法 {mv} 在 {board.fen()} 上无法映射到 action")
-            key = (self.seed, self.book_id, ply) if self.book_id is not None else None
+            key = (self.seed, self.book_id, ply) if (self.book_id is not None and self.opp_evaluator is None) else None
             cached = self.shared.pipol_memo.get(key) if key is not None else None
             if cached is not None:
                 pi_ids, pi, stats = cached
                 self.shared.book_memo_hits += 1
             else:
                 rng = book_pipol_rng(self.seed, self.book_id, ply) if key is not None else self.rng
-                _, pi_ids, pi, stats = yield from self._search_pi(board, root, ids, rng,
-                                                                  budget.simulations)
+                res = yield from cur_search.search(board, root=root, rng=rng, simulations=budget.simulations)
+                _, pi = res.pi_prime(cur_cfg)
+                pi_ids = ids.astype(np.uint16)
+                pi = pi.astype(np.float32)
+                stats = {k: res.stats[k] for k in ("n_nodes", "n_terminal", "sims_used", "max_depth")}
                 self.shared.book_memo_misses += 1
                 if key is not None:
                     self.shared.pipol_memo[key] = (pi_ids, pi, stats)
             self.shared.add_search(stats)
             return MoveDecision(mv, source="book", info={"pi_ids": pi_ids, "pi": pi})
-        res, pi_ids, pi, stats = yield from self._search_pi(board, root, ids, self.rng,
-                                                            budget.simulations)
+
+        sims = budget.simulations or cur_cfg.simulations
+        if self.pcr_rate > 0.0 and self.rng.random() < self.pcr_rate:
+            sims = self.pcr_fast_sims
+
+        res = yield from cur_search.search(board, root=root, rng=self.rng, simulations=sims)
+        _, pi = res.pi_prime(cur_cfg)
+        pi_ids = ids.astype(np.uint16)
+        pi = pi.astype(np.float32)
+        stats = {k: res.stats[k] for k in ("n_nodes", "n_terminal", "sims_used", "max_depth")}
+        if stats["sims_used"] != (sims or cur_cfg.simulations):
+            self.shared.budget_violations += 1
+        self.shared.expand_hist = hist_merge(self.shared.expand_hist, res.stats.get("expand_hist"))
         self.shared.add_search(stats)
-        return MoveDecision(res.move, source="search", info={"pi_ids": pi_ids, "pi": pi})
+
+        mv = res.move
+        if ply < self.temp_plies and self.temperature > 0.0 and len(pi) > 0:
+            eff_temp = float(self.temperature) * max(0.1, (self.temp_plies - ply) / float(self.temp_plies))
+            p = np.power(pi.astype(np.float64), 1.0 / eff_temp)
+            total = float(p.sum())
+            if total > 0:
+                p = p / total
+                p = p / float(p.sum())
+                moves = list(board.legal_moves)
+                idx = int(self.rng.choice(len(moves), p=p))
+                mv = moves[idx]
+
+        return MoveDecision(mv, source="search", info={"pi_ids": pi_ids, "pi": pi})
 
 
 class SsmSelfPlayerFactory:
-    def __init__(self, name: str, evaluator: SsmEvaluator, cfg: GumbelConfig):
+    def __init__(self, name: str, evaluator: SsmEvaluator, cfg: GumbelConfig, *,
+                 opponent_evaluator: Optional[SsmEvaluator] = None,
+                 opp_cfg: Optional[GumbelConfig] = None,
+                 temp_plies: int = 0,
+                 temperature: float = 0.0,
+                 min_book_plies: Optional[int] = None,
+                 pcr_rate: float = 0.0,
+                 pcr_fast_sims: int = 16):
         self.name = name
         self.evaluator = evaluator
         self.cfg = cfg
+        self.opp_evaluator = opponent_evaluator
+        self.opp_cfg = opp_cfg or cfg
+        self.temp_plies = temp_plies
+        self.temperature = temperature
+        self.min_book_plies = min_book_plies
+        self.pcr_rate = pcr_rate
+        self.pcr_fast_sims = pcr_fast_sims
         self.shared = SelfPlayShared()
 
     def __call__(self) -> SsmSelfPlayer:
-        return SsmSelfPlayer(self.name, self.evaluator, self.cfg, self.shared)
+        return SsmSelfPlayer(self.name, self.evaluator, self.cfg, self.shared,
+                             opponent_evaluator=self.opp_evaluator,
+                             opp_cfg=self.opp_cfg,
+                             temp_plies=self.temp_plies,
+                             temperature=self.temperature,
+                             min_book_plies=self.min_book_plies,
+                             pcr_rate=self.pcr_rate,
+                             pcr_fast_sims=self.pcr_fast_sims)
 
 
 def make_selfplay_factory(checkpoint=None, *, evaluator=None,
@@ -781,14 +912,33 @@ def make_selfplay_factory(checkpoint=None, *, evaluator=None,
                           cuda_graphs: bool = True,
                           server_dir: Optional[str] = None,
                           server_chunk: int = 0,
-                          server_precision: str = "fp32") -> SsmSelfPlayerFactory:
+                          server_precision: str = "fp32",
+                          opp_checkpoint: Optional[str] = None,
+                          opp_evaluator: Optional[SsmEvaluator] = None,
+                          temp_plies: int = 0,
+                          temperature: float = 0.0,
+                          min_book_plies: Optional[int] = None,
+                          pcr_rate: float = 0.0,
+                          pcr_fast_sims: int = 16) -> SsmSelfPlayerFactory:
     """自对弈工厂（默认 g=1）。给 evaluator 时复用已加载的模型，否则从 checkpoint 加载。"""
     if evaluator is None:
         evaluator = make_evaluator(checkpoint, device, engine,
                                    **_engine_kw(engine, pool_slots, cuda_graphs, server_dir,
                                                 server_chunk, server_precision))
+    if opp_checkpoint is not None and opp_evaluator is None:
+        opp_evaluator = make_evaluator(opp_checkpoint, device, engine,
+                                       **_engine_kw(engine, pool_slots, cuda_graphs, server_dir,
+                                                    server_chunk, server_precision))
     cfg = _gumbel_cfg(evaluator, simulations, m0, g, c_visit, c_scale, parallel)
-    return SsmSelfPlayerFactory(name, evaluator, cfg)
+    opp_cfg = _gumbel_cfg(opp_evaluator, simulations, m0, g, c_visit, c_scale, parallel) if opp_evaluator else None
+    return SsmSelfPlayerFactory(name, evaluator, cfg,
+                                opponent_evaluator=opp_evaluator,
+                                opp_cfg=opp_cfg,
+                                temp_plies=temp_plies,
+                                temperature=temperature,
+                                min_book_plies=min_book_plies,
+                                pcr_rate=pcr_rate,
+                                pcr_fast_sims=pcr_fast_sims)
 
 
 def pipol_byte_offsets(per_ply_actions: list) -> np.ndarray:
