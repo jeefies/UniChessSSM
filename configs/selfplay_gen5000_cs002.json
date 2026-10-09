@@ -28,7 +28,8 @@
       "out_dir": "/home/jeefy/UniChess/SSM/runs/stage_b_gen_5000_cs002",
       "gen_id": 1,
       "ckpt_step": 34,
-      "elo": 2567.5
+      "elo": 2567.5,
+      "shard_size": 500
     }
   }
 }
