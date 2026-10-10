@@ -56,6 +56,9 @@ def main():
     parser.add_argument("--insufficient-penalty", type=float, default=1.0, help="大优方兑光子力成和罚分 (默认 1.0=判负)")
     parser.add_argument("--twofold-penalty", type=float, default=1.0, help="大优方走入二次重复罚分 (默认 1.0=判负)")
     parser.add_argument("--c-scale-schedule", action="store_true", default=True, help="开启动态 c_scale 调度 (默认开启)")
+    parser.add_argument("--adaptive-sims", action="store_true", default=False, help="开启 KataGo 式战术自适应高预算")
+    parser.add_argument("--deep-sims", type=int, default=256, help="自适应深算上限 (默认 256)")
+    parser.add_argument("--p-explore", type=float, default=0.15, help="开局深潜探索概率 (默认 0.15)")
     args = parser.parse_args()
 
 
@@ -127,6 +130,9 @@ def main():
                 "insufficient_penalty": args.insufficient_penalty,
                 "twofold_penalty": args.twofold_penalty,
                 "c_scale_schedule": args.c_scale_schedule,
+                "adaptive_sims": args.adaptive_sims,
+                "deep_sims": args.deep_sims,
+                "p_explore": args.p_explore,
             }
             if args.opp_ckpt:
                 engine_kw["opp_checkpoint"] = os.path.abspath(args.opp_ckpt)

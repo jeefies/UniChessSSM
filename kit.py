@@ -705,12 +705,47 @@ class SelfPlayShared:
         self.book_memo_hits = 0
         self.book_memo_misses = 0
         self.expand_hist: list = []
+        self.adaptive_deep_count = 0
+        self.adaptive_fast_count = 0
 
     def add_search(self, stats: dict) -> None:
         self.n_nodes += int(stats["n_nodes"])
         self.n_terminal += int(stats["n_terminal"])
         self.sims += int(stats["sims_used"])
         self.max_depth += int(stats["max_depth"])
+
+
+_MAT_VALS = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9}
+
+
+def _board_mat(board: chess.Board, color: chess.Color) -> int:
+    return sum(len(board.pieces(pt, color)) * v for pt, v in _MAT_VALS.items())
+
+
+def check_adaptive_deep_trigger(board: chess.Board, ply: int,
+                                rng: Optional[np.random.Generator] = None,
+                                p_explore: float = 0.15) -> tuple[bool, str]:
+    """KataGo 式自适应高预算（256 sims）触发判定。
+
+    1. 战术硬触发：当前被叫将 (board.is_check())，深算化解危机或抓绝杀
+    2. 残局将杀硬触发：总子力 <= 16 且优势方净胜 >= 2 兵，深算锁定杀王路径
+    3. 开局探索触发：前 12 步以概率 p_explore (默认 15%) 随机深潜，注入高质量大局观
+    """
+    if board.is_check():
+        return True, "check"
+
+    w_mat = _board_mat(board, chess.WHITE)
+    b_mat = _board_mat(board, chess.BLACK)
+    if w_mat + b_mat <= 16:
+        turn_mat = w_mat if board.turn == chess.WHITE else b_mat
+        opp_mat = b_mat if board.turn == chess.WHITE else w_mat
+        if turn_mat - opp_mat >= 2:
+            return True, "endgame_advantage"
+
+    if ply <= 12 and rng is not None and float(rng.random()) < p_explore:
+        return True, "opening_explore"
+
+    return False, "normal"
 
 
 class SsmSelfPlayer(SsmPlayer):
@@ -736,7 +771,10 @@ class SsmSelfPlayer(SsmPlayer):
                  temperature: float = 0.0,
                  min_book_plies: Optional[int] = None,
                  pcr_rate: float = 0.0,
-                 pcr_fast_sims: int = 16):
+                 pcr_fast_sims: int = 16,
+                 adaptive_sims: bool = False,
+                 deep_sims: int = 256,
+                 p_explore: float = 0.15):
         super().__init__(name, evaluator, cfg)
         self.shared = shared
         self.opp_evaluator = opponent_evaluator
@@ -746,6 +784,9 @@ class SsmSelfPlayer(SsmPlayer):
         self.min_book_plies = int(min_book_plies) if min_book_plies is not None else None
         self.pcr_rate = float(pcr_rate)
         self.pcr_fast_sims = int(pcr_fast_sims)
+        self.adaptive_sims = bool(adaptive_sims)
+        self.deep_sims = int(deep_sims)
+        self.p_explore = float(p_explore)
         self.opp_cache = None
         self.opp_stepped = 0
         self.opp_occurrence = {}
@@ -862,7 +903,17 @@ class SsmSelfPlayer(SsmPlayer):
             return MoveDecision(mv, source="book", info={"pi_ids": pi_ids, "pi": pi})
 
         sims = budget.simulations or cur_cfg.simulations
-        if self.pcr_rate > 0.0 and self.rng.random() < self.pcr_rate:
+        is_deep = False
+        trigger_reason = "normal"
+        if self.adaptive_sims:
+            is_deep, trigger_reason = check_adaptive_deep_trigger(board, ply, self.rng, self.p_explore)
+            if is_deep:
+                sims = self.deep_sims
+                self.shared.adaptive_deep_count += 1
+            else:
+                self.shared.adaptive_fast_count += 1
+
+        if not is_deep and self.pcr_rate > 0.0 and self.rng.random() < self.pcr_rate:
             sims = self.pcr_fast_sims
 
         res = yield from cur_search.search(board, root=root, rng=self.rng, simulations=sims)
@@ -887,7 +938,9 @@ class SsmSelfPlayer(SsmPlayer):
                 idx = int(self.rng.choice(len(moves), p=p))
                 mv = moves[idx]
 
-        return MoveDecision(mv, source="search", info={"pi_ids": pi_ids, "pi": pi})
+        return MoveDecision(mv, source="search",
+                            info={"pi_ids": pi_ids, "pi": pi, "is_deep": is_deep,
+                                  "trigger_reason": trigger_reason})
 
 
 class SsmSelfPlayerFactory:
@@ -898,7 +951,10 @@ class SsmSelfPlayerFactory:
                  temperature: float = 0.0,
                  min_book_plies: Optional[int] = None,
                  pcr_rate: float = 0.0,
-                 pcr_fast_sims: int = 16):
+                 pcr_fast_sims: int = 16,
+                 adaptive_sims: bool = False,
+                 deep_sims: int = 256,
+                 p_explore: float = 0.15):
         self.name = name
         self.evaluator = evaluator
         self.cfg = cfg
@@ -909,6 +965,9 @@ class SsmSelfPlayerFactory:
         self.min_book_plies = min_book_plies
         self.pcr_rate = pcr_rate
         self.pcr_fast_sims = pcr_fast_sims
+        self.adaptive_sims = adaptive_sims
+        self.deep_sims = deep_sims
+        self.p_explore = p_explore
         self.shared = SelfPlayShared()
 
     def __call__(self) -> SsmSelfPlayer:
@@ -919,7 +978,10 @@ class SsmSelfPlayerFactory:
                              temperature=self.temperature,
                              min_book_plies=self.min_book_plies,
                              pcr_rate=self.pcr_rate,
-                             pcr_fast_sims=self.pcr_fast_sims)
+                             pcr_fast_sims=self.pcr_fast_sims,
+                             adaptive_sims=self.adaptive_sims,
+                             deep_sims=self.deep_sims,
+                             p_explore=self.p_explore)
 
 
 def make_selfplay_factory(checkpoint=None, *, evaluator=None,
@@ -938,6 +1000,9 @@ def make_selfplay_factory(checkpoint=None, *, evaluator=None,
                           min_book_plies: Optional[int] = None,
                           pcr_rate: float = 0.0,
                           pcr_fast_sims: int = 16,
+                          adaptive_sims: bool = False,
+                          deep_sims: int = 256,
+                          p_explore: float = 0.15,
                           contempt: float = 0.0,
                           stalemate_penalty: float = 0.0,
                           insufficient_penalty: float = 0.0,
@@ -965,10 +1030,12 @@ def make_selfplay_factory(checkpoint=None, *, evaluator=None,
                                 opp_cfg=opp_cfg,
                                 temp_plies=temp_plies,
                                 temperature=temperature,
-
                                 min_book_plies=min_book_plies,
                                 pcr_rate=pcr_rate,
-                                pcr_fast_sims=pcr_fast_sims)
+                                pcr_fast_sims=pcr_fast_sims,
+                                adaptive_sims=adaptive_sims,
+                                deep_sims=deep_sims,
+                                p_explore=p_explore)
 
 
 def pipol_byte_offsets(per_ply_actions: list) -> np.ndarray:
