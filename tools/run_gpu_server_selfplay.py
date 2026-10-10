@@ -53,8 +53,9 @@ def main():
     parser.add_argument("--pcr-fast-sims", type=int, default=16, help="快速步模拟数")
     parser.add_argument("--contempt", type=float, default=0.5, help="大优方三次重复罚分 (默认 0.5)")
     parser.add_argument("--stalemate-penalty", type=float, default=1.0, help="大优方逼和对方罚分 (默认 1.0=判负)")
-    parser.add_argument("--insufficient-penalty", type=float, default=0.25, help="大优方兑光子力成和罚分 (默认 0.25)")
-    parser.add_argument("--twofold-penalty", type=float, default=0.15, help="大优方走入二次重复罚分 (默认 0.15)")
+    parser.add_argument("--insufficient-penalty", type=float, default=1.0, help="大优方兑光子力成和罚分 (默认 1.0=判负)")
+    parser.add_argument("--twofold-penalty", type=float, default=1.0, help="大优方走入二次重复罚分 (默认 1.0=判负)")
+    parser.add_argument("--c-scale-schedule", action="store_true", default=True, help="开启动态 c_scale 调度 (默认开启)")
     args = parser.parse_args()
 
 
@@ -125,6 +126,7 @@ def main():
                 "stalemate_penalty": args.stalemate_penalty,
                 "insufficient_penalty": args.insufficient_penalty,
                 "twofold_penalty": args.twofold_penalty,
+                "c_scale_schedule": args.c_scale_schedule,
             }
             if args.opp_ckpt:
                 engine_kw["opp_checkpoint"] = os.path.abspath(args.opp_ckpt)

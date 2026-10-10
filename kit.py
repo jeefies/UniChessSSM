@@ -69,7 +69,7 @@ _PRESET_IGNORED = {"description"}
 _PRESET_KEYS = {k: k for k in (
     "checkpoint", "name", "device", "simulations", "m0", "g", "c_visit", "c_scale", "engine",
     "parallel", "pool_slots", "cuda_graphs", "server_dir", "server_chunk", "server_precision",
-    "contempt", "stalemate_penalty", "insufficient_penalty", "twofold_penalty")}
+    "contempt", "stalemate_penalty", "insufficient_penalty", "twofold_penalty", "c_scale_schedule")}
 _PRESET_KEYS.update({"ckpt": "checkpoint", "mcts_sims": "simulations"})
 
 
@@ -614,14 +614,16 @@ def _engine_kw(engine, pool_slots, cuda_graphs, server_dir, server_chunk=0,
 
 def _gumbel_cfg(evaluator, simulations, m0, g, c_visit, c_scale, parallel,
                 contempt: float = 0.0, stalemate_penalty: float = 0.0,
-                insufficient_penalty: float = 0.0, twofold_penalty: float = 0.0) -> GumbelConfig:
+                insufficient_penalty: float = 0.0, twofold_penalty: float = 0.0,
+                c_scale_schedule: bool = False) -> GumbelConfig:
     if parallel is None:        # 快速实现默认轮内并发；参考实现保持原串行次序（逐位对照）
         parallel = bool(getattr(evaluator, "fast", False))
     return GumbelConfig(simulations=simulations, m0=m0, g=g, c_visit=c_visit, c_scale=c_scale,
                         parallel=parallel, contempt=contempt,
                         stalemate_penalty=stalemate_penalty,
                         insufficient_penalty=insufficient_penalty,
-                        twofold_penalty=twofold_penalty)
+                        twofold_penalty=twofold_penalty,
+                        c_scale_schedule=c_scale_schedule)
 
 
 def make_player_factory(checkpoint=None, *, preset: Optional[str] = None, name: str = "S",
@@ -938,7 +940,8 @@ def make_selfplay_factory(checkpoint=None, *, evaluator=None,
                           contempt: float = 0.0,
                           stalemate_penalty: float = 0.0,
                           insufficient_penalty: float = 0.0,
-                          twofold_penalty: float = 0.0) -> SsmSelfPlayerFactory:
+                          twofold_penalty: float = 0.0,
+                          c_scale_schedule: bool = False) -> SsmSelfPlayerFactory:
     """自对弈工厂（默认 g=1）。给 evaluator 时复用已加载的模型，否则从 checkpoint 加载。"""
     if evaluator is None:
         evaluator = make_evaluator(checkpoint, device, engine,
@@ -950,10 +953,12 @@ def make_selfplay_factory(checkpoint=None, *, evaluator=None,
                                                     server_chunk, server_precision))
     cfg = _gumbel_cfg(evaluator, simulations, m0, g, c_visit, c_scale, parallel,
                       contempt=contempt, stalemate_penalty=stalemate_penalty,
-                      insufficient_penalty=insufficient_penalty, twofold_penalty=twofold_penalty)
+                      insufficient_penalty=insufficient_penalty, twofold_penalty=twofold_penalty,
+                      c_scale_schedule=c_scale_schedule)
     opp_cfg = _gumbel_cfg(opp_evaluator, simulations, m0, g, c_visit, c_scale, parallel,
                           contempt=contempt, stalemate_penalty=stalemate_penalty,
-                          insufficient_penalty=insufficient_penalty, twofold_penalty=twofold_penalty) if opp_evaluator else None
+                          insufficient_penalty=insufficient_penalty, twofold_penalty=twofold_penalty,
+                          c_scale_schedule=c_scale_schedule) if opp_evaluator else None
     return SsmSelfPlayerFactory(name, evaluator, cfg,
                                 opponent_evaluator=opp_evaluator,
                                 opp_cfg=opp_cfg,
