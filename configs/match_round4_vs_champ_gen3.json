@@ -40,7 +40,7 @@
     }
   },
   "match": {
-    "pairs": 200,
+    "pairs": 350,
     "concurrency": 4,
     "max_plies": 300,
     "openings": "/home/jeefy/UniChess/SSM/data/openings_200.txt",
