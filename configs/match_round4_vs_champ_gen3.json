@@ -10,7 +10,13 @@
       "c_scale": 0.02,
       "c_visit": 50.0,
       "g": 0.0,
-      "engine": "fast"
+      "engine": "fast",
+      "pool_slots": 1024,
+      "contempt": 0.5,
+      "stalemate_penalty": 1.0,
+      "insufficient_penalty": 0.25,
+      "twofold_penalty": 1.0,
+      "c_scale_schedule": true
     }
   },
   "b": {
@@ -24,16 +30,22 @@
       "c_scale": 0.02,
       "c_visit": 50.0,
       "g": 0.0,
-      "engine": "fast"
+      "engine": "fast",
+      "pool_slots": 1024,
+      "contempt": 0.5,
+      "stalemate_penalty": 1.0,
+      "insufficient_penalty": 0.25,
+      "twofold_penalty": 1.0,
+      "c_scale_schedule": true
     }
   },
   "match": {
     "pairs": 200,
-    "concurrency": 8,
+    "concurrency": 4,
     "max_plies": 300,
     "openings": "/home/jeefy/UniChess/SSM/data/openings_200.txt",
     "seed": 20261014,
-    "workers": 6,
+    "workers": 4,
     "sprt": {
       "elo0": 0.0,
       "elo1": 35.0,

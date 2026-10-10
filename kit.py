@@ -670,7 +670,8 @@ def make_player_factory(checkpoint=None, *, preset: Optional[str] = None, name: 
                       contempt=pick("contempt", 0.0),
                       stalemate_penalty=pick("stalemate_penalty", 0.0),
                       insufficient_penalty=pick("insufficient_penalty", 0.0),
-                      twofold_penalty=pick("twofold_penalty", 0.0))
+                      twofold_penalty=pick("twofold_penalty", 0.0),
+                      c_scale_schedule=pick("c_scale_schedule", False))
     return SsmPlayerFactory(pick("name", name), evaluator, cfg)
 
 
