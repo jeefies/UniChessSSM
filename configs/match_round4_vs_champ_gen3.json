@@ -1,0 +1,45 @@
+{
+  "a": {
+    "factory": "SSM.kit:make_player_factory",
+    "root": "/home/jeefy/UniChess",
+    "label": "Candidate_gen5",
+    "kwargs": {
+      "checkpoint": "/home/jeefy/UniChess/SSM/runs/stage_b_training_round4/best.pt",
+      "simulations": 64,
+      "m0": 16,
+      "c_scale": 0.02,
+      "c_visit": 50.0,
+      "g": 0.0,
+      "engine": "fast"
+    }
+  },
+  "b": {
+    "factory": "SSM.kit:make_player_factory",
+    "root": "/home/jeefy/UniChess",
+    "label": "Champion_gen3",
+    "kwargs": {
+      "checkpoint": "/home/jeefy/UniChess/SSM/runs/champion.pt",
+      "simulations": 64,
+      "m0": 16,
+      "c_scale": 0.02,
+      "c_visit": 50.0,
+      "g": 0.0,
+      "engine": "fast"
+    }
+  },
+  "match": {
+    "pairs": 200,
+    "concurrency": 8,
+    "max_plies": 300,
+    "openings": "/home/jeefy/UniChess/SSM/data/openings_200.txt",
+    "seed": 20261014,
+    "workers": 6,
+    "sprt": {
+      "elo0": 0.0,
+      "elo1": 35.0,
+      "alpha": 0.05,
+      "beta": 0.05,
+      "min_pairs": 20
+    }
+  }
+}
