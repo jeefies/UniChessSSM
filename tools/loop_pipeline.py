@@ -192,6 +192,24 @@ class SsmLoopOrchestrator:
                 past_sp_dirs.append(str(d))
         if not past_sp_dirs:
             past_sp_dirs = [str(sp_dir)]
+        if self.record_qsearch:
+            # 只收带 q̂ 的代。混入无 q̂ 的老代时，那些局的价值目标会退化成纯 MC
+            # （整局无 q̂ ⇒ lambda_return 自动回落 z），而 λ=1 实测比 λ=0.5 差 8.5 分，
+            # 混合等价于把 λ 往 1 拉——收益被稀释。开 q̂ 记录时才过滤，不影响原行为。
+            keep = []
+            for d in past_sp_dirs:
+                try:
+                    with open(os.path.join(d, "manifest.json"), encoding="utf-8") as fh:
+                        if json.load(fh).get("qsearch"):
+                            keep.append(d)
+                except Exception:
+                    pass
+            dropped = len(past_sp_dirs) - len(keep)
+            if dropped:
+                log(f"Gen {gen_id} 回放池剔除 {dropped} 个无 q̂ 的旧代（价值目标口径不一致）",
+                    self.log_file)
+            if keep:
+                past_sp_dirs = keep
 
         cfg_path = gen_dir / "train_config.json"
         # 价值目标开关：关闭时一个键都不加 ⇒ 生成的 train_config 与改造前逐位相同
