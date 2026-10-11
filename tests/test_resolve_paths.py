@@ -76,14 +76,21 @@ class ResolvePathTest(unittest.TestCase):
 
 
 class RealWorldScenarioTest(unittest.TestCase):
-    """复现今天的实际用法：cwd = SSM 仓库根，手写仓库内相对路径。"""
+    """真实布局下的两条口径（不 monkeypatch）：配置式路径走 import 根，仓库内路径也能解析。"""
 
-    def test_ssm_relative_path_resolves_inside_repo(self):
-        # ROOT（import 根）下没有 SSM/runs/... 这一层，cwd（SSM 仓库根）下有
-        self.assertFalse((kit.ROOT / "SSM" / "runs").exists()
-                         or True)                 # 不依赖远端布局，只验不抛异常
+    def test_config_style_path_uses_import_root(self):
+        # 配置里的 SSM/runs/... 必须解析到 import 根下的 SSM 仓库
         p = kit._resolve("SSM/runs/champion.pt")
         self.assertTrue(p.is_absolute())
+        self.assertEqual(p, kit.ROOT / "SSM" / "runs" / "champion.pt")
+
+    def test_repo_relative_path_resolves_inside_repo(self):
+        # cwd 若是 SSM 仓库根，仓库内相对路径也要能解析（import 根下没有这一层）
+        if Path.cwd() != kit.SSM_ROOT:
+            self.skipTest("cwd 不是 SSM 仓库根")
+        p = kit._resolve("runs/champion.pt")
+        self.assertTrue(p.is_absolute())
+        self.assertTrue(p.exists() or (kit.ROOT / "runs" / "champion.pt").exists())
 
 
 if __name__ == "__main__":
