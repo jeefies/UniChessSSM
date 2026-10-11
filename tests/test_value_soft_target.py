@@ -31,31 +31,35 @@ def _logits_from_q(q: float, d: float, scale: float = 8.0) -> torch.Tensor:
 
 
 class ValueSoftTargetTest(unittest.TestCase):
-    def test_projection_moments(self):
-        torch.manual_seed(0)
-        g = torch.tensor([[0.6, -0.3, 0.0, 0.95, -0.95]])
-        logits = torch.randn(1, 5, 3) * 2.0
-        p = torch.softmax(logits, dim=-1).detach()
-        d_expect = p[..., 1].clamp(min=0.05, max=0.5)
-        d_expect = torch.minimum(d_expect, (1.0 - g.abs()).clamp(min=0.0))
-        w = (g + 1.0 - d_expect) * 0.5
-        l = (1.0 - g - d_expect) * 0.5
-        self.assertTrue(torch.all(w >= -1e-7) and torch.all(l >= -1e-7),
-                        "投影后出现负概率")
-        self.assertTrue(torch.allclose(w + d_expect + l, torch.ones_like(g), atol=1e-6),
-                        "投影后概率和不为 1")
-        # pW - pL 必须等于 g（矩匹配）
-        self.assertTrue(torch.allclose(w - l, g, atol=1e-6))
+    def test_projection_is_max_entropy(self):
+        """和棋质量 = 1−|g|，胜/负按符号分配；和恒 1、均值恒等于 g。"""
+        g = torch.tensor([0.0, 0.6, -0.3, 0.95, -0.95, 1.0, -1.0, 0.25])
+        w = g.clamp(min=0)
+        d = 1.0 - g.abs()
+        l = (-g).clamp(min=0)
+        self.assertTrue(torch.allclose(w + d + l, torch.ones_like(g), atol=1e-7), "概率和不为 1")
+        self.assertTrue(torch.allclose(w - l, g, atol=1e-7), "pW−pL 不等于 g")
+        self.assertTrue(torch.all(w >= 0) and torch.all(d >= 0) and torch.all(l >= 0))
 
-    def test_extreme_g_keeps_nonneg(self):
-        g = torch.tensor([[1.0, -1.0]])
-        logits = torch.zeros(1, 2, 3)          # pD = 1/3 ⇒ d 被压到 0
-        w = torch.softmax(logits, -1)[..., 1].clamp(0.05, 0.5)
-        d = torch.minimum(w, (1.0 - g.abs()).clamp(min=0.0))
-        self.assertTrue(torch.all(d == 0), "|g|=1 时 draw 质量应被压到 0")
-        pw = (g + 1.0 - d) * 0.5
-        pl = (1.0 - g - d) * 0.5
-        self.assertTrue(torch.all(pw >= 0) and torch.all(pl >= 0))
+    def test_extremes_are_one_hot(self):
+        """|g|=1 与 g=0 必须精确 one-hot —— λ=1 时才能与硬标签 MC 逐位一致。"""
+        for g_val, expect in ((1.0, [1.0, 0.0, 0.0]), (-1.0, [0.0, 0.0, 1.0]),
+                              (0.0, [0.0, 1.0, 0.0])):
+            g = torch.tensor([g_val])
+            t = torch.stack([g.clamp(min=0), 1.0 - g.abs(), (-g).clamp(min=0)], dim=-1)
+            self.assertTrue(torch.allclose(t[0], torch.tensor(expect), atol=1e-7),
+                            f"g={g_val} 未退化成 one-hot：{t[0].tolist()}")
+
+    def test_lambda_one_matches_hard_label(self):
+        """λ=1 时软目标必须与硬标签 CE 完全一致（架构消融的前提）。"""
+        torch.manual_seed(0)
+        logits = torch.randn(2, 5, 3) * 2.0
+        result = torch.tensor([[0, 1, 2, 0, 1], [2, 2, 1, 0, 0]])       # 0 胜/1 和/2 负
+        g = (1.0 - result.float()).reshape(-1)                          # → +1/0/−1
+        soft = value_soft_loss(logits, g.reshape(2, 5))
+        hard = losses.value_loss(logits, result)
+        self.assertAlmostEqual(float(soft), float(hard), places=6,
+                               msg=f"λ=1 软目标 {float(soft)} 与硬标签 {float(hard)} 不一致")
 
     def test_loss_prefers_matching_prediction(self):
         g = torch.full((1, 4), 0.8)
@@ -83,14 +87,6 @@ class ValueSoftTargetTest(unittest.TestCase):
         logits = torch.randn(1, 3, 3)
         mask = torch.zeros(1, 3, dtype=torch.bool)
         self.assertEqual(float(value_soft_loss(logits, g, mask)), 0.0)
-
-    def test_draw_clamp_bounds(self):
-        """自预测 pD 贴边时目标 d 必须被 clamp 住（防自举固定点坍缩）。"""
-        g = torch.zeros(1, 1)
-        # pD ≈ 0.999 ⇒ clamp 到 d_max=0.5
-        logits = torch.tensor([[[-20.0, 20.0, -20.0]]])
-        d = torch.softmax(logits, -1)[..., 1].clamp(0.05, 0.5)
-        self.assertAlmostEqual(float(d[0, 0]), 0.5, places=6)
 
 
 class MaterialLossTest(unittest.TestCase):

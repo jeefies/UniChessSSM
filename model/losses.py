@@ -186,22 +186,24 @@ def lambda_return(q_white: torch.Tensor, q_valid: torch.Tensor, z_white: torch.T
 
 def value_soft_loss(wdl_logits: torch.Tensor, target_g: torch.Tensor,
                     pos_mask: torch.Tensor | None = None,
-                    value_weights: torch.Tensor | None = None,
-                    d_min: float = 0.05, d_max: float = 0.5) -> torch.Tensor:
+                    value_weights: torch.Tensor | None = None) -> torch.Tensor:
     """λ-return 标量目标 → WDL 三分类软目标 CE（D4）。
 
     target_g (B,T)：行棋方视角的 λ-return（∈ [−1,1]，期望得分）。
-    目标分布用"矩匹配投影"构造：draw 质量 d 取当前预测 pD 的截断值（detach），
-    剩余质量按 g 分给 W/L ⇒ pW − pL ≡ g 且 pD 保持自由；clamp 住自预测的 d 是为了
-    防止自举固定点把 pD 推向 1 使 q 坍缩（自举退化方向）。
+    目标分布取"均值 = g 的最大熵分布"：和棋质量 = 1−|g|，剩余质量按符号全给胜/负方——
+
+        pW = max(g, 0),  pD = 1 − |g|,  pL = max(−g, 0)
+
+    |g|=1 ⇒ 精确 one-hot 胜/负；g=0 ⇒ 精确 one-hot 和。于是 λ=1 时与硬标签 MC **逐位一致**，
+    架构改动（价值塔 / 子力差辅助头）因此可以单独消融。
+
+    Round 1 的教训：早期版本把和棋质量取成 clamp(pD.detach(), 0.05, 0.5)，g=0 的目标被稀释成
+    ((1−d)/2, d, (1−d)/2)——和棋信号被冲淡，且 d 取自模型自身预测形成自举固定点。
+    实测后果是优势局转换能力退化（Arena 和棋归因 41:5），故改为确定性投影。
     """
     logits = wdl_logits.reshape(-1, 3).float()
     g = target_g.reshape(-1).float().clamp(-1.0, 1.0)
-    p = torch.softmax(logits, dim=-1).detach()
-    d = p[:, 1].clamp(min=float(d_min), max=float(d_max))
-    # 极端 g 下压缩 draw 质量，保证 pW/pL 非负（构造后和恒为 1，无需再归一）
-    d = torch.minimum(d, (1.0 - g.abs()).clamp(min=0.0))
-    target = torch.stack([(g + 1.0 - d) * 0.5, d, (1.0 - g - d) * 0.5], dim=-1)
+    target = torch.stack([g.clamp(min=0.0), 1.0 - g.abs(), (-g).clamp(min=0.0)], dim=-1)
     log_p = torch.log_softmax(logits, dim=-1)
     ce = -(target * log_p).sum(dim=-1)
     w = torch.ones_like(ce)
