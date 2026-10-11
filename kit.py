@@ -249,12 +249,28 @@ def hist_summary(hist: list[int]) -> dict:
     }
 
 
+#: 2026-10-11 新增且**零初始化**的模块前缀：旧 checkpoint 缺这些键是预期的（加载后塔是恒等
+#: 映射，step 0 与改造前逐位一致）。缺名单之外的键一律响亮报错，绝不静默随机初始化。
+_NEW_ZEROINIT_PREFIXES = ("f.value_tower.", "f.w_mat.")
+
+
 def load_seq_model(checkpoint, device: str = "cuda") -> tuple:
-    """→ (eval 模式的 SeqModel, 解析后的绝对路径)。"""
+    """→ (eval 模式的 SeqModel, 解析后的绝对路径)。
+
+    旧架构的 checkpoint（没有价值塔 / 子力差辅助头）用 ``strict=False`` 加载：新模块保持
+    ``__init__`` 里的零初始化，前向与改造前逐位一致。除此之外任何键缺失或多余都报错——
+    推理路径静默随机初始化会把冒烟测试变成假阳性。
+    """
     path = _resolve(checkpoint).resolve()
     ckpt = torch.load(path, map_location=device, weights_only=False)
     seq = SeqModel(dropout=0.0)
-    seq.load_state_dict(ckpt.get("model", ckpt))
+    missing, unexpected = seq.load_state_dict(ckpt.get("model", ckpt), strict=False)
+    bad_missing = [k for k in missing if not k.startswith(_NEW_ZEROINIT_PREFIXES)]
+    if unexpected or bad_missing:
+        raise RuntimeError(
+            f"checkpoint {path} 与当前模型架构不匹配：多余键 {sorted(unexpected)[:5]}，"
+            f"缺失键 {sorted(bad_missing)[:5]}（缺失仅允许 {_NEW_ZEROINIT_PREFIXES} 这些"
+            f"零初始化新模块）")
     seq.to(device).eval()
     return seq, path
 

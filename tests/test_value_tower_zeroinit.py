@@ -87,6 +87,47 @@ class ValueTowerZeroInitTest(unittest.TestCase):
         self.assertGreater(total, 26_000_000, f"参数异常偏小：{total}")
 
 
+    def test_load_seq_model_accepts_old_checkpoint(self):
+        """旧架构 checkpoint（无价值塔/子力差键）必须能经 load_seq_model 加载且塔仍为零。"""
+        import tempfile
+
+        from SSM.kit import load_seq_model
+        from SSM.model import SeqModel
+
+        ref = SeqModel(dropout=0.0)
+        old_sd = {k: v for k, v in ref.state_dict().items()
+                  if not k.startswith("f.value_tower.") and not k.startswith("f.w_mat.")}
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            p = os.path.join(d, "old.pt")
+            torch.save({"model": old_sd, "step": 34}, p)
+            seq, path = load_seq_model(p, "cpu")
+        self.assertEqual(str(path), p)
+        for blk in seq.f.value_tower:
+            self.assertTrue(torch.equal(blk.fc2.weight, torch.zeros_like(blk.fc2.weight)),
+                            "旧 checkpoint 加载后价值塔不是恒等映射")
+        h = torch.randn(2, 3, 512)
+        with torch.no_grad():
+            _, wdl_new, _ = seq.f(h)
+            _, wdl_ref, _ = ref.f(h)
+        self.assertTrue(torch.equal(wdl_new, wdl_ref),
+                        "旧 checkpoint 经 load_seq_model 后 wdl 与改造前不一致")
+
+    def test_load_seq_model_rejects_foreign_checkpoint(self):
+        """缺零初始化新模块之外的键必须报错（推理路径不许静默随机初始化）。"""
+        import tempfile
+
+        from SSM.kit import load_seq_model
+        from SSM.model import SeqModel
+
+        ref = SeqModel(dropout=0.0)
+        broken = {k: v for k, v in ref.state_dict().items() if not k.startswith("e.")}
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            p = os.path.join(d, "broken.pt")
+            torch.save({"model": broken}, p)
+            with self.assertRaises(RuntimeError):
+                load_seq_model(p, "cpu")
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "整体前向/反向需 CUDA")
 class ValueTowerTrainingTest(unittest.TestCase):
     def test_tower_learns(self):
