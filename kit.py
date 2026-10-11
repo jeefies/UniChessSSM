@@ -58,8 +58,32 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _resolve(path) -> Path:
+    """路径解析：绝对路径原样；相对路径**先按 import 根**，找不到再按 cwd。
+
+    配置里的相对路径历来按 import 根解释（``SSM/runs/champion.pt``），这条不变；但命令行 /
+    脚本里手写的相对路径（cwd 常是 SSM 仓库根）会被静默改解释到 import 根，报错指向一个
+    八竿子打不着的路径——2026-10-11 连踩三次（champion 加载、worker config.json、
+    raw-policy 评测）。现在 import 根候选不存在时回落 cwd 候选；两者都不存在时仍返回
+    import 根候选，让调用方的报错保持既有口径（并在消息里带上两个候选）。
+    """
     p = Path(path).expanduser()
-    return p if p.is_absolute() else ROOT / p
+    if p.is_absolute():
+        return p
+    root_candidate = ROOT / p
+    if root_candidate.exists():
+        return root_candidate
+    cwd_candidate = Path.cwd() / p
+    if cwd_candidate.exists():
+        return cwd_candidate
+    return root_candidate
+
+
+def _missing_path(path: Path, what: str = "路径") -> FileNotFoundError:
+    """统一的"文件不存在"报错：把两个候选和当前口径都写出来，避免盯着错误路径发呆。"""
+    return FileNotFoundError(
+        f"{what}不存在：{path}\n"
+        f"  （相对路径先按 import 根 {ROOT} 解释，找不到再按 cwd {Path.cwd()} 解释；"
+        f"都不存在时报 import 根口径。建议直接传绝对路径。）")
 
 
 # ---------------------------------------------------------------- Server 预设（config.json）
@@ -262,6 +286,8 @@ def load_seq_model(checkpoint, device: str = "cuda") -> tuple:
     推理路径静默随机初始化会把冒烟测试变成假阳性。
     """
     path = _resolve(checkpoint).resolve()
+    if not path.exists():
+        raise _missing_path(path, "权重")
     ckpt = torch.load(path, map_location=device, weights_only=False)
     seq = SeqModel(dropout=0.0)
     missing, unexpected = seq.load_state_dict(ckpt.get("model", ckpt), strict=False)
@@ -674,7 +700,7 @@ def make_player_factory(checkpoint=None, *, preset: Optional[str] = None, name: 
                                 "（SSM/config.json 里的预设名）")
     ck = _resolve(ck)
     if not Path(ck).exists():
-        raise FileNotFoundError(f"权重不存在：{ck}")
+        raise _missing_path(Path(ck), "权重")
     eng = pick("engine", engine)
     evaluator = make_evaluator(
         ck, pick("device", device), eng,
