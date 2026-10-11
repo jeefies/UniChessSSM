@@ -137,6 +137,10 @@ class SeqModel(nn.Module):
         # ---- 价值目标：mc（终局 z 硬标签）/ lambda（TD(λ) 软目标）----
         if value_target not in ("mc", "lambda"):
             raise ValueError(f"value_target 只能是 'mc' / 'lambda'，得到 {value_target!r}")
+        # 低预算 ply 降权（D7）只为"q̂ 噪声大"而设：λ=1 时目标就是终局真值、与 sims 无关，
+        # 此时降权等于无端把 38% 的 ply 的价值梯度砍半（Round 2 实测因此掉到 42.5%）。
+        if value_lambda is not None and float(value_lambda) >= 1.0:
+            value_weights = None
         val_diag: dict[str, float] = {}
         if value_target == "lambda":
             if batch.q_valid is not None:
