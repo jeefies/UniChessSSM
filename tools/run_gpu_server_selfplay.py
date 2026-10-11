@@ -66,6 +66,17 @@ def main():
                              "训练侧 value_target='lambda' 才消费）")
     args = parser.parse_args()
 
+    # 路径一律绝对化：worker 子进程以 import 根为 cwd 启动，任何相对路径都会被解释到别处
+    # （2026-10-11 踩过：--out 传相对路径时 worker 找不到自己的 config.json）。
+    args.out = os.path.abspath(args.out)
+    args.ckpt = os.path.abspath(args.ckpt)
+    if args.openings:
+        args.openings = os.path.abspath(args.openings)
+    if args.opp_ckpt:
+        args.opp_ckpt = os.path.abspath(args.opp_ckpt)
+    if args.league_opps:
+        args.league_opps = ",".join(os.path.abspath(p) for p in args.league_opps.split(",") if p)
+
     if args.seed is None:
         args.seed = int(time.time() * 1000) & 0x7FFFFFFF
 

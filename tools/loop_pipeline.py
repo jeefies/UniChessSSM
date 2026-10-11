@@ -482,7 +482,7 @@ def main():
     args = parser.parse_args()
 
     orchestrator = SsmLoopOrchestrator(
-        out_dir=Path(args.out),
+        out_dir=Path(args.out).resolve(),
         total_gens=args.generations,
         games_per_gen=args.games,
         initial_champion=args.champion,
