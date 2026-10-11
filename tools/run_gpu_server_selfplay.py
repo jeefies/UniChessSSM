@@ -166,6 +166,9 @@ def main():
                 "c_scale_schedule": args.c_scale_schedule,
                 "adaptive_sims": args.adaptive_sims,
                 "deep_sims": args.deep_sims,
+                # 深算触发概率：loop_pipeline 一直显式传 --p-explore，但这里漏了转发，
+                # 之前全靠工厂默认值恰好也是 0.15 才没出偏差（默认一改就静默失效）。
+                "p_explore": args.p_explore,
             }
             # 联盟对局分配策略：
             # 若开启 --league 且存在对手池：
