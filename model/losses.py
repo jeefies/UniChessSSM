@@ -95,6 +95,50 @@ def z_white_from_results(results: torch.Tensor, color: torch.Tensor) -> torch.Te
     return to_mover_perspective(z_mover, color)
 
 
+def _lambda_return_scan(q_white: torch.Tensor, q_valid: torch.Tensor, z_white: torch.Tensor,
+                        lam: float, valid: torch.Tensor,
+                        anchor_last: torch.Tensor, last: torch.Tensor,
+                        anchor_val: torch.Tensor) -> torch.Tensor:
+    """通用兜底：按定义逐位递推（部分 ply 有 q̂ 时才走这里）。"""
+    g = torch.zeros_like(q_white)
+    g.scatter_(1, last.clamp(min=0).unsqueeze(1), anchor_val.unsqueeze(1))
+    for t in range(q_white.shape[1] - 2, -1, -1):
+        q_eff = torch.where(q_valid[:, t + 1] & valid[:, t + 1], q_white[:, t + 1], g[:, t + 1])
+        if lam >= 1.0:                      # 纯 MC：避开 0·NaN
+            cand = g[:, t + 1]
+        else:
+            cand = (1.0 - lam) * q_eff + lam * g[:, t + 1]
+        g[:, t] = torch.where(last > t, cand, g[:, t])
+    return g
+
+
+def _lambda_return_closed(q_white: torch.Tensor, anchor_val: torch.Tensor,
+                          last: torch.Tensor, lam: float) -> torch.Tensor:
+    """闭式：全部有效位都有 q̂ 时一次 bmm 算完。
+
+    g[t] = Σ_{s=t+1}^{last} (1−λ)·λ^{s−t−1}·q[s] + λ^{last−t}·anchor
+
+    B=4,T=300 上递推要 ~9.6 ms、闭式 ~0.12 ms；训练每步调 32 次，差 14% 吞吐。
+    λ≥1 时闭式退化为"g ≡ anchor"，直接返回以免 0·NaN。
+    """
+    bsz, seqlen = q_white.shape
+    dev = q_white.device
+    idx = torch.arange(seqlen, device=dev)
+    keep = last.unsqueeze(1) >= idx.unsqueeze(0)                 # (B,T)：t ≤ last
+    if lam >= 1.0:
+        g = anchor_val.unsqueeze(1).expand(bsz, seqlen).clone()
+        return torch.where(keep, g, torch.zeros_like(g))
+    expo = (idx[None, :] - idx[:, None] - 1).clamp(min=0).to(q_white.dtype)      # (T,T)
+    base = (1.0 - lam) * torch.pow(torch.full_like(expo, lam), expo)             # (T,T)
+    upper = (idx[None, :] > idx[:, None]).unsqueeze(0)                           # (1,T,T) s>t
+    within = (idx[None, :].expand(bsz, seqlen) <= last[:, None]).unsqueeze(1)    # (B,1,T) s≤last
+    mat = base.unsqueeze(0) * (upper & within).to(q_white.dtype)                 # (B,T,T)
+    decay = torch.pow(torch.full((bsz, seqlen), lam, device=dev, dtype=q_white.dtype),
+                      (last[:, None] - idx[None, :]).clamp(min=0).to(q_white.dtype))
+    g = torch.bmm(mat, q_white.unsqueeze(-1)).squeeze(-1) + decay * anchor_val.unsqueeze(1)
+    return torch.where(keep, g, torch.zeros_like(g))
+
+
 def lambda_return(q_white: torch.Tensor, q_valid: torch.Tensor, z_white: torch.Tensor,
                   lam: float, valid: torch.Tensor | None = None,
                   anchor_last: torch.Tensor | None = None) -> torch.Tensor:
@@ -109,6 +153,9 @@ def lambda_return(q_white: torch.Tensor, q_valid: torch.Tensor, z_white: torch.T
 
     递推：g[last] = anchor；g[t] = (1−λ)·q_eff[t+1] + λ·g[t+1]。
     λ=1 ⇒ g ≡ z（= 现 MC 基线，可逐位对拍）；λ=0 ⇒ 纯一步自举（明确要避免的端点）。
+
+    性能：全部有效位都有 q̂ 时走闭式（一次 bmm），只有"部分 ply 有 q̂"的混合批次才
+    逐位递推——前者覆盖新分片与人类谱自举，是训练的热路径。
     """
     bsz, seqlen = q_white.shape
     dev = q_white.device
@@ -126,16 +173,15 @@ def lambda_return(q_white: torch.Tensor, q_valid: torch.Tensor, z_white: torch.T
     anchor_ok = anchor_last.reshape(-1) & q_valid.gather(1, safe_last.unsqueeze(1)).squeeze(1)
     anchor_val = torch.where(anchor_ok, q_anchor, z_anchor)
 
-    g = torch.zeros_like(q_white)
-    g.scatter_(1, safe_last.unsqueeze(1), anchor_val.unsqueeze(1))
-    for t in range(seqlen - 2, -1, -1):
-        q_eff = torch.where(q_valid[:, t + 1] & valid[:, t + 1], q_white[:, t + 1], g[:, t + 1])
-        if lam >= 1.0:                      # 纯 MC：避开 0·NaN
-            cand = g[:, t + 1]
-        else:
-            cand = (1.0 - lam) * q_eff + lam * g[:, t + 1]
-        g[:, t] = torch.where(last > t, cand, g[:, t])
-    return g
+    if not bool((valid & ~q_valid).any()):
+        # 热路径：有效位全有 q̂（新分片 / 人类谱自举）
+        return _lambda_return_closed(q_white, anchor_val, last, lam)
+    if not bool(q_valid.any()):
+        # 老分片：整局无 q̂ ⇒ 纯 MC
+        g = z_anchor.unsqueeze(1).expand(bsz, seqlen).clone()
+        return torch.where(valid, g, torch.zeros_like(g))
+    return _lambda_return_scan(q_white, q_valid, z_white, lam, valid, anchor_last,
+                               last, anchor_val)
 
 
 def value_soft_loss(wdl_logits: torch.Tensor, target_g: torch.Tensor,
