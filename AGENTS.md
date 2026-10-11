@@ -233,14 +233,21 @@ $$I = -[s \log p + (1 - s) \log (1 - p)] \quad (s \in \{1, 0.5, 0\})$$
 - **λ-return 目标（D2/D4）**：`g[t]=(1−λ)q̂[t+1]+λg[t+1]`（闭式一次 bmm，递推版 9.6ms→0.125ms），
   WDL 软目标用**确定性最大熵投影** `pW=max(g,0), pD=1−|g|, pL=max(−g,0)`（|g|=1 与 g=0 精确
   one-hot，λ=1 与硬标签 MC 逐位一致）。
+- **终局常数锚 β（必须开）**：递改自带给锚点的权重是 λ^(剩余ply)，百步棋里指数衰减到 0 ⇒
+  目标退化成纯自举、终局真值毫无话语权 ⇒ 价值尺度代际坍缩（实测两代 mean|q| −24%、
+  |q|>0.9 占比 20%→9.5%，Arena −33 Elo）。正确形式是
+  `g = (1−β)·λreturn + β·anchor`，`--value-anchor-weight 0.5`。β=0 与旧行为逐位一致。
 - **不需要重新预训练**：零初始化保证连续；`load_seq_model` 改 `strict=False` 且只允许缺零初始化
   新模块（缺别的键一律响亮报错）。
 - **实验结论**（逐轮记录见 `docs/value-target-experiments.md`）：
   λ=1.0（纯架构消融）43.5% < λ=0.35 46.0% < **λ=0.5 57.5%**；投影修复单独值 +45 Elo。
   Round 4（λ=0.5 + 新投影）在 Arena GSPRT 以 **55.25% / Elo +36.62 / H1** 胜出并晋级，
   旧霸主备份为 `runs/champion_gen4.pt`（进联盟池）。
-- **循环开关**：`loop_pipeline.py --value-target lambda --value-lambda-end 0.5 --record-qsearch`；
-  开 q̂ 记录时回放池只收带 q̂ 的代（混入老代会让价值目标在 λ-return 与纯 MC 之间漂移）。
+  Gen 31（晋级后第一次正规循环代）退步到 45.28%，归因为上面的**终局锚缺失**；补上 β=0.5 后
+  同数据同基座从 −32.91 Elo 回到 +3.47 Elo。
+- **循环开关**：`loop_pipeline.py --value-target lambda --value-lambda-end 0.5
+  --value-anchor-weight 0.5 --record-qsearch`；开 q̂ 记录时回放池只收带 q̂ 的代
+  （混入老代会让价值目标在 λ-return 与纯 MC 之间漂移）。
 - **两个容易踩的坑**：① λ=1 时不要做低预算 ply 降权（目标已是终局真值，与 sims 无关）；
   ② `value_q_corr` 只在同一 λ 内可比——λ<1 时目标大部分来自网络自己的搜索值，高相关性
   有很大一部分是自蒸馏，不等于价值头变强。
