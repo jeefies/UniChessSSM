@@ -261,8 +261,11 @@ def main():
             w_shards = w_mf.get("shards", [])
             for w_shard in w_shards:
                 target_shard_name = f"shard-selfplay-{next_shard_idx:05d}"
-                for ext in (".actions.bin", ".meta.npz", ".pipol.bin", ".pipol.offsets.bin"):
+                for ext in (".actions.bin", ".meta.npz", ".pipol.bin", ".pipol.offsets.bin",
+                            ".qsearch.bin"):
                     src = os.path.join(wdir, w_shard + ext)
+                    if not os.path.exists(src):
+                        continue        # qsearch 未开时不产该文件
                     dst = os.path.join(args.out, target_shard_name + ext)
                     shutil.move(src, dst)
                 existing_shards.append(target_shard_name)
@@ -270,6 +273,9 @@ def main():
 
             total_games += w_mf.get("games", 0)
             total_steps += w_mf.get("steps", 0)
+            # 聚合 qsearch 标记：任一 worker 落了逐 ply 搜索价值，主 manifest 就要记 true
+            if w_mf.get("qsearch"):
+                main_mf["qsearch"] = True
 
             # 聚合 .games.jsonl
             w_jsonl = os.path.join(wdir, ".games.jsonl")
