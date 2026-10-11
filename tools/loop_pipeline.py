@@ -60,6 +60,7 @@ class SsmLoopOrchestrator:
                  workers: int = 8, concurrency: int = 20,
                  python_bin: str = sys.executable,
                  value_target: str = "mc", value_lambda_end: float = 1.0,
+                 value_anchor_weight: float = 0.0,
                  record_qsearch: bool = False):
         self.out_dir = out_dir
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -75,6 +76,7 @@ class SsmLoopOrchestrator:
             raise ValueError(f"value_target 只能是 'mc' / 'lambda'，得到 {value_target!r}")
         self.value_target = str(value_target)
         self.value_lambda_end = float(value_lambda_end)
+        self.value_anchor_weight = float(value_anchor_weight)
         self.record_qsearch = bool(record_qsearch)
 
         self.log_file = self.out_dir / "loop.log"
@@ -220,6 +222,9 @@ class SsmLoopOrchestrator:
                 "value_lambda_start": 1.0,
                 "value_lambda_end": self.value_lambda_end,
                 "value_lambda_anneal_frac": 0.25,
+                # 终局锚的常数权重：递改自带的 λ^k 锚在百步棋里指数衰减到 0，目标退化成纯自举，
+                # 实测两代内价值尺度坍缩（mean|q| −24%、|q|>0.9 占比腰斩）、Arena −33 Elo。
+                "value_anchor_weight": self.value_anchor_weight,
                 "material_weight": 0.1,
             }
         cfg_data = {
@@ -464,6 +469,7 @@ class SsmLoopOrchestrator:
                 "raw_policy": raw_summary,
                 "value_target": self.value_target,
                 "value_lambda_end": self.value_lambda_end if self.value_target == "lambda" else None,
+                "value_anchor_weight": self.value_anchor_weight if self.value_target == "lambda" else None,
                 "record_qsearch": self.record_qsearch,
                 "elapsed_sec": {
                     "selfplay": round(t_sp, 1),
@@ -495,6 +501,8 @@ def main():
                         help="价值学习目标：mc=终局 z 硬标签（原口径）；lambda=TD(λ) 软目标（D2/D4）")
     parser.add_argument("--value-lambda-end", type=float, default=1.0,
                         help="lambda 目标的退火终点（默认 1.0 = 与 mc 等价；建议 0.5）")
+    parser.add_argument("--value-anchor-weight", type=float, default=0.0,
+                        help="终局锚的常数权重 β（默认 0 = 旧行为；防价值尺度代际坍缩，建议 0.5）")
     parser.add_argument("--record-qsearch", action="store_true", default=False,
                         help="自对弈额外落逐 ply 搜索价值 q̂（D3；lambda 目标的前置条件）")
     args = parser.parse_args()
@@ -509,6 +517,7 @@ def main():
         concurrency=args.concurrency,
         value_target=args.value_target,
         value_lambda_end=args.value_lambda_end,
+        value_anchor_weight=args.value_anchor_weight,
         record_qsearch=args.record_qsearch,
     )
     orchestrator.run()
