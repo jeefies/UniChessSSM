@@ -2,9 +2,9 @@
   "a": {
     "factory": "SSM.kit:make_player_factory",
     "root": "/home/jeefy/UniChess",
-    "label": "Candidate_vtower",
+    "label": "Candidate_vtower_gen0002",
     "kwargs": {
-      "checkpoint": "/home/jeefy/UniChess/SSM/runs/exp_vtower_v1/gen_0001/train/best.pt",
+      "checkpoint": "/home/jeefy/UniChess/SSM/runs/exp_vtower_v1/gen_0002/train/best.pt",
       "simulations": 64,
       "m0": 16,
       "c_scale": 0.02,
