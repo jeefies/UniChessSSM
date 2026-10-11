@@ -42,8 +42,8 @@ def _meta(n_plies: int, gen_id: int = 7) -> np.ndarray:
 def _pipol(n_plies: int) -> tuple:
     acts = [np.array([0, 1], dtype=np.uint16)] * n_plies
     probs = [np.array([0.75, 0.25], dtype=np.float32)] * n_plies
-    # 每 ply = u16 合法数 + 2×(u16 id + f16 prob) = 2 + 8 字节
-    return encode_v3_pipol(acts, probs), np.array([0, 2 + 8 * n_plies], dtype=np.int32)
+    # 每 ply = u16 合法数 + 2×(u16 id + f16 prob) = 2 + 8 = 10 字节
+    return encode_v3_pipol(acts, probs), np.array([0, 10 * n_plies], dtype=np.int32)
 
 
 class QsearchCodecTest(unittest.TestCase):

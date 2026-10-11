@@ -107,7 +107,7 @@ class ValueTowerTrainingTest(unittest.TestCase):
             loss.backward()
             opt.step()
             if i == 0:
-                first = float(loss)
+                first = float(loss.detach())
         self.assertGreater(first, 0.9)
         nonzero = any(float(blk.fc2.weight.abs().sum()) > 0 for blk in head.value_tower)
         self.assertTrue(nonzero, "塔的 fc2 仍全零：残差路径没有拿到梯度")

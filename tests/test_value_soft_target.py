@@ -94,12 +94,15 @@ class ValueSoftTargetTest(unittest.TestCase):
 
 
 class MaterialLossTest(unittest.TestCase):
-    def _features(self, pieces: dict) -> torch.Tensor:
-        """pieces: {(plane_idx, square): 1}；plane 0..5=白 P,N,B,R,Q,K，6..11=黑。"""
+    def _features(self, pieces: dict, n_pos: int = 1) -> torch.Tensor:
+        """pieces: {(plane_idx, square): 1}；plane 0..5=白 P,N,B,R,Q,K，6..11=黑。
+
+        n_pos > 1 时在同一条序列上重复同一局面（用于验证 mask 屏蔽）。
+        """
         from SSM.features import FEATURE_DIM
-        f = torch.zeros(1, 1, FEATURE_DIM)
+        f = torch.zeros(1, n_pos, FEATURE_DIM)
         for (plane, sq), v in pieces.items():
-            f[0, 0, plane * 64 + sq] = v
+            f[0, :, plane * 64 + sq] = v
         return f
 
     def test_material_target(self):
@@ -121,7 +124,7 @@ class MaterialLossTest(unittest.TestCase):
 
     def test_mask(self):
         # 白多一个车 ⇒ 目标 0.5；mask 掉第二位后只算第一位
-        f = self._features({(3, 0): 1})
+        f = self._features({(3, 0): 1}, n_pos=2)
         pred = torch.zeros(1, 2, 1)
         mask = torch.tensor([[True, False]])
         self.assertAlmostEqual(float(material_loss(pred, f, mask)), 0.125, places=6)
