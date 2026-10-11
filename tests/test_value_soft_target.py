@@ -21,7 +21,7 @@ import unittest
 
 import torch
 
-from SSM.model.losses import material_loss, value_soft_loss
+from SSM.model.losses import material_loss, value_loss, value_soft_loss
 
 
 def _logits_from_q(q: float, d: float, scale: float = 8.0) -> torch.Tensor:
@@ -57,7 +57,7 @@ class ValueSoftTargetTest(unittest.TestCase):
         result = torch.tensor([[0, 1, 2, 0, 1], [2, 2, 1, 0, 0]])       # 0 胜/1 和/2 负
         g = (1.0 - result.float()).reshape(-1)                          # → +1/0/−1
         soft = value_soft_loss(logits, g.reshape(2, 5))
-        hard = losses.value_loss(logits, result)
+        hard = value_loss(logits, result)
         self.assertAlmostEqual(float(soft), float(hard), places=6,
                                msg=f"λ=1 软目标 {float(soft)} 与硬标签 {float(hard)} 不一致")
 
