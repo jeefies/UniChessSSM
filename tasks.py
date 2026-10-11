@@ -170,6 +170,7 @@ class StageB2Task(SsmTask):
                  kl_reweight: bool = True,
                  value_target: str = "mc", value_lambda_start: float = 1.0,
                  value_lambda_end: float = 0.5, value_lambda_anneal_frac: float = 0.25,
+                 value_anchor_weight: float = 0.0,
                  value_lowsim_weight: float = 0.5, value_lowsim_sims: int = 32,
                  material_weight: float = 0.1, **kw):
         super().__init__(**kw)
@@ -191,6 +192,9 @@ class StageB2Task(SsmTask):
         self.value_lambda_start = float(value_lambda_start)
         self.value_lambda_end = float(value_lambda_end)
         self.value_lambda_anneal_frac = float(value_lambda_anneal_frac)
+        # 终局锚点的常数权重：递推自带的 λ^k 锚在百步棋里指数衰减到 0，目标退化成纯自举，
+        # 实测两代内价值尺度坍缩 24%（mean|q|）、Arena −33 Elo。默认 0 = 旧行为。
+        self.value_anchor_weight = float(value_anchor_weight)
         self.value_lowsim_weight = float(value_lowsim_weight)
         self.value_lowsim_sims = int(value_lowsim_sims)
         self.material_weight = float(material_weight)
@@ -300,6 +304,7 @@ class StageB2Task(SsmTask):
                                                valid_mask=h["valid"], log_target=self.mlh_log,
                                                value_target=self.value_target,
                                                value_lambda=lam,
+                                               value_anchor_weight=self.value_anchor_weight,
                                                material_weight=self.material_weight)
             total_sp, m_sp = model.forward_train(
                 sp["batch"], self.weights, step, total_steps, valid_mask=sp["valid"],
@@ -307,6 +312,7 @@ class StageB2Task(SsmTask):
                 policy_weights=self._sp_policy_weights(sp), log_target=self.mlh_log,
                 kl_reweight=self.kl_reweight,
                 value_target=self.value_target, value_lambda=lam,
+                value_anchor_weight=self.value_anchor_weight,
                 value_weights=sp["value_weight"], anchor_last=sp["anchor_last"],
                 material_weight=self.material_weight)
         total = self.w_selfplay * total_sp + self.w_human * total_h
@@ -325,6 +331,7 @@ class StageB2Task(SsmTask):
                                                valid_mask=item["valid"], log_target=self.mlh_log,
                                                value_target=self.value_target,
                                                value_lambda=self._last_lambda,
+                                               value_anchor_weight=self.value_anchor_weight,
                                                material_weight=self.material_weight)
                 for k, v in m.items():
                     if k.startswith("loss_") or k in _EXTRA_METRIC_KEYS:
@@ -338,6 +345,7 @@ class StageB2Task(SsmTask):
                         mlh_valid_mask=item["mlh_valid"],
                         policy_weights=self._sp_policy_weights(item), log_target=self.mlh_log,
                         value_target=self.value_target, value_lambda=self._last_lambda,
+                        value_anchor_weight=self.value_anchor_weight,
                         value_weights=item["value_weight"], anchor_last=item["anchor_last"],
                         material_weight=self.material_weight)
                 for k, v in m.items():

@@ -131,5 +131,64 @@ class LambdaReturnTest(unittest.TestCase):
         self.assertAlmostEqual(float(g[0, 0]), 1.0, places=6)
 
 
+# ------------------------- 常数权重的终局锚（价值尺度防坍缩） -------------------------
+
+class AnchorWeightTest(unittest.TestCase):
+    """β>0 时终局真值在每个位置都有固定话语权，杜绝纯自举导致的尺度代际坍缩。"""
+
+    def setUp(self):
+        # 长序列：中位位置离终局 ~90 步，λ^90 早已衰减到 0
+        self.T = 181
+        self.q = (torch.rand(1, self.T) * 2 - 1) * 0.5          # |q| ≤ 0.5
+        self.qv = torch.ones_like(self.q, dtype=torch.bool)
+        self.z = torch.tensor([1.0])
+        self.valid = torch.ones_like(self.q, dtype=torch.bool)
+
+    def test_beta_zero_is_old_behaviour(self):
+        """β=0 必须与旧行为逐位一致（递推自带的 λ^k 锚）。"""
+        g0 = lambda_return(self.q, self.qv, self.z, 0.5, self.valid, None, 0.0)
+        g_none = lambda_return(self.q, self.qv, self.z, 0.5, self.valid)
+        self.assertTrue(torch.equal(g0, g_none), "β=0 与不传 β 不一致")
+
+    def test_beta_one_is_pure_mc(self):
+        g = lambda_return(self.q, self.qv, self.z, 0.5, self.valid, None, 1.0)
+        for t in range(self.T):
+            self.assertAlmostEqual(float(g[0, t]), 1.0, places=6, msg=f"β=1 时 g[{t}] 应等于 z")
+
+    def test_anchor_weight_is_constant_across_distance(self):
+        """关键不变式：终局锚的权重不随剩余步数衰减（旧实现在远端位置恒等于 0）。"""
+        beta = 0.5
+        g_beta = lambda_return(self.q, self.qv, self.z, 0.5, self.valid, None, beta)
+        g_plain = lambda_return(self.q, self.qv, self.z, 0.5, self.valid, None, 0.0)
+        # g_beta = (1-β)·g_plain + β·z  ⇒ 残差应恒为 β·z
+        resid = g_beta - (1.0 - beta) * g_plain
+        expect = torch.full_like(resid, beta * 1.0)
+        self.assertTrue(torch.allclose(resid, expect, atol=1e-6),
+                        f"锚权重不是常数：残差范围 [{resid.min():.6f}, {resid.max():.6f}]")
+        # 远端位置（递推锚已衰减到 0）也必须拿到 β·z
+        far = self.T - 2
+        self.assertAlmostEqual(float(resid[0, far]), beta, places=6)
+
+    def test_target_scale_does_not_collapse(self):
+        """坍缩回归：目标里必须保留终局真值的尺度，而不是被 q̂ 的尺度拖着走。"""
+        beta = 0.5
+        g = lambda_return(self.q, self.qv, self.z, 0.5, self.valid, None, beta)
+        # q̂ 全压到 0.05（模拟已坍缩的价值头），目标仍应离 z 有 beta 的量级
+        q_flat = torch.full_like(self.q, 0.05)
+        g_flat = lambda_return(q_flat, self.qv, self.z, 0.5, self.valid, None, beta)
+        self.assertGreater(float(g_flat[0, self.T // 2]), 0.4,
+                           "q̂ 被压平时目标也跟着塌——终局锚没起作用")
+        g_flat_old = lambda_return(q_flat, self.qv, self.z, 0.5, self.valid, None, 0.0)
+        self.assertLess(abs(float(g_flat_old[0, self.T // 2])), 0.1,
+                        "β=0 时目标应几乎完全跟随 q̂（这正是坍缩的机制）")
+
+    def test_padding_stays_zero(self):
+        valid = torch.ones_like(self.q, dtype=torch.bool)
+        valid[0, self.T // 2:] = False
+        g = lambda_return(self.q, self.qv, self.z, 0.5, valid, None, 0.5)
+        self.assertEqual(float(g[0, self.T // 2:].abs().max()), 0.0,
+                         "β 混合把 padding 位也填上了")
+
+
 if __name__ == "__main__":
     unittest.main()

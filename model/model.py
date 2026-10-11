@@ -84,6 +84,7 @@ class SeqModel(nn.Module):
                       value_lambda: float = 1.0,
                       value_weights: torch.Tensor | None = None,
                       anchor_last: torch.Tensor | None = None,
+                      value_anchor_weight: float = 0.0,
                       material_weight: float = 0.0) -> tuple[torch.Tensor, dict[str, float]]:
         """整序列前向 + 五损失（+子力差辅助）；valid_mask (B,T) 屏蔽填充步。返回 (总损失, 指标 dict)。
 
@@ -109,6 +110,8 @@ class SeqModel(nn.Module):
         value_lambda: λ；1.0 = 现 MC 基线，0.0 = 纯一步自举（要避免的端点）。
         value_weights (B,T)：价值损失逐位置权重（PCR 低预算 ply 降权，D7）。
         anchor_last (B,)：真实终局不在加载窗口内（截断局），锚点改用 q̂[last]。
+        value_anchor_weight：终局锚点的常数权重 β（0 = 旧行为，递推自带的 λ^k 锚随剩余
+        步数指数衰减，百步棋里等于没有锚 ⇒ 纯自举 ⇒ 价值尺度代际坍缩；见 losses.lambda_return）。
         material_weight: 子力差辅助损失权重（D9，0 = 关闭）。
         """
         bsz, seqlen, _ = batch.features.shape
@@ -156,7 +159,7 @@ class SeqModel(nn.Module):
                 anchor = None
             z_white = losses.z_white_from_results(batch.results, batch.color)[:, 0]
             g_white = losses.lambda_return(q_white, q_valid, z_white, value_lambda,
-                                           valid_mask, anchor)
+                                           valid_mask, anchor, value_anchor_weight)
             g_mover = losses.to_mover_perspective(g_white, batch.color)
             l_val = losses.value_soft_loss(wdl_logits, g_mover, valid_mask, value_weights)
             with torch.no_grad():

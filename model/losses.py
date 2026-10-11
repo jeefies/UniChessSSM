@@ -141,8 +141,9 @@ def _lambda_return_closed(q_white: torch.Tensor, anchor_val: torch.Tensor,
 
 def lambda_return(q_white: torch.Tensor, q_valid: torch.Tensor, z_white: torch.Tensor,
                   lam: float, valid: torch.Tensor | None = None,
-                  anchor_last: torch.Tensor | None = None) -> torch.Tensor:
-    """TD(λ) 价值目标（白方绝对视角；无中间奖励 ⇒ 向后递推，D2）。
+                  anchor_last: torch.Tensor | None = None,
+                  anchor_weight: float = 0.0) -> torch.Tensor:
+    """TD(λ) 价值目标 + 常数权重的终局锚（白方绝对视角；无中间奖励 ⇒ 向后递推，D2）。
 
     q_white (B,T)：每 ply 搜索价值 Σ_a π′(a)·completedQ(a)（白方绝对视角）
     q_valid (B,T)：该 ply 的 q̂ 是否可用。不可用时用后续的 g 代替 ⇒ 该步不引入自举、
@@ -150,6 +151,13 @@ def lambda_return(q_white: torch.Tensor, q_valid: torch.Tensor, z_white: torch.T
     z_white (B,)：终局结果（白方绝对视角，+1/0/−1）
     anchor_last (B,)：True ⇒ 真实终局不在加载窗口内（截断局 / 被 t_max 截断），
                    锚点改用 q̂[last]（截断局的 z=0 是假标签）
+    anchor_weight β：终局锚点的**常数**权重。递推本身给锚点的权重是 λ^(剩余ply)，
+                   一盘百步棋的中位位置离终局 ~50 步 ⇒ 0.5⁵⁰≈1e-15，**终局真值对目标的
+                   影响恒等于零**，目标退化成纯自举（q̂ 的加权平均）。q̂ 来自模型自己的
+                   价值头，于是一旦被压扁，下一代数据更扁、再无修正——实测两代内 mean|q|
+                   掉 24%、|q|>0.9 占比腰斩（20%→9.5%），Arena −33 Elo。
+                   加常数锚后：g = (1−β)·λreturn + β·anchor，终局真值在每个位置都有固定
+                   话语权，尺度不再漂移。β=0 ⇒ 与旧行为逐位一致；β=1 ⇒ 纯 MC。
 
     递推：g[last] = anchor；g[t] = (1−λ)·q_eff[t+1] + λ·g[t+1]。
     λ=1 ⇒ g ≡ z（= 现 MC 基线，可逐位对拍）；λ=0 ⇒ 纯一步自举（明确要避免的端点）。
@@ -160,6 +168,7 @@ def lambda_return(q_white: torch.Tensor, q_valid: torch.Tensor, z_white: torch.T
     bsz, seqlen = q_white.shape
     dev = q_white.device
     lam = float(lam)
+    beta = float(anchor_weight)
     if valid is None:
         valid = torch.ones(bsz, seqlen, dtype=torch.bool, device=dev)
     if anchor_last is None:
@@ -175,13 +184,21 @@ def lambda_return(q_white: torch.Tensor, q_valid: torch.Tensor, z_white: torch.T
 
     if not bool((valid & ~q_valid).any()):
         # 热路径：有效位全有 q̂（新分片 / 人类谱自举）
-        return _lambda_return_closed(q_white, anchor_val, last, lam)
-    if not bool(q_valid.any()):
+        g = _lambda_return_closed(q_white, anchor_val, last, lam)
+    elif not bool(q_valid.any()):
         # 老分片：整局无 q̂ ⇒ 纯 MC
         g = z_anchor.unsqueeze(1).expand(bsz, seqlen).clone()
-        return torch.where(valid, g, torch.zeros_like(g))
-    return _lambda_return_scan(q_white, q_valid, z_white, lam, valid, anchor_last,
-                               last, anchor_val)
+        g = torch.where(valid, g, torch.zeros_like(g))
+    else:
+        g = _lambda_return_scan(q_white, q_valid, z_white, lam, valid, anchor_last,
+                                last, anchor_val)
+
+    if beta > 0.0:
+        # 常数权重的终局锚：只在有效位上混合，padding 位保持 0
+        keep = last.unsqueeze(1) >= torch.arange(seqlen, device=dev).unsqueeze(0)
+        g = torch.where(keep, (1.0 - beta) * g + beta * anchor_val.unsqueeze(1),
+                        torch.zeros_like(g))
+    return g
 
 
 def value_soft_loss(wdl_logits: torch.Tensor, target_g: torch.Tensor,
