@@ -118,7 +118,10 @@ SSM/
     /home/jeefy/miniconda3/envs/unichess/bin/python -m unittest discover -s tests
   ```
   2026-09-25 重构后：**123 项 OK**（5 项按环境跳过）；2026-09-27 加 `test_kit_preset.py` 后
-  **129 项 OK**；2026-10-08 加 `test_v3_sink.py` 与 `test_multigen_selfplay.py` 后 **137 项 OK**。
+  **129 项 OK**；2026-10-08 加 `test_v3_sink.py` 与 `test_multigen_selfplay.py` 后 **137 项 OK**；
+  2026-10-11 价值头与学习目标改造后 **188 项 OK**（新增 `test_value_tower_zeroinit` /
+  `test_lambda_return` / `test_qsearch_roundtrip` / `test_value_soft_target` /
+  `test_resolve_paths`）。**动 `SSM/kit.py` 或 Trainer 口径前，Kit 全量（388 项）先过。**
 - **本机**：无 torch/chess/mamba-ssm，只跑语法检查（`python -m py_compile`）。
 - **Kit 先过**：动 `SSM/kit.py` 或 Trainer 相关口径前，先跑
   `cd ~/UniChess && UNICHESS_IMPORT_ROOT=~/UniChess python -m unittest discover -s Kit/tests`。
@@ -213,7 +216,28 @@ $$I = -[s \log p + (1 - s) \log (1 - p)] \quad (s \in \{1, 0.5, 0\})$$
 - **势均力敌自博弈（$p=0.50$）**：胜、和、负严格对称收敛于 $-\log(0.5) \approx 0.6931$；
 - **强敌抗压局（$p=0.02$）**：守和与逆袭赢局信息量大幅拉高（1.96 ~ 3.91）。
 
-### 9.4 强化学习纪律与约束【锁定】
+### 9.5 价值头与学习目标改造（2026-10-11，已晋级一代）
+
+针对 `docs/elo-degradation-analysis.md` §19 的"0-sim 58.5% vs 64-sim 45% 搜索-蒸馏脱节"：
+
+- **价值塔（D1）**：`head_norm` 与 `w_v` 之间插 2×`ResidualMLP(512,768)` + 子力差辅助头，
+  **零初始化** ⇒ 旧 ckpt 经 `strict=False` 加载后 step 0 逐位等价；参数 26.40M → 27.981M（D4 内）。
+- **q̂ 数据（D3）**：v3 分片新增 `shard-*.qsearch.bin`（每 ply 3 B：f16 白方绝对视角
+  `Σπ′·completedQ` + u8 sims）；旧分片无该文件 ⇒ 价值目标自动回退终局 z。**Kit 零改动**。
+- **λ-return 目标（D2/D4）**：`g[t]=(1−λ)q̂[t+1]+λg[t+1]`（闭式一次 bmm，递推版 9.6ms→0.125ms），
+  WDL 软目标用**确定性最大熵投影** `pW=max(g,0), pD=1−|g|, pL=max(−g,0)`（|g|=1 与 g=0 精确
+  one-hot，λ=1 与硬标签 MC 逐位一致）。
+- **不需要重新预训练**：零初始化保证连续；`load_seq_model` 改 `strict=False` 且只允许缺零初始化
+  新模块（缺别的键一律响亮报错）。
+- **实验结论**（逐轮记录见 `docs/value-target-experiments.md`）：
+  λ=1.0（纯架构消融）43.5% < λ=0.35 46.0% < **λ=0.5 57.5%**；投影修复单独值 +45 Elo。
+  Round 4（λ=0.5 + 新投影）在 Arena GSPRT 以 **55.25% / Elo +36.62 / H1** 胜出并晋级，
+  旧霸主备份为 `runs/champion_gen4.pt`（进联盟池）。
+- **循环开关**：`loop_pipeline.py --value-target lambda --value-lambda-end 0.5 --record-qsearch`；
+  开 q̂ 记录时回放池只收带 q̂ 的代（混入老代会让价值目标在 λ-return 与纯 MC 之间漂移）。
+- **两个容易踩的坑**：① λ=1 时不要做低预算 ply 降权（目标已是终局真值，与 sims 无关）；
+  ② `value_q_corr` 只在同一 λ 内可比——λ<1 时目标大部分来自网络自己的搜索值，高相关性
+  有很大一部分是自蒸馏，不等于价值头变强。
 - **全链路时间戳真动态随机种子**：自对弈、数据 shuffle、Arena 开局全量接入 `int(time.time() * 1000) & 0x7FFFFFFF`，全局局序号逐代累加错位；
 - **换代门槛【锁定】**：challenger vs champion 成对换先 GSPRT 动态早停（$\alpha=0.05, \beta=0.05, H_1: 35.0\text{ Elo}$）触发 $H_1$ 胜出或得分率 $\ge 55.0\%$ 即可晋升；
 - **五代非回滚窗口（Learner 连续性与熔断机制）**：五代内有晋升则不回滚，每一代训练以**上一代最优检查点 `best.pt`** 为基座连续向前推进（深度策略演化，彻底打破在原地微调打转）；若**连续 5 代**冲击 Champion 均未突破，触发安全熔断机制，下一代重置回现役 Champion 重新热启（防止偏科与误差滚雪球）；
