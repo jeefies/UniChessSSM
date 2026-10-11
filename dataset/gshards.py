@@ -16,6 +16,7 @@ import os
 import struct
 import tempfile
 import zlib
+from typing import Optional
 
 import numpy as np
 
@@ -74,6 +75,11 @@ META_V3_DTYPE = np.dtype([
     ("flags", np.uint8),
     ("pad", np.uint32),
 ])
+
+# v3 扩展：逐 ply 搜索价值（D2/D3）。定长 3 B/ply ⇒ 不需要额外 offsets 文件，
+# 用 meta.n_plies 就能切分；sims=0 是"该 ply 无记录"哨兵（老分片/未开记录时整局为 0）。
+# q 存**白方绝对视角**（与 meta.result 同口径），训练侧再按行棋方翻转。
+QSEARCH_DTYPE = np.dtype([("q", "<f2"), ("sims", "u1")])
 
 
 def make_game_key(month: str, game_index: int) -> str:
@@ -157,13 +163,14 @@ class ShardBuilder:
 
 
 def write_manifest(shard_dir: str, shards: list[str], months: list[str],
-                   stats: dict) -> None:
+                    stats: dict) -> None:
     manifest = {
         "shards": [os.path.basename(s) for s in shards],
         "months": months,
         "games": stats.get("games", 0),
         "steps": stats.get("steps", 0),
         "skipped": stats.get("skipped", 0),
+        "qsearch": bool(stats.get("qsearch", False)),
     }
     fd, tmp = tempfile.mkstemp(dir=shard_dir, suffix=".tmp")
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -234,7 +241,7 @@ class ShardReader:
 # ------------------------- v3 分片（Stage B 自对弈） -------------------------
 
 class V3ShardWriter:
-    """v3 分片写入器：支持变长 pipol 目标 + 终局元数据扩展。"""
+    """v3 分片写入器：支持变长 pipol 目标 + 终局元数据扩展 + 定长 qsearch 目标。"""
 
     def __init__(self, out_dir: str, tag: str, shard_size: int = GAMES_PER_SHARD):
         self.out_dir = out_dir
@@ -245,10 +252,12 @@ class V3ShardWriter:
         self._action_chunks: list[np.ndarray] = []
         self._pipol_chunks: list[bytes] = []
         self._pipol_offsets: list[np.ndarray] = []
+        self._qsearch_chunks: list[bytes | None] = []
         self.shard_files: list[str] = []
         self.games = 0
         self.steps = 0
         manifest_path = os.path.join(out_dir, "manifest.json")
+        self._manifest_qsearch = False
         if os.path.exists(manifest_path):
             try:
                 with open(manifest_path, encoding="utf-8") as fh:
@@ -256,14 +265,17 @@ class V3ShardWriter:
                 self.shard_files = [os.path.join(out_dir, s) for s in m.get("shards", [])]
                 self.games = int(m.get("games", 0))
                 self.steps = int(m.get("steps", 0))
+                self._manifest_qsearch = bool(m.get("qsearch", False))
             except Exception:
                 pass
 
-    def add(self, meta: np.ndarray, actions: np.ndarray, pipol: bytes, pipol_offset: np.ndarray) -> None:
+    def add(self, meta: np.ndarray, actions: np.ndarray, pipol: bytes, pipol_offset: np.ndarray,
+            qsearch: Optional[bytes] = None) -> None:
         self._metas.append(meta)
         self._action_chunks.append(actions)
         self._pipol_chunks.append(pipol)
         self._pipol_offsets.append(pipol_offset)
+        self._qsearch_chunks.append(qsearch)
         self.games += 1
         self.steps += int(meta["n_plies"])
         if len(self._metas) >= self.shard_size:
@@ -303,14 +315,29 @@ class V3ShardWriter:
         with open(tmp, "wb") as fh:
             fh.write(pipol_blob)
         os.replace(tmp, base + ".pipol.bin")
+        # qsearch 定长目标：本片任一局有记录就写整片，缺记录的局补等长 sims=0 哨兵
+        wrote_qsearch = False
+        if any(c is not None for c in self._qsearch_chunks):
+            blob = bytearray()
+            for rec, n in zip(self._qsearch_chunks, metas["n_plies"]):
+                need = 3 * int(n)
+                blob += rec if rec is not None else bytes(need)
+            fd, tmp = tempfile.mkstemp(dir=self.out_dir, suffix=".tmp")
+            os.close(fd)
+            with open(tmp, "wb") as fh:
+                fh.write(bytes(blob))
+            os.replace(tmp, base + ".qsearch.bin")
+            wrote_qsearch = True
         self.shard_files.append(base)
         write_manifest(self.out_dir, self.shard_files, [],
-                       {"games": self.games, "steps": self.steps})
+                       {"games": self.games, "steps": self.steps,
+                        "qsearch": wrote_qsearch or self._manifest_qsearch})
         self._metas, self._action_chunks, self._pipol_chunks, self._pipol_offsets = [], [], [], []
+        self._qsearch_chunks = []
 
 
 class V3ShardReader:
-    """v3 分片读取器：读取动作序列 + 变长 pipol 目标。"""
+    """v3 分片读取器：读取动作序列 + 变长 pipol 目标 + 定长 qsearch 目标。"""
 
     def __init__(self, shard_dir: str):
         with open(os.path.join(shard_dir, "manifest.json"), encoding="utf-8") as fh:
@@ -320,6 +347,8 @@ class V3ShardReader:
         self.pools: list[np.memmap] = []
         self.pipol_offsets: list[np.memmap] = []
         self.pipol_blobs: list[bytes] = []
+        self.qsearch_offsets: list[np.ndarray] = []
+        self.qsearch_blobs: list[bytes | None] = []
         is_val_parts: list[np.ndarray] = []
         for name in self.manifest["shards"]:
             base = os.path.join(shard_dir, name)
@@ -337,14 +366,28 @@ class V3ShardReader:
             else:
                 self.pipol_offsets.append(None)
                 self.pipol_blobs.append(None)
+            if os.path.exists(base + ".qsearch.bin"):
+                qoff = np.zeros(len(meta) + 1, dtype=np.int64)
+                np.cumsum(meta["n_plies"].astype(np.int64) * QSEARCH_DTYPE.itemsize, out=qoff[1:])
+                self.qsearch_offsets.append(qoff)
+                with open(base + ".qsearch.bin", "rb") as fh:
+                    self.qsearch_blobs.append(fh.read())
+            else:
+                self.qsearch_offsets.append(None)
+                self.qsearch_blobs.append(None)
         self.meta_all = np.concatenate(self.metas)
         self.is_val_arr = np.concatenate(is_val_parts)
+        self.has_qsearch = any(b is not None for b in self.qsearch_blobs)
         counts = [len(m) for m in self.metas]
         self.shard_of = np.repeat(np.arange(len(counts)), counts)
         self._cumcounts = np.concatenate([[0], np.cumsum(counts)])
 
     def game(self, global_index: int) -> dict:
-        """→ {meta, actions, pipol_actions, pipol_probs}。"""
+        """→ {meta, actions, pipol_actions, pipol_probs, qsearch}。
+
+        qsearch = (q f32 (n_plies,) 白方绝对视角, sims int64 (n_plies,)) 或 None
+        （老分片 / 未开记录）。sims=0 的 ply 视为无记录。
+        """
         shard = int(self.shard_of[global_index])
         local = global_index - int(self._cumcounts[shard])
         rec = self.metas[shard][local]
@@ -380,11 +423,20 @@ class V3ShardReader:
                     offset += 4
                 pipol_actions.append(np.array(ply_actions, dtype=np.uint16))
                 pipol_probs.append(np.array(ply_probs, dtype=np.float32))
+        qsearch = None
+        if self.qsearch_blobs[shard] is not None:
+            qoff = self.qsearch_offsets[shard]
+            blob = self.qsearch_blobs[shard]
+            s = int(qoff[local])
+            e = int(qoff[local + 1])
+            if e - s >= n * QSEARCH_DTYPE.itemsize:
+                qsearch = decode_v3_qsearch(blob[s:e], n)
         return {
             "meta": rec,
             "actions": actions,
             "pipol_actions": pipol_actions,
             "pipol_probs": pipol_probs,
+            "qsearch": qsearch,
         }
 
 
@@ -450,4 +502,26 @@ def decode_v3_pipol(blob: bytes, n_plies: int) -> tuple[list[np.ndarray], list[n
         actions_list.append(np.array(acts, dtype=np.uint16))
         probs_list.append(np.array(probs, dtype=np.float32))
     return actions_list, probs_list
+
+
+def encode_v3_qsearch(q_white, sims) -> bytes:
+    """逐 ply 搜索价值 → v3 qsearch 二进制（定长 3 B/ply）。
+
+    q_white：白方绝对视角的搜索价值 Σ_a π′(a)·completedQ(a)；
+    sims：该 ply 搜索实际用量（0 = 无记录，读取端据此置 q_valid=False；截断到 u8 量程）。
+    """
+    q = np.asarray(q_white, dtype="<f2").reshape(-1)
+    s = np.asarray(sims, dtype=np.int64).reshape(-1)
+    if len(q) != len(s):
+        raise ValueError(f"qsearch 长度不一致：q={len(q)} sims={len(s)}")
+    rec = np.zeros(len(q), dtype=QSEARCH_DTYPE)
+    rec["q"] = q
+    rec["sims"] = np.clip(s, 0, 255).astype(np.uint8)
+    return rec.tobytes()
+
+
+def decode_v3_qsearch(blob: bytes, n_plies: int) -> tuple[np.ndarray, np.ndarray]:
+    """v3 qsearch 二进制 → (q f32 (n_plies,) 白方绝对视角, sims int64 (n_plies,))。"""
+    rec = np.frombuffer(blob, dtype=QSEARCH_DTYPE, count=n_plies)
+    return rec["q"].astype(np.float32), rec["sims"].astype(np.int64)
 

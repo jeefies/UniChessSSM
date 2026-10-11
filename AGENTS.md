@@ -1,6 +1,6 @@
 # UniChessSSM AGENTS.md
 
-> 本文件面向 AI 编码 agent。最后更新：2026-09-25（扁平化重构后）。
+> 本文件面向 AI 编码 agent。最后更新：2026-10-10（Stage B 换代大循环与三元博弈联盟落地）。
 
 ## 0. 先读这一节：仓库已经不是 `stateseq/` 布局了
 
@@ -39,16 +39,26 @@ UniChessSSM 是 UniChess 的**状态序列模型（state-sequence model）**：�
 **权威系统设计**：`docs/state-sequence-model-design.md`（v3.0，唯一权威架构与代码手册，D1–D10
 【锁定】不可改）。
 **设计偏差与审计**：`docs/design-deviations.md`（c_scale=0.1 的决定在 §9）。
+**Stage B 实验总录**：`docs/stage-b-experiment.md`（Round 1~5 攻坚、Champion gen4 确立、Gen 6~9 循环实录）。
+**Elo 衰退根因诊断**：`docs/elo-degradation-analysis.md`（Val Policy Loss 新低与 MCTS Arena 守擂偏科根因深度剖析）。
 **Stage B 实施规格**：`docs/stage-b-implementation.md`（唯一规格来源，与 handoff 冲突时以规格为准）。
-**Stage B 下一步计划**：`docs/stage-b-next-plan.md`（现状盘点 + 阻塞项 + Phase 0/1/2 推进计划，
-2026-09-27 立；已确认的口径变更以规格 §5 变更表为准）。
 
-## 2. 双设备路由
+## 2. 设备与连接路由
 
-| 设备 | 路径 | 用途 |
+| 设备 | 地址 / 路径 | 用途 |
 |---|---|---|
 | Windows 本机 | `C:\Users\jeefy\Documents\UniChess\SSM` | 代码编辑、文档；无 torch/mamba-ssm，跑不了引擎测试 |
-| 远端 5070 Ti（`jeefy@172.16.2.12`，SSH 免密） | `/home/jeefy/UniChess/SSM` | GPU 训练、评测、单测实际运行 |
+| 远端 5070 Ti（主机名 `jeefyULab`） | `jeefy@ulab.jeefy.top` → `/home/jeefy/UniChess/SSM` | GPU 训练、评测、单测实际运行 |
+
+**远端只有一台设备，但有两条网络路由，默认走域名**（2026-10-11 实测域名可用）：
+
+| 路由 | 地址 | 定位 |
+|---|---|---|
+| **域名（默认）** | `jeefy@ulab.jeefy.top`（解析到 IPv6 `2409:8a62:5c4:5170:…`） | 一切 ssh / scp / git 都先用它 |
+| 内网 IP（兜底） | `jeefy@172.16.2.12`（IPv4） | 只在域名不通时才是候选 |
+
+纪律：默认一律用 `jeefy@ulab.jeefy.top`；只有连接失败时才明确告知用户"域名不通，需要你组网/放行"，
+由用户决定下一步——不要自行反复重试、不要静默改走 IP，也不要把两条路由写成两台设备。
 
 - 远端 conda（与原项目共用，**复用不改动**）：
   `/home/jeefy/miniconda3/envs/unichess/bin/python`（Py 3.12，torch 2.11.0+cu128，
@@ -180,21 +190,34 @@ SSM/
 - **训练目标**：π′ 在**全部合法着**上计算 softmax（不是只在候选集上）。
 - **数值安全**：非法动作 logits 填 `−3e4`（有限大负数，非 −inf），防止 `0 × (−∞) = NaN`。
 
-## 9. Stage B 硬约束（阶段①）
+## 9. Stage B 强化学习迭代体系与自动化循环规范
 
-**违反即返工，不得自行调整后继续；确认的变更须记入 `docs/stage-b-implementation.md` §5 变更表。**
+> 2026-10-10 里程碑：通过子力+步数双轮动态 $c_{\text{scale}}$ 调度与四重防和棋铁壁，Candidate gen5 在 508 局 GSPRT 对决中以 55.51% 得分率（LLR=3.47）胜出，正式晋升为现役霸主 **Champion gen4**（将杀率突破 90.94%，和棋率降至 9.06%）。随后完成自动化换代大循环（Gen 6~9），并在诊断后全面落地多模型联盟与惊讶度重要性采样（Gen 10+）。
 
-- **A 组算法单测全过之前，禁止生成任何正式训练数据。**
-- **旧 MCTS-400 链路禁止用于数据生成**（O(T²)，实测 0.63s/步），仅作 B0 对齐基线。
-- 条件输入锁定（规格 §0.2）：自对弈 Elo=2567.5 + RAPID 桶；人类混批保留原始条件。
-- 架构 D1–D10 冻结；不做消融实验。
-- **换代门槛【锁定】**：challenger vs champion **400 局 ≥55%**（和计 0.5），Gumbel `g=0`、
-  `n=64`，配对开局 + 交换颜色；**连续 3 代失败即暂停，不放宽门槛**。
-- **learner 连续性**：权重与优化器状态跨代持续，**不随换代成败回滚**；champion 仅在晋级时替换。
-- 阶段推进：阶段② 首轮闭环 2k–5k 局 → 阶段③ 主循环 25k 局/代 + 最近 10 代 replay buffer
-  （按代均匀采样）。单卡**分时**：生成窗口与训练窗口交替，不并行争显存。
-- **显存陷阱**：`workers × concurrency` 才是预算（每进程各建 CUDA context）。
-  `--engine server` 下 worker 纯 CPU、只有 GPU 服务进程显存常驻；`fast/reference` 是老口径。
+### 9.1 核心强化学习流水线：`loop_pipeline.py`
+自动化端到端大循环实现于 `SSM/tools/loop_pipeline.py`，串联三大核心阶段：
+1. **生成（`step_selfplay`）**：调用 `run_gpu_server_selfplay.py`，以 GpuServer 共享显存模式拉起 8 个 Worker（并发 160 槽位），每代生成 3,000 局高质量棋谱；
+2. **训练（`step_train`）**：调用 `Kit.train`，以 85% 自博弈 + 15% 人类棋谱混批训练，最近 4 代滑动窗口经验池（12,000 局）+ Surprise-based PER，留出验证集三维复合评分（策略+自博弈价值+人类价值）挑选最优检查点 `best.pt`；
+3. **评测与裁决（`step_eval_raw_policy` & `step_arena`）**：双轨评测（Track 1 纯策略 0-sim 100局对决；Track 2 系统级 64-sims Gumbel成对换先五项式 GSPRT 动态早停裁决，判定是否晋升 Champion）。
+
+### 9.2 三元多模型博弈联盟（League Self-Play）
+为根治单代偏科和灾难性遗忘，自对弈生成阶段支持多模型博弈联盟池（`--league`）：
+- **当前 vs 当前（50%，Worker 0~3，1,500 局）**：纯自博弈，探索策略前沿；
+- **当前 vs 历史最强（25%，Worker 4~5，750 局）**：防倒退锚定；
+- **当前 vs 历史霸主联盟轮换（25%，Worker 6~7，750 局）**：与 gen1/gen2/gen3 历史冠军轮流过招，吸收多样化防守流派。
+
+### 9.3 基于信息论自信息的惊讶度重要性采样（Surprise-based PER）
+彻底摒弃红黑颜色偏见，以对手历史胜率 $p$ 为基准，严格落地负对数似然自信息量指标：
+$$I = -[s \log p + (1 - s) \log (1 - p)] \quad (s \in \{1, 0.5, 0\})$$
+- **弱对手虐菜局（$p=0.98$）**：赢局信息量降至 0.05 截断下限，自动过滤平庸垃圾样本；翻车输局信息量打满至 3.91 强制重点复盘；
+- **势均力敌自博弈（$p=0.50$）**：胜、和、负严格对称收敛于 $-\log(0.5) \approx 0.6931$；
+- **强敌抗压局（$p=0.02$）**：守和与逆袭赢局信息量大幅拉高（1.96 ~ 3.91）。
+
+### 9.4 强化学习纪律与约束【锁定】
+- **全链路时间戳真动态随机种子**：自对弈、数据 shuffle、Arena 开局全量接入 `int(time.time() * 1000) & 0x7FFFFFFF`，全局局序号逐代累加错位；
+- **换代门槛【锁定】**：challenger vs champion 成对换先 GSPRT 动态早停（$\alpha=0.05, \beta=0.05, H_1: 35.0\text{ Elo}$）触发 $H_1$ 胜出或得分率 $\ge 55.0\%$ 即可晋升；
+- **五代非回滚窗口（Learner 连续性与熔断机制）**：五代内有晋升则不回滚，每一代训练以**上一代最优检查点 `best.pt`** 为基座连续向前推进（深度策略演化，彻底打破在原地微调打转）；若**连续 5 代**冲击 Champion 均未突破，触发安全熔断机制，下一代重置回现役 Champion 重新热启（防止偏科与误差滚雪球）；
+- **显存与多进程**：`run_gpu_server_selfplay.py` 下 Worker 纯 CPU、只有 GPU 服务进程常驻显存（4 模型并行常驻显存约 8.9 GiB）。单卡分时交替，严禁训练与自对弈抢占 GPU。
 
 ## 10. 数据格式
 

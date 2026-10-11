@@ -41,7 +41,7 @@ def main():
     parser.add_argument("--g", type=float, default=1.0)
     parser.add_argument("--openings", default=os.path.join(IMPORT_ROOT, "SSM/data/openings_200.txt"))
     parser.add_argument("--book-plies", type=int, default=6)
-    parser.add_argument("--seed", type=int, default=20261008)
+    parser.add_argument("--seed", type=int, default=None, help="随机数种子 (默认基于时间戳动态生成)")
     parser.add_argument("--slots-per-client", type=int, default=1024)
     parser.add_argument("--chunk", type=int, default=64)
     parser.add_argument("--precision", default="fp32")
@@ -59,7 +59,15 @@ def main():
     parser.add_argument("--adaptive-sims", action="store_true", default=False, help="开启 KataGo 式战术自适应高预算")
     parser.add_argument("--deep-sims", type=int, default=256, help="自适应深算上限 (默认 256)")
     parser.add_argument("--p-explore", type=float, default=0.15, help="开局深潜探索概率 (默认 0.15)")
+    parser.add_argument("--league", action="store_true", default=False, help="开启多模型博弈联盟模式 (50%% 自博弈 + 25%% 历史最强 + 25%% 轮换联盟对手)")
+    parser.add_argument("--league-opps", default=None, help="联盟对手检查点列表 (逗号分隔，如 ckpt1,ckpt2)")
+    parser.add_argument("--record-qsearch", action="store_true", default=False,
+                        help="额外落逐 ply 搜索价值 q̂（D3，定长 3 B/ply，零额外搜索成本；"
+                             "训练侧 value_target='lambda' 才消费）")
     args = parser.parse_args()
+
+    if args.seed is None:
+        args.seed = int(time.time() * 1000) & 0x7FFFFFFF
 
 
     os.makedirs(args.out, exist_ok=True)
@@ -67,10 +75,25 @@ def main():
     rem_games = args.total_games % args.workers
 
     ckpts = [os.path.abspath(args.ckpt)]
-    if args.opp_ckpt:
-        ckpts.append(os.path.abspath(args.opp_ckpt))
+    opp_pool = []
+    if args.opp_ckpt and os.path.exists(args.opp_ckpt):
+        ap = os.path.abspath(args.opp_ckpt)
+        if ap != ckpts[0]:
+            opp_pool.append(ap)
+    if args.league_opps:
+        for p in args.league_opps.split(","):
+            p_strip = p.strip()
+            if p_strip and os.path.exists(p_strip):
+                ap = os.path.abspath(p_strip)
+                if ap not in opp_pool and ap != ckpts[0]:
+                    opp_pool.append(ap)
+    for op in opp_pool:
+        if op not in ckpts:
+            ckpts.append(op)
 
     print(f"[GpuServer] 正在启动 GPU 共享服务 (models={len(ckpts)}, clients={args.workers}, slots={args.slots_per_client}, chunk={args.chunk})...")
+    if args.league:
+        print(f"[League] 已启用博弈联盟模式！模型池={ckpts}")
     server = GpuServer(
         checkpoints=ckpts,
         n_clients=args.workers,
@@ -132,9 +155,23 @@ def main():
                 "c_scale_schedule": args.c_scale_schedule,
                 "adaptive_sims": args.adaptive_sims,
                 "deep_sims": args.deep_sims,
-                "p_explore": args.p_explore,
             }
-            if args.opp_ckpt:
+            # 联盟对局分配策略：
+            # 若开启 --league 且存在对手池：
+            # 前 50% Worker: 当前 vs 当前 (opp_checkpoint = None, 纯自博弈)
+            # 中间 25% Worker: 当前 vs 历史最强霸主 (opp_pool[0])
+            # 剩余 25% Worker: 当前 vs 联盟轮换对手 (opp_pool[1:] 轮替)
+            if args.league and opp_pool:
+                half = max(1, args.workers // 2)
+                three_quarter = max(half + 1, (args.workers * 3) // 4)
+                if i < half:
+                    pass  # 纯自博弈，推进策略探索
+                elif i < three_quarter:
+                    engine_kw["opp_checkpoint"] = opp_pool[0]  # 历史最强
+                else:
+                    alt_idx = (i - three_quarter) % len(opp_pool)
+                    engine_kw["opp_checkpoint"] = opp_pool[alt_idx]
+            elif args.opp_ckpt and os.path.exists(args.opp_ckpt):
                 engine_kw["opp_checkpoint"] = os.path.abspath(args.opp_ckpt)
 
             wconf = {
@@ -162,6 +199,7 @@ def main():
                         "ckpt_step": 34,
                         "elo": 2567.5,
                         "shard_size": games_for_w,
+                        "record_qsearch": bool(args.record_qsearch),
                     },
                 },
             }

@@ -3,10 +3,12 @@
 每步 t：π_t = policy target（Stage A=人类走子 one-hot），y_t=对局结果（对行棋方归一），e=双方平均 Elo。
 
 L_policy = Σ_t w(e)·CE(π_t, p(·|s_t)) / Σ_t w(e)     # 按有效权重和归一
-L_value  = mean_t CE((W,D,L)_t, y_t)
+L_value  = mean_t CE((W,D,L)_t, y_t)                  # value_target="mc"（硬标签）
+L_value  = mean_t w_t·CE((W,D,L)_t, proj(G^λ_t))      # value_target="lambda"（软目标，D2/D4）
 L_mlh    = mean_t Huber(m̂_t − m_t)
 L_recon  = mean_{t,sq} CE(B̂_t[sq], B_t[sq]) + 0.3·辅助位损失     # 按格平均（不是求和）
 L_dyn    = mean_t (1/d)·‖Δ̂_t − sg(x_t − x_{t-1})‖²
+L_mat    = mean_t Huber(mat_t − (白方子力 − 黑方子力)/10)        # 子力差辅助（D9，仅训练）
 
 初值：w_p=1.0, w_v=0.8, w_m=0.1, w_d=0.5；w_r 从 1.0 线性退火到 0.1（前 30% 训练步）。
 上线前按首 1000 步各分量对共享主干的梯度范数校准（§6）。
@@ -72,6 +74,116 @@ def value_loss(wdl_logits: torch.Tensor, result: torch.Tensor,
     ce = F.cross_entropy(wdl_logits.reshape(-1, 3), result.reshape(-1).long(), reduction="none")
     w = torch.ones_like(ce) if pos_mask is None else pos_mask.reshape(-1).float()
     return (ce * w).sum() / w.sum().clamp(min=1e-8)
+
+
+# ------------------------- λ-return 价值目标（D2 / D4） -------------------------
+
+#: 12 个占用平面的标准子力（白 P,N,B,R,Q,K / 黑 P,N,B,R,Q,K，王 0）
+_PIECE_MAT_VALUES = (1.0, 3.0, 3.0, 5.0, 9.0, 0.0)
+
+
+def to_mover_perspective(value_white: torch.Tensor, color: torch.Tensor) -> torch.Tensor:
+    """白方绝对视角 → 行棋方视角（color: 1=白走 / 0=黑走，同 TrainBatch.color 口径）。"""
+    c = color.reshape(value_white.shape).to(value_white.dtype)
+    return value_white * torch.where(c > 0.5, torch.ones_like(value_white),
+                                     -torch.ones_like(value_white))
+
+
+def z_white_from_results(results: torch.Tensor, color: torch.Tensor) -> torch.Tensor:
+    """results (B,T)（0 胜/1 和/2 负，行棋方归一）→ 白方绝对视角 z (B,T)，取值 +1/0/−1。"""
+    z_mover = 1.0 - results.to(torch.float32)
+    return to_mover_perspective(z_mover, color)
+
+
+def lambda_return(q_white: torch.Tensor, q_valid: torch.Tensor, z_white: torch.Tensor,
+                  lam: float, valid: torch.Tensor | None = None,
+                  anchor_last: torch.Tensor | None = None) -> torch.Tensor:
+    """TD(λ) 价值目标（白方绝对视角；无中间奖励 ⇒ 向后递推，D2）。
+
+    q_white (B,T)：每 ply 搜索价值 Σ_a π′(a)·completedQ(a)（白方绝对视角）
+    q_valid (B,T)：该 ply 的 q̂ 是否可用。不可用时用后续的 g 代替 ⇒ 该步不引入自举、
+                   权重自动归一到 g[t+1]；因此"整局无 q̂"的老分片自动退化为纯 MC。
+    z_white (B,)：终局结果（白方绝对视角，+1/0/−1）
+    anchor_last (B,)：True ⇒ 真实终局不在加载窗口内（截断局 / 被 t_max 截断），
+                   锚点改用 q̂[last]（截断局的 z=0 是假标签）
+
+    递推：g[last] = anchor；g[t] = (1−λ)·q_eff[t+1] + λ·g[t+1]。
+    λ=1 ⇒ g ≡ z（= 现 MC 基线，可逐位对拍）；λ=0 ⇒ 纯一步自举（明确要避免的端点）。
+    """
+    bsz, seqlen = q_white.shape
+    dev = q_white.device
+    lam = float(lam)
+    if valid is None:
+        valid = torch.ones(bsz, seqlen, dtype=torch.bool, device=dev)
+    if anchor_last is None:
+        anchor_last = torch.zeros(bsz, dtype=torch.bool, device=dev)
+    idx = torch.arange(seqlen, device=dev).expand(bsz, seqlen)
+    last = torch.where(valid, idx, torch.full_like(idx, -1)).max(dim=1).values   # (B,)
+    safe_last = last.clamp(min=0)
+    z_row = z_white.reshape(-1, 1).to(q_white.dtype).expand(bsz, seqlen)
+    z_anchor = z_row.gather(1, safe_last.unsqueeze(1)).squeeze(1)
+    q_anchor = q_white.gather(1, safe_last.unsqueeze(1)).squeeze(1)
+    anchor_ok = anchor_last.reshape(-1) & q_valid.gather(1, safe_last.unsqueeze(1)).squeeze(1)
+    anchor_val = torch.where(anchor_ok, q_anchor, z_anchor)
+
+    g = torch.zeros_like(q_white)
+    g.scatter_(1, safe_last.unsqueeze(1), anchor_val.unsqueeze(1))
+    for t in range(seqlen - 2, -1, -1):
+        q_eff = torch.where(q_valid[:, t + 1] & valid[:, t + 1], q_white[:, t + 1], g[:, t + 1])
+        if lam >= 1.0:                      # 纯 MC：避开 0·NaN
+            cand = g[:, t + 1]
+        else:
+            cand = (1.0 - lam) * q_eff + lam * g[:, t + 1]
+        g[:, t] = torch.where(last > t, cand, g[:, t])
+    return g
+
+
+def value_soft_loss(wdl_logits: torch.Tensor, target_g: torch.Tensor,
+                    pos_mask: torch.Tensor | None = None,
+                    value_weights: torch.Tensor | None = None,
+                    d_min: float = 0.05, d_max: float = 0.5) -> torch.Tensor:
+    """λ-return 标量目标 → WDL 三分类软目标 CE（D4）。
+
+    target_g (B,T)：行棋方视角的 λ-return（∈ [−1,1]，期望得分）。
+    目标分布用"矩匹配投影"构造：draw 质量 d 取当前预测 pD 的截断值（detach），
+    剩余质量按 g 分给 W/L ⇒ pW − pL ≡ g 且 pD 保持自由；clamp 住自预测的 d 是为了
+    防止自举固定点把 pD 推向 1 使 q 坍缩（自举退化方向）。
+    """
+    logits = wdl_logits.reshape(-1, 3).float()
+    g = target_g.reshape(-1).float().clamp(-1.0, 1.0)
+    p = torch.softmax(logits, dim=-1).detach()
+    d = p[:, 1].clamp(min=float(d_min), max=float(d_max))
+    # 极端 g 下压缩 draw 质量，保证 pW/pL 非负（构造后和恒为 1，无需再归一）
+    d = torch.minimum(d, (1.0 - g.abs()).clamp(min=0.0))
+    target = torch.stack([(g + 1.0 - d) * 0.5, d, (1.0 - g - d) * 0.5], dim=-1)
+    log_p = torch.log_softmax(logits, dim=-1)
+    ce = -(target * log_p).sum(dim=-1)
+    w = torch.ones_like(ce)
+    if pos_mask is not None:
+        w = w * pos_mask.reshape(-1).float()
+    if value_weights is not None:
+        w = w * value_weights.reshape(-1).float()
+    return (ce * w).sum() / w.sum().clamp(min=1e-8)
+
+
+def material_loss(pred: torch.Tensor, features: torch.Tensor,
+                  pos_mask: torch.Tensor | None = None, scale: float = 10.0) -> torch.Tensor:
+    """子力差辅助（D9）：目标 = (白方标准子力 − 黑方标准子力)/scale。
+
+    特征 [0,768) 即 12×64 占用平面（白 P,N,B,R,Q,K / 黑 P,N,B,R,Q,K），目标由重放棋盘
+    精确算出 ⇒ 零存储、零标注成本，只受规则引擎约束。
+    """
+    planes = features[..., :768].reshape(*features.shape[:-1], 12, 64).float()
+    counts = planes.sum(dim=-1)
+    vals = torch.tensor(_PIECE_MAT_VALUES + _PIECE_MAT_VALUES,
+                        device=features.device, dtype=torch.float32)
+    white = (counts[..., :6] * vals[:6]).sum(dim=-1)
+    black = (counts[..., 6:] * vals[6:]).sum(dim=-1)
+    target = ((white - black) / float(scale)).reshape(-1)
+    p = pred.reshape(-1).float()
+    h = F.huber_loss(p, target, delta=1.0, reduction="none")
+    w = torch.ones_like(h) if pos_mask is None else pos_mask.reshape(-1).float()
+    return (h * w).sum() / w.sum().clamp(min=1e-8)
 
 
 def mlh_loss(mlh_pred: torch.Tensor, moves_left: torch.Tensor,

@@ -58,7 +58,9 @@ class SsmLoopOrchestrator:
     def __init__(self, out_dir: Path, total_gens: int, games_per_gen: int,
                  initial_champion: str, opp_checkpoint: str,
                  workers: int = 8, concurrency: int = 20,
-                 python_bin: str = sys.executable):
+                 python_bin: str = sys.executable,
+                 value_target: str = "mc", value_lambda_end: float = 1.0,
+                 record_qsearch: bool = False):
         self.out_dir = out_dir
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.total_gens = total_gens
@@ -68,6 +70,12 @@ class SsmLoopOrchestrator:
         self.workers = workers
         self.concurrency = concurrency
         self.python_bin = python_bin
+        # 价值头改造开关（默认全部关闭 ⇒ 与改造前逐位一致；开启时见 SSM/tasks.py D2/D4/D5）
+        if value_target not in ("mc", "lambda"):
+            raise ValueError(f"value_target 只能是 'mc' / 'lambda'，得到 {value_target!r}")
+        self.value_target = str(value_target)
+        self.value_lambda_end = float(value_lambda_end)
+        self.record_qsearch = bool(record_qsearch)
 
         self.log_file = self.out_dir / "loop.log"
         self.state_file = self.out_dir / "loop_state.json"
@@ -118,7 +126,6 @@ class SsmLoopOrchestrator:
             "--ckpt", champion_pt,
             "--out", str(sp_out),
             "--total-games", str(self.games_per_gen),
-            "--first-game", "0",
             "--workers", str(self.workers),
             "--concurrency", str(self.concurrency),
             "--simulations", "64",
@@ -130,15 +137,33 @@ class SsmLoopOrchestrator:
             "--contempt", "0.5",
             "--temp-plies", "15",
             "--temperature", "1.0",
+            "--book-plies", "8",
             "--min-book-plies", "6",
             "--pcr-rate", "0.5",
             "--pcr-fast-sims", "16",
             "--adaptive-sims",
             "--deep-sims", "256",
             "--p-explore", "0.15",
-            "--precision", "tf32"
+            "--precision", "tf32",
+            "--seed", str(int(time.time() * 1000) & 0x7FFFFFFF),
+            "--first-game", str((gen_id - 1) * self.games_per_gen)
         ]
-        if opp_pt and os.path.exists(opp_pt):
+        if self.record_qsearch:
+            # 逐 ply 搜索价值落盘（零额外搜索成本；训练侧 value_target='lambda' 才消费）
+            cmd.append("--record-qsearch")
+        # 多模型博弈联盟机制 (League Play: 50% 当前自博弈 + 25% 历史最强 + 25% 历史联盟轮换)
+        league_ckpts = []
+        for g_id in [4, 3, 2, 1]:
+            p = os.path.join(IMPORT_ROOT, f"SSM/runs/champion_gen{g_id}.pt")
+            if os.path.exists(p) and os.path.abspath(p) != os.path.abspath(champion_pt):
+                league_ckpts.append(p)
+        if opp_pt and os.path.exists(opp_pt) and os.path.abspath(opp_pt) not in league_ckpts:
+            league_ckpts.insert(0, os.path.abspath(opp_pt))
+
+        if league_ckpts:
+            cmd.append("--league")
+            cmd.extend(["--league-opps", ",".join(league_ckpts)])
+        elif opp_pt and os.path.exists(opp_pt):
             cmd.extend(["--opp-ckpt", opp_pt])
 
         rc = self.run_command(cmd, phase_log)
@@ -148,7 +173,7 @@ class SsmLoopOrchestrator:
         log(f"Gen {gen_id} 自对弈生成完毕！", self.log_file)
         return sp_out
 
-    def step_train(self, gen_id: int, gen_dir: Path, sp_dir: Path, champion_pt: str) -> Path:
+    def step_train(self, gen_id: int, gen_dir: Path, sp_dir: Path, base_pt: str) -> Path:
         train_out = gen_dir / "train"
         best_pt = train_out / "best.pt"
         phase_log = gen_dir / "train.log"
@@ -157,31 +182,52 @@ class SsmLoopOrchestrator:
             log(f"Gen {gen_id} 训练产物已存在 ({best_pt})，跳过训练阶段", self.log_file)
             return best_pt
 
-        log(f"Gen {gen_id} 开始混合强化训练 (85% 自博弈 + 15% 人类谱)...", self.log_file)
+        log(f"Gen {gen_id} 开始混合强化训练 (85% 自博弈多代经验池 + 15% 人类谱, 基座={os.path.basename(base_pt)})...", self.log_file)
+        # 构建滑动窗口经验回放池 (Sliding Window Replay Buffer, 最近 4 代)
+        window_size = 4
+        past_sp_dirs = []
+        for g in range(max(1, gen_id - window_size + 1), gen_id + 1):
+            d = self.out_dir / f"gen_{g:04d}" / "selfplay"
+            if (d / "manifest.json").exists():
+                past_sp_dirs.append(str(d))
+        if not past_sp_dirs:
+            past_sp_dirs = [str(sp_dir)]
+
         cfg_path = gen_dir / "train_config.json"
+        # 价值目标开关：关闭时一个键都不加 ⇒ 生成的 train_config 与改造前逐位相同
+        value_kwargs = {}
+        if self.value_target != "mc":
+            value_kwargs = {
+                "value_target": self.value_target,
+                "value_lambda_start": 1.0,
+                "value_lambda_end": self.value_lambda_end,
+                "value_lambda_anneal_frac": 0.25,
+                "material_weight": 0.1,
+            }
         cfg_data = {
             "task": {
                 "factory": "SSM.tasks:make_task",
                 "kwargs": {
                     "kind": "stage_b2",
                     "data": {"dir": os.path.join(IMPORT_ROOT, "SSM/data/shards"), "t_max": 300},
-                    "selfplay": {"dir": str(sp_dir)},
-                    "ckpt": champion_pt,
+                    "selfplay": {"dirs": past_sp_dirs},
+                    "ckpt": base_pt,
                     "microbatch": 4,
-                    "weights": {"w_v": 1.0, "w_r_start": 0.1, "w_r_end": 0.1},
+                    "weights": {"w_v": 1.5, "w_r_start": 0.1, "w_r_end": 0.1},
                     "workers": 4,
                     "val_batches": 8,
                     "w_selfplay": 0.85,
                     "w_human": 0.15,
                     "mlh_log": True,
                     "kl_reweight": True,
-                    "t_max": 300
+                    "t_max": 300,
+                    **value_kwargs,
                 }
             },
             "out": str(train_out),
             "steps": 0,
             "accum": 16,
-            "seed": gen_id,
+            "seed": int(time.time() * 1000) & 0x7FFFFFFF,
             "device": "cuda",
             "precision": "bf16",
             "grad_scaler": False,
@@ -288,7 +334,7 @@ class SsmLoopOrchestrator:
                 "concurrency": 4,
                 "max_plies": 300,
                 "openings": os.path.join(IMPORT_ROOT, "SSM/data/openings_200.txt"),
-                "seed": 20261000 + gen_id * 100,
+                "seed": int(time.time() * 1000) & 0x7FFFFFFF,
                 "workers": 4,
                 "sprt": {
                     "elo0": 0.0,
@@ -332,9 +378,35 @@ class SsmLoopOrchestrator:
             sp_dir = self.step_selfplay(gen_id, gen_dir, current_champ, opp_champ)
             t_sp = time.time() - t0
 
-            # 2. 混合训练
+            # 2. 确定本代训练起点 (Learner 连续演化 vs 5 代回滚安全熔断)
+            # 策略：五代内有晋升则不回滚（从上一代最优 Candidate 连续推进）；
+            # 连续 5 代冲击 Champion 失败则触发安全熔断，回滚至 Champion。
+            consecutive_fails = 0
+            for h in reversed(self.state.get("history", [])):
+                if h.get("promoted", False):
+                    break
+                consecutive_fails += 1
+
+            window_phase = consecutive_fails % 5  # 0: 周期第1代(新王/回滚重置), 1..4: 连续推进代
+            prev_cand = None
+            if gen_id > 1:
+                p_cand = self.out_dir / f"gen_{gen_id - 1:04d}" / "train" / "best.pt"
+                if p_cand.exists():
+                    prev_cand = str(p_cand)
+
+            if window_phase != 0 and prev_cand:
+                base_pt = prev_cand
+                log(f"🔄【连续 Learner 演化】五代非回滚窗口 (周期第 {window_phase + 1}/5 代, 累计未晋升: {consecutive_fails})，本代从上一代最优检查点连续推进: {base_pt}", self.log_file)
+            elif consecutive_fails > 0 and window_phase == 0:
+                base_pt = current_champ
+                log(f"⚠️【安全熔断回滚】前一个 5 代窗口冲击 Champion 未果 (累计未晋升: {consecutive_fails})，触发安全回滚，本代重置从 Champion 重新热启: {base_pt}", self.log_file)
+            else:
+                base_pt = current_champ
+                log(f"🚀【首代/新王启动】本代从现役 Champion 启动: {base_pt}", self.log_file)
+
+            # 混合训练
             t0 = time.time()
-            cand_pt = self.step_train(gen_id, gen_dir, sp_dir, current_champ)
+            cand_pt = self.step_train(gen_id, gen_dir, sp_dir, base_pt)
             t_train = time.time() - t0
 
             # 3. 双轨评测
@@ -358,12 +430,13 @@ class SsmLoopOrchestrator:
                 self.state["opp_champion"] = str(backup_champ)
                 log(f"🎉【加冕新霸主】Gen {gen_id} 满足换代门限 (SPRT={sprt_verdict}, 得分率={score_a:.2%})，晋升为现役 Champion！", self.log_file)
             else:
-                log(f"🛡️【前任守擂】Gen {gen_id} 未突破换代门限 (SPRT={sprt_verdict}, 得分率={score_a:.2%})，现任 Champion 守擂成功。", self.log_file)
+                log(f"🛡️【前任守擂】Gen {gen_id} 未突破换代门限 (SPRT={sprt_verdict}, 得分率={score_a:.2%})，现任 Champion 守擂成功。(连续冲击窗口: {consecutive_fails + 1}/5 代)", self.log_file)
 
             record = {
                 "generation": gen_id,
                 "promoted": promoted,
                 "candidate": str(cand_pt),
+                "train_base": base_pt,
                 "champion_before": champion_before,
                 "champion_after": self.state["champion"],
                 "score_a": score_a,
@@ -371,6 +444,9 @@ class SsmLoopOrchestrator:
                 "sprt": sprt_verdict,
                 "games_arena": arena_summary.get("games"),
                 "raw_policy": raw_summary,
+                "value_target": self.value_target,
+                "value_lambda_end": self.value_lambda_end if self.value_target == "lambda" else None,
+                "record_qsearch": self.record_qsearch,
                 "elapsed_sec": {
                     "selfplay": round(t_sp, 1),
                     "train": round(t_train, 1),
@@ -397,6 +473,12 @@ def main():
     parser.add_argument("--opp", default=os.path.join(IMPORT_ROOT, "SSM/runs/champion_gen3.pt"), help="历史对手池检查点")
     parser.add_argument("--workers", type=int, default=8, help="自对弈 Worker 数量 (默认 8)")
     parser.add_argument("--concurrency", type=int, default=20, help="单 Worker 并发 (默认 20)")
+    parser.add_argument("--value-target", default="mc", choices=["mc", "lambda"],
+                        help="价值学习目标：mc=终局 z 硬标签（原口径）；lambda=TD(λ) 软目标（D2/D4）")
+    parser.add_argument("--value-lambda-end", type=float, default=1.0,
+                        help="lambda 目标的退火终点（默认 1.0 = 与 mc 等价；建议 0.5）")
+    parser.add_argument("--record-qsearch", action="store_true", default=False,
+                        help="自对弈额外落逐 ply 搜索价值 q̂（D3；lambda 目标的前置条件）")
     args = parser.parse_args()
 
     orchestrator = SsmLoopOrchestrator(
@@ -406,7 +488,10 @@ def main():
         initial_champion=args.champion,
         opp_checkpoint=args.opp,
         workers=args.workers,
-        concurrency=args.concurrency
+        concurrency=args.concurrency,
+        value_target=args.value_target,
+        value_lambda_end=args.value_lambda_end,
+        record_qsearch=args.record_qsearch,
     )
     orchestrator.run()
 

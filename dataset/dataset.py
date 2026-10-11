@@ -204,5 +204,7 @@ class SequenceDataset:
 def _to_device(batch, device: str):
     from ..model import TrainBatch
 
-    return TrainBatch(*[getattr(batch, f).to(device, non_blocking=True)
+    # q_search/q_valid 等可选字段为 None（人类谱 / 老分片）时原样透传
+    return TrainBatch(*[(getattr(batch, f).to(device, non_blocking=True)
+                         if torch.is_tensor(getattr(batch, f)) else getattr(batch, f))
                         for f in batch.__dataclass_fields__])

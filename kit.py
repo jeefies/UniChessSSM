@@ -34,12 +34,13 @@ import numpy as np
 import torch
 
 from Kit.api import EvalRequest, GameStart, MoveDecision, NodeEval, SearchBudget, immediate
-from Kit.search.gumbel import Gumbel, GumbelConfig, softmax
+from Kit.search.gumbel import Gumbel, GumbelConfig, completed_q, softmax
 
 from .actions import TO_ACTION as _TO_ACTION
 from .actions import move_to_action
 from .conditions import TimeControlBucket, standardize_elo
-from .dataset.gshards import GAMES_PER_SHARD, META_V3_DTYPE, V3ShardWriter, encode_v3_pipol, make_game_key
+from .dataset.gshards import (GAMES_PER_SHARD, META_V3_DTYPE, V3ShardWriter, encode_v3_pipol,
+                              encode_v3_qsearch, make_game_key)
 from .dataset.sequences import _board_key
 
 from Kit.search.gumbel import C_SCALE, C_VISIT, M0, N_SIMS
@@ -687,12 +688,32 @@ def book_pipol_rng(seed: int, opening_idx: int, ply: int) -> np.random.Generator
     return np.random.default_rng(np.random.SeedSequence([int(seed), int(opening_idx), int(ply)]))
 
 
+def root_search_value(res, pi, turn) -> tuple[float, int]:
+    """根节点搜索价值（白方绝对视角）与该次搜索实际模拟数（D3）。
+
+    q̂ = Σ_a π′(a)·completedQ(a) —— "按搜索推荐策略行棋的局面价值"，正是 MCTS 回溯
+    需要的量。completedQ 是**行棋方视角**，故按 turn 翻成白方绝对视角（与 meta.result
+    同口径，训练侧再按 color 翻回行棋方视角）。终局/无着法时取规则真值 root.q。
+
+    数据全部来自搜索返回的根节点，**零额外搜索成本**。
+    """
+    root = getattr(res, "root", None)
+    sims = int((getattr(res, "stats", None) or {}).get("sims_used", 0))
+    if root is None or root.is_terminal or len(pi) == 0:
+        q = float(root.q) if root is not None else 0.0
+    else:
+        cq = completed_q(root)
+        q = float(np.dot(np.asarray(pi, dtype=np.float64), np.asarray(cq, dtype=np.float64)))
+    return (q if turn == chess.WHITE else -q), sims
+
+
 class SelfPlayShared:
     """同一工厂（= 同一 worker 进程）内各局共享：book ply 的 π′ 缓存与生成统计。
 
-    pipol_memo：(seed, book_id, ply) → (ids uint16, π′ fp32, stats)。并发局若在同一 ply
-    竞态（都未命中）会各自搜索，二者输入一致、浮点结果可能因拼批差 ~1e-6——这是计算优化而非
-    正确性依赖，复用到的 π′ 始终是该局面的一次合法搜索结果（与原生成器相同）。
+    pipol_memo：(seed, book_id, ply) → (ids uint16, π′ fp32, stats, q_white fp32, sims int)。
+    并发局若在同一 ply 竞态（都未命中）会各自搜索，二者输入一致、浮点结果可能因拼批差
+    ~1e-6——这是计算优化而非正确性依赖，复用到的 π′/q̂ 始终是该局面的一次合法搜索结果
+    （与原生成器相同）。
     """
 
     def __init__(self):
@@ -887,7 +908,7 @@ class SsmSelfPlayer(SsmPlayer):
             key = (self.seed, self.book_id, ply) if (self.book_id is not None and self.opp_evaluator is None) else None
             cached = self.shared.pipol_memo.get(key) if key is not None else None
             if cached is not None:
-                pi_ids, pi, stats = cached
+                pi_ids, pi, stats, q_white, q_sims = cached
                 self.shared.book_memo_hits += 1
             else:
                 rng = book_pipol_rng(self.seed, self.book_id, ply) if key is not None else self.rng
@@ -896,11 +917,13 @@ class SsmSelfPlayer(SsmPlayer):
                 pi_ids = ids.astype(np.uint16)
                 pi = pi.astype(np.float32)
                 stats = {k: res.stats[k] for k in ("n_nodes", "n_terminal", "sims_used", "max_depth")}
+                q_white, q_sims = root_search_value(res, pi, board.turn)
                 self.shared.book_memo_misses += 1
                 if key is not None:
-                    self.shared.pipol_memo[key] = (pi_ids, pi, stats)
+                    self.shared.pipol_memo[key] = (pi_ids, pi, stats, q_white, q_sims)
             self.shared.add_search(stats)
-            return MoveDecision(mv, source="book", info={"pi_ids": pi_ids, "pi": pi})
+            return MoveDecision(mv, source="book", info={"pi_ids": pi_ids, "pi": pi,
+                                                         "q_search": q_white, "q_sims": q_sims})
 
         sims = budget.simulations or cur_cfg.simulations
         is_deep = False
@@ -921,6 +944,7 @@ class SsmSelfPlayer(SsmPlayer):
         pi_ids = ids.astype(np.uint16)
         pi = pi.astype(np.float32)
         stats = {k: res.stats[k] for k in ("n_nodes", "n_terminal", "sims_used", "max_depth")}
+        q_white, q_sims = root_search_value(res, pi, board.turn)
         if stats["sims_used"] != (sims or cur_cfg.simulations):
             self.shared.budget_violations += 1
         self.shared.expand_hist = hist_merge(self.shared.expand_hist, res.stats.get("expand_hist"))
@@ -940,7 +964,8 @@ class SsmSelfPlayer(SsmPlayer):
 
         return MoveDecision(mv, source="search",
                             info={"pi_ids": pi_ids, "pi": pi, "is_deep": is_deep,
-                                  "trigger_reason": trigger_reason})
+                                  "trigger_reason": trigger_reason,
+                                  "q_search": q_white, "q_sims": q_sims})
 
 
 class SsmSelfPlayerFactory:
@@ -1047,15 +1072,21 @@ def pipol_byte_offsets(per_ply_actions: list) -> np.ndarray:
 
 
 class V3Sink:
-    """kit RecordSink → v3 分片（actions + pipol + 扩展 meta），字段与原生成器逐项相同。"""
+    """kit RecordSink → v3 分片（actions + pipol + 扩展 meta），字段与原生成器逐项相同。
+
+    ``record_qsearch=True`` 时额外落逐 ply 搜索价值（D3，定长 3 B/ply）——零额外搜索成本，
+    老读取端直接忽略该文件；默认关闭以保持既有生成行为逐位不变。
+    """
 
     def __init__(self, writer, *, gen_id: int, ckpt_step: int = 0, elo: float = 2567.5,
-                 tc_bucket=TimeControlBucket.RAPID, out_dir: Optional[str | Path] = None):
+                 tc_bucket=TimeControlBucket.RAPID, out_dir: Optional[str | Path] = None,
+                 record_qsearch: bool = False):
         self.writer = writer
         self.gen_id = int(gen_id)
         self.ckpt_step = int(ckpt_step)
         self.elo = float(elo)
         self.tc_bucket = tc_bucket
+        self.record_qsearch = bool(record_qsearch)
         od = out_dir if out_dir is not None else getattr(writer, "out_dir", None)
         self.out_dir = Path(od) if od is not None else None
         self.meta_path = (self.out_dir / ".games.jsonl") if self.out_dir else None
@@ -1088,6 +1119,13 @@ class V3Sink:
             actions.append(a)
         pipol_actions = [d.info["pi_ids"] for d in decisions]
         pipol_probs = [d.info["pi"] for d in decisions]
+        qsearch = None
+        if self.record_qsearch:
+            # 白方绝对视角的逐 ply 搜索价值 + 实际模拟数（sims=0 ⇒ 无记录）
+            q_white = [float((d.info or {}).get("q_search", 0.0)) for d in decisions]
+            q_sims = [int((d.info or {}).get("q_sims", 0)) for d in decisions]
+            if any(s > 0 for s in q_sims) and len(q_white) == len(actions):
+                qsearch = encode_v3_qsearch(q_white, q_sims)
         meta = np.zeros((), dtype=META_V3_DTYPE)
         meta["n_plies"] = len(actions)
         meta["tc_bucket"] = int(self.tc_bucket)
@@ -1104,7 +1142,7 @@ class V3Sink:
         meta["flags"] = int(record["book_plies"])
         self.writer.add(meta, np.array(actions, dtype=np.uint16),
                         encode_v3_pipol(pipol_actions, pipol_probs),
-                        pipol_byte_offsets(pipol_actions))
+                        pipol_byte_offsets(pipol_actions), qsearch=qsearch)
         self.games += 1
         self.plies += len(actions)
         self.term_reason_counts[term] += 1
@@ -1127,10 +1165,11 @@ class V3Sink:
 def make_v3_sink(out_dir: Optional[str | Path] = None, *, path: Optional[str | Path] = None,
                  gen_id: int = 0, ckpt_step: int = 0, elo: float = 2567.5,
                  tc_bucket=TimeControlBucket.RAPID, shard_size: int = GAMES_PER_SHARD,
-                 tag: str = "selfplay", **kw) -> V3Sink:
+                 tag: str = "selfplay", record_qsearch: bool = False, **kw) -> V3Sink:
     """创建 v3 分片自对弈 sink（用于 Kit pipelines.selfplay / loop）。
 
     ``out_dir`` 与 ``path`` 互为别名，支持 loop 传入的占位符路径。
+    ``record_qsearch=True`` 时额外落逐 ply 搜索价值（D3）。
     """
     target = out_dir if out_dir is not None else path
     if target is None:
@@ -1139,4 +1178,5 @@ def make_v3_sink(out_dir: Optional[str | Path] = None, *, path: Optional[str | P
     target_path.mkdir(parents=True, exist_ok=True)
     writer = V3ShardWriter(str(target_path), tag=str(tag), shard_size=int(shard_size))
     return V3Sink(writer, gen_id=int(gen_id), ckpt_step=int(ckpt_step), elo=float(elo),
-                  tc_bucket=tc_bucket, out_dir=target_path)
+                  tc_bucket=tc_bucket, out_dir=target_path,
+                  record_qsearch=bool(record_qsearch))

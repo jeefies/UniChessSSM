@@ -1,0 +1,49 @@
+{
+  "engine": {
+    "factory": "SSM.kit:make_selfplay_factory",
+    "root": "/home/jeefy/UniChess",
+    "kwargs": {
+      "checkpoint": "/home/jeefy/UniChess/SSM/runs/champion.pt",
+      "simulations": 64,
+      "m0": 16,
+      "c_scale": 0.02,
+      "c_visit": 50.0,
+      "g": 1.0,
+      "engine": "fast",
+      "pool_slots": 4096,
+      "temp_plies": 15,
+      "temperature": 1.0,
+      "min_book_plies": 6,
+      "pcr_rate": 0.5,
+      "pcr_fast_sims": 16,
+      "adaptive_sims": true,
+      "deep_sims": 256,
+      "p_explore": 0.15,
+      "twofold_penalty": 1.0,
+      "stalemate_penalty": 1.0,
+      "insufficient_penalty": 1.0,
+      "contempt": 0.5
+    }
+  },
+  "selfplay": {
+    "games": 3000,
+    "seed": 20261011,
+    "max_plies": 300,
+    "concurrency": 128,
+    "openings": "/home/jeefy/UniChess/SSM/data/openings_200.txt",
+    "book_plies": 8,
+    "first_game": 0,
+    "workers": 1
+  },
+  "sink": {
+    "factory": "SSM.kit:make_v3_sink",
+    "kwargs": {
+      "out_dir": "/home/jeefy/UniChess/SSM/runs/exp_vtower_v1/gen_0001/selfplay",
+      "gen_id": 1,
+      "ckpt_step": 34,
+      "elo": 2567.5,
+      "shard_size": 500,
+      "record_qsearch": true
+    }
+  }
+}

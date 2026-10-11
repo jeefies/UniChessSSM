@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 from typing import Optional
 
 import torch
@@ -31,6 +32,10 @@ from .model.losses import LossWeights
 def _autocast(device):
     return (torch.autocast(device.type, dtype=torch.bfloat16)
             if device.type == "cuda" else contextlib.nullcontext())
+
+
+#: validate 里除 loss_* 之外还要收集的诊断键
+_EXTRA_METRIC_KEYS = ("recon_whole_board_acc", "dyn_rel_err", "value_q_corr", "target_g_absmean")
 
 
 class SsmTask:
@@ -149,7 +154,7 @@ class StageATask(SsmTask):
                     _, m = model.forward_train(item["batch"], self.weights, 0,
                                                ctx.cfg.steps, valid_mask=item["valid"])
                 for k, v in m.items():
-                    if k.startswith("loss_") or k in ("recon_whole_board_acc", "dyn_rel_err"):
+                    if k.startswith("loss_") or k in _EXTRA_METRIC_KEYS:
                         metrics.setdefault(k, []).append(float(v))
         out = {k: sum(v) / max(len(v), 1) for k, v in metrics.items()}
         # 旧脚本：best.pt 按人类 val 的 policy CE 选
@@ -162,7 +167,11 @@ class StageB2Task(SsmTask):
 
     def __init__(self, *, selfplay=None, w_selfplay=0.85, w_human=0.10, mlh_log=False,
                  opening_loss_weight=0.25, t_max=300, limit_games=500000,
-                 kl_reweight: bool = True, **kw):
+                 kl_reweight: bool = True,
+                 value_target: str = "mc", value_lambda_start: float = 1.0,
+                 value_lambda_end: float = 0.5, value_lambda_anneal_frac: float = 0.25,
+                 value_lowsim_weight: float = 0.5, value_lowsim_sims: int = 32,
+                 material_weight: float = 0.1, **kw):
         super().__init__(**kw)
         self.selfplay = dict(selfplay or {})
         self.w_selfplay = float(w_selfplay)
@@ -175,7 +184,31 @@ class StageB2Task(SsmTask):
         # 人类库是千万级（19.3M 局），只取其前 limit_games 局参与混批——先截断再 shuffle，
         # 顺序与旧脚本 --limit-games 一致；不截断等于每步都在 19M 局里抽，另是一个分布。
         self.limit_games = int(limit_games)
+        # ---- 价值目标（D2/D4/D5/D6/D7/D9）----
+        if value_target not in ("mc", "lambda"):
+            raise ValueError(f"value_target 只能是 'mc' / 'lambda'，得到 {value_target!r}")
+        self.value_target = str(value_target)
+        self.value_lambda_start = float(value_lambda_start)
+        self.value_lambda_end = float(value_lambda_end)
+        self.value_lambda_anneal_frac = float(value_lambda_anneal_frac)
+        self.value_lowsim_weight = float(value_lowsim_weight)
+        self.value_lowsim_sims = int(value_lowsim_sims)
+        self.material_weight = float(material_weight)
+        # loss() 里最近一次实际使用的 λ（validate 复用它，保证训练/验证目标一致）
+        self._last_lambda = self.value_lambda_end
         self.human_ds = self.sp_ds = None
+
+    def _value_lambda(self, step: int, total_steps: int) -> float:
+        """λ 退火（D5）：start → end，前 anneal_frac 比例步线性。
+
+        目标语义从 MC 换到 λ-return 会先有一个价值损失尖峰，退火让迁移平滑；
+        λ=1 时与现 MC 基线逐位等价。
+        """
+        if self.value_lambda_anneal_frac <= 0.0 or total_steps <= 0:
+            return self.value_lambda_end
+        span = max(int(total_steps * self.value_lambda_anneal_frac), 1)
+        frac = min(max(int(step), 0) / span, 1.0)
+        return self.value_lambda_start + (self.value_lambda_end - self.value_lambda_start) * frac
 
     def _sp_policy_weights(self, item):
         """自对弈 policy 逐位置权重：book ply × opening_w，其余 ×1，填充位 ×0。"""
@@ -188,14 +221,21 @@ class StageB2Task(SsmTask):
         """每代遍历预算：``min(3×buffer 局数 ÷ 有效 batch, 2000)``（§2.6）。
 
         只看自对弈 replay buffer 的局数——人类库固定且远大于 buffer，混入会让预算恒被
-        2000 步上限吃满，失去"控制对陈旧搜索目标过拟合遍数"的本意。
+        2000 步上限吃满，失去"控制对陈旧搜索目标过拟合遍数"的本意。支持单目录 dir 或多目录 dirs 回放池。
         """
         from .dataset.gshards import V3ShardReader
-        reader = V3ShardReader(self.selfplay["dir"])
-        is_val = reader.is_val_arr
-        buffer_games = int(len(is_val) - int(is_val.sum()))
+        sp_dirs = self.selfplay.get("dirs")
+        if not sp_dirs:
+            d = self.selfplay.get("dir")
+            sp_dirs = [d] if d else []
+        buffer_games = 0
+        for d in sp_dirs:
+            if d and os.path.exists(d):
+                reader = V3ShardReader(d)
+                is_val = reader.is_val_arr
+                buffer_games += int(len(is_val) - int(is_val.sum()))
         if buffer_games <= 0:
-            raise RuntimeError(f"自对弈分片 {self.selfplay['dir']} 无可训练局——Stage B2 的核心"
+            raise RuntimeError(f"自对弈分片 {sp_dirs} 无可训练局——Stage B2 的核心"
                                f"监督来源缺失，请检查生成产物")
         eff = self.microbatch * int(accum)
         steps = min(3 * buffer_games // eff, 2000)
@@ -215,7 +255,9 @@ class StageB2Task(SsmTask):
             if not sp_dirs:
                 raise ValueError("StageB2Task 必须配置 selfplay['dir'] 或 selfplay['dirs']")
             self.sp_ds = SelfPlayDataset(sp_dirs, workers=self.workers,
-                                         t_max=self.t_max)
+                                         t_max=self.t_max,
+                                         value_lowsim_weight=self.value_lowsim_weight,
+                                         value_lowsim_sims=self.value_lowsim_sims)
         if self.limit_games > 0:
             self.human_ds.train_indices = self.human_ds.train_indices[:self.limit_games]
         if not self.sp_ds.train_indices:
@@ -251,18 +293,27 @@ class StageB2Task(SsmTask):
         total_steps = total_steps or 0
         h, sp = batch["human"], batch["selfplay"]
         dev = _dev(model)
+        lam = self._value_lambda(step, total_steps)
+        self._last_lambda = lam
         with _autocast(dev):
             total_h, m_h = model.forward_train(h["batch"], self.weights, step, total_steps,
-                                               valid_mask=h["valid"], log_target=self.mlh_log)
+                                               valid_mask=h["valid"], log_target=self.mlh_log,
+                                               value_target=self.value_target,
+                                               value_lambda=lam,
+                                               material_weight=self.material_weight)
             total_sp, m_sp = model.forward_train(
                 sp["batch"], self.weights, step, total_steps, valid_mask=sp["valid"],
                 policy_soft_target=sp["policy_soft_target"], mlh_valid_mask=sp["mlh_valid"],
                 policy_weights=self._sp_policy_weights(sp), log_target=self.mlh_log,
-                kl_reweight=self.kl_reweight)
+                kl_reweight=self.kl_reweight,
+                value_target=self.value_target, value_lambda=lam,
+                value_weights=sp["value_weight"], anchor_last=sp["anchor_last"],
+                material_weight=self.material_weight)
         total = self.w_selfplay * total_sp + self.w_human * total_h
         parts = {f"selfplay_{k}": v for k, v in m_sp.items()}
         parts.update({f"human_{k}": v for k, v in m_h.items()})
         parts["w_selfplay"], parts["w_human"] = self.w_selfplay, self.w_human
+        parts["value_lambda"] = float(lam)
         return total, parts
 
     def validate(self, model, ctx):
@@ -271,9 +322,12 @@ class StageB2Task(SsmTask):
             for item in self.human_ds.val_batch(self.val_batches, self.microbatch, ctx.device):
                 with _autocast(ctx.device):
                     _, m = model.forward_train(item["batch"], self.weights, 0, ctx.cfg.steps,
-                                               valid_mask=item["valid"], log_target=self.mlh_log)
+                                               valid_mask=item["valid"], log_target=self.mlh_log,
+                                               value_target=self.value_target,
+                                               value_lambda=self._last_lambda,
+                                               material_weight=self.material_weight)
                 for k, v in m.items():
-                    if k.startswith("loss_") or k in ("recon_whole_board_acc", "dyn_rel_err"):
+                    if k.startswith("loss_") or k in _EXTRA_METRIC_KEYS:
                         agg.setdefault(f"human_{k}", []).append(float(v))
             for item in self.sp_ds.val_batch(self.val_batches, self.microbatch, ctx.device):
                 with _autocast(ctx.device):
@@ -282,13 +336,19 @@ class StageB2Task(SsmTask):
                         valid_mask=item["valid"],
                         policy_soft_target=item["policy_soft_target"],
                         mlh_valid_mask=item["mlh_valid"],
-                        policy_weights=self._sp_policy_weights(item), log_target=self.mlh_log)
+                        policy_weights=self._sp_policy_weights(item), log_target=self.mlh_log,
+                        value_target=self.value_target, value_lambda=self._last_lambda,
+                        value_weights=item["value_weight"], anchor_last=item["anchor_last"],
+                        material_weight=self.material_weight)
                 for k, v in m.items():
-                    if k.startswith("loss_") or k in ("recon_whole_board_acc", "dyn_rel_err"):
+                    if k.startswith("loss_") or k in _EXTRA_METRIC_KEYS:
                         agg.setdefault(f"selfplay_{k}", []).append(float(v))
         out = {f"val_{k}": sum(v) / max(len(v), 1) for k, v in agg.items()}
-        # §2.6：每代以自对弈 held-out policy CE 选当代表
-        out["score"] = out.get("val_selfplay_loss_policy", float("inf"))
+        # 综合选优标尺：兼顾自对弈 Policy、自对弈 Value 及人类通用 Value 误差，严防 Value 坍塌与单代偏科过拟合
+        sp_pol = out.get("val_selfplay_loss_policy", float("inf"))
+        sp_val = out.get("val_selfplay_loss_value", 0.0)
+        hm_val = out.get("val_human_loss_value", 0.0)
+        out["score"] = sp_pol + 0.5 * sp_val + 0.3 * hm_val
         return out
 
 
@@ -306,9 +366,10 @@ def make_task(runtime=None, *, kind: str = "stage_a", **kwargs) -> SsmTask:
 
     * ``kind``：``stage_a`` / ``stage_b2``；
     * ``data``：人类分片目录（``{"dir": ..., "t_max": 200}``）；
-    * ``selfplay``：Stage B2 的自对弈 v3 分片目录；
+    * ``selfplay``：Stage B2 的自对弈 v3 分片目录（``dir`` 单目录或 ``dirs`` 多代回放池）；
     * 其余：``workers`` / ``microbatch`` / ``dropout`` / ``weights`` / ``ckpt`` /
-      ``w_selfplay`` / ``w_human`` / ``mlh_log`` / ``opening_loss_weight`` / ``t_max``。
+      ``w_selfplay`` / ``w_human`` / ``mlh_log`` / ``opening_loss_weight`` / ``t_max`` /
+      ``value_target`` / ``value_lambda_*`` / ``value_lowsim_*`` / ``material_weight``。
     """
     if kind not in TASKS:
         raise KeyError(f"没有训练任务 {kind!r}（可选：{', '.join(TASKS)}）")

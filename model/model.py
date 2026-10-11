@@ -8,6 +8,7 @@ h_init 为推理起点隐状态，即 t=0 的 h_{-1}）。
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -37,6 +38,10 @@ class TrainBatch:
     tc_bucket: torch.Tensor     # (B,) int64（对局级；逐步同局一致）
     elo_std: torch.Tensor       # (B,) float
     color: torch.Tensor         # (B, T) int64：0 黑走 / 1 白走
+    # v3 自对弈的逐 ply 搜索价值（D2/D3）：白方绝对视角，q_valid=False 的 ply 不可用。
+    # None = 该数据源没有搜索价值（人类谱 / 老分片）⇒ 价值目标回退终局 z。
+    q_search: Optional[torch.Tensor] = None
+    q_valid: Optional[torch.Tensor] = None
 
 
 class SeqModel(nn.Module):
@@ -74,8 +79,13 @@ class SeqModel(nn.Module):
                       mlh_valid_mask: torch.Tensor | None = None,
                       policy_weights: torch.Tensor | None = None,
                       log_target: bool = False,
-                      kl_reweight: bool = False) -> tuple[torch.Tensor, dict[str, float]]:
-        """整序列前向 + 五损失；valid_mask (B,T) 屏蔽填充步。返回 (总损失, 指标 dict)。
+                      kl_reweight: bool = False,
+                      value_target: str = "mc",
+                      value_lambda: float = 1.0,
+                      value_weights: torch.Tensor | None = None,
+                      anchor_last: torch.Tensor | None = None,
+                      material_weight: float = 0.0) -> tuple[torch.Tensor, dict[str, float]]:
+        """整序列前向 + 五损失（+子力差辅助）；valid_mask (B,T) 屏蔽填充步。返回 (总损失, 指标 dict)。
 
         policy_soft_target (B,T,NUM_ACTIONS)：Stage B 自对弈 π′ 软目标（§2.2 修正②，
         支持集=全部合法着）；提供时 policy 损失改用软 CE（losses.policy_soft_loss），
@@ -92,12 +102,20 @@ class SeqModel(nn.Module):
         log_target：是否对 mlh 启用 Log-Huber 变换（torch.log1p(F.relu(...)), delta=0.5）。
 
         kl_reweight：是否启用高 KL 难样本批内自适应加权。
+
+        value_target: "mc" = 终局 z 硬标签（原口径，逐位不变）；"lambda" = TD(λ) 软目标
+        （D2/D4）。"lambda" 时：有 batch.q_search 用搜索价值，没有（人类谱）则用本帧
+        detach 的 WDL 预测自举（D6，零额外前向）；整局无 q̂ 的老分片自动退化为纯 MC。
+        value_lambda: λ；1.0 = 现 MC 基线，0.0 = 纯一步自举（要避免的端点）。
+        value_weights (B,T)：价值损失逐位置权重（PCR 低预算 ply 降权，D7）。
+        anchor_last (B,)：真实终局不在加载窗口内（截断局），锚点改用 q̂[last]。
+        material_weight: 子力差辅助损失权重（D9，0 = 关闭）。
         """
         bsz, seqlen, _ = batch.features.shape
         x = self.encode(batch.features)                                   # (B, T, 512)
         cond = self._cond_expand(batch, x.shape[:2] + (x.shape[-1],))
         h = self.trunk(x + cond)                                          # (B, T, 512)
-        policy_logits, wdl_logits, mlh = self.f(h)
+        policy_logits, wdl_logits, mlh, material = self.f(h, return_material=True)
 
         # Apply legal mask to policy logits before loss
         if hasattr(batch, 'legal_mask') and batch.legal_mask is not None:
@@ -115,10 +133,52 @@ class SeqModel(nn.Module):
         else:
             l_pol = losses.policy_loss(policy_logits_masked, batch.actions,
                                        pol_w, valid_mask)
-        l_val = losses.value_loss(wdl_logits, batch.results, valid_mask)
+
+        # ---- 价值目标：mc（终局 z 硬标签）/ lambda（TD(λ) 软目标）----
+        if value_target not in ("mc", "lambda"):
+            raise ValueError(f"value_target 只能是 'mc' / 'lambda'，得到 {value_target!r}")
+        val_diag: dict[str, float] = {}
+        if value_target == "lambda":
+            if batch.q_valid is not None:
+                q_white, q_valid = batch.q_search, batch.q_valid
+                anchor = anchor_last
+            else:
+                # 无搜索价值来源（人类谱）：用本帧 detach 的 WDL 预测自举。
+                # to_mover_perspective 是对合变换（乘 ±1），mover→white 同样成立。
+                p_det = torch.softmax(wdl_logits.float(), dim=-1).detach()
+                q_white = losses.to_mover_perspective(p_det[..., 0] - p_det[..., 2], batch.color)
+                q_valid = (valid_mask if valid_mask is not None
+                           else torch.ones_like(q_white, dtype=torch.bool))
+                anchor = None
+            z_white = losses.z_white_from_results(batch.results, batch.color)[:, 0]
+            g_white = losses.lambda_return(q_white, q_valid, z_white, value_lambda,
+                                           valid_mask, anchor)
+            g_mover = losses.to_mover_perspective(g_white, batch.color)
+            l_val = losses.value_soft_loss(wdl_logits, g_mover, valid_mask, value_weights)
+            with torch.no_grad():
+                m = valid_mask if valid_mask is not None else torch.ones_like(g_mover, dtype=torch.bool)
+                mb = m.bool()
+                val_diag["target_g_absmean"] = float(g_mover[mb].abs().mean())
+                # 搜索-蒸馏对齐度：网络自身 q 与 λ-return 目标的 Pearson 相关（批内）
+                p_now = torch.softmax(wdl_logits.float(), dim=-1)
+                q_net = (p_now[..., 0] - p_now[..., 2])[mb]
+                tgt = g_mover[mb]
+                if q_net.numel() > 1:
+                    a = q_net - q_net.mean()
+                    b = tgt - tgt.mean()
+                    denom = a.norm() * b.norm()
+                    if float(denom) > 1e-12:
+                        val_diag["value_q_corr"] = float((a * b).sum() / denom)
+        else:
+            l_val = losses.value_loss(wdl_logits, batch.results, valid_mask)
+
         l_mlh = losses.mlh_loss(mlh, batch.moves_left,
                                 mlh_valid_mask if mlh_valid_mask is not None else valid_mask,
                                 log_target=log_target)
+
+        l_mat = None
+        if material_weight and float(material_weight) > 0.0:
+            l_mat = losses.material_loss(material, batch.features, valid_mask)
 
         d_out = self.d(x)
         l_rec, diag_rec = losses.recon_loss(d_out, batch.features, valid_mask)
@@ -138,6 +198,8 @@ class SeqModel(nn.Module):
             + weights.w_r(step, total_steps) * l_rec
             + weights.w_d * l_dyn
         )
+        if l_mat is not None:
+            total = total + float(material_weight) * l_mat
         metrics: dict[str, float] = {
             "loss_total": float(total.detach()),
             "loss_policy": float(l_pol.detach()),
@@ -145,9 +207,12 @@ class SeqModel(nn.Module):
             "loss_mlh": float(l_mlh.detach()),
             "loss_recon": float(l_rec.detach()),
             "loss_dyn": float(l_dyn.detach()),
+            **val_diag,
             **diag_rec,
             **diag_dyn,
         }
+        if l_mat is not None:
+            metrics["loss_mat"] = float(l_mat.detach())
         return total, metrics
 
     # ---- 递推口径（推理 / 未来 MCTS 节点扩展） ----
