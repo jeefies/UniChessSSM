@@ -1,4 +1,4 @@
-"""价值塔（D1）：零初始化残差块 ⇒ 与改造前的单层线性头逐位一致。
+﻿"""价值塔（D1）：零初始化残差块 ⇒ 与改造前的单层线性头逐位一致。
 
 覆盖三条不变式：
 1. ``PredictionHeads.forward`` 的 wdl 输出 ≡ ``w_v(head_norm(transform(h)))``（塔是恒等映射）；
@@ -98,7 +98,7 @@ class ValueTowerZeroInitTest(unittest.TestCase):
         old_sd = {k: v for k, v in ref.state_dict().items()
                   if not k.startswith("f.value_tower.") and not k.startswith("f.w_mat.")}
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
-            p = os.path.join(d, "old.pt")
+            p = _os.path.join(d, "old.pt")
             torch.save({"model": old_sd, "step": 34}, p)
             seq, path = load_seq_model(p, "cpu")
         self.assertEqual(str(path), p)
@@ -122,7 +122,7 @@ class ValueTowerZeroInitTest(unittest.TestCase):
         ref = SeqModel(dropout=0.0)
         broken = {k: v for k, v in ref.state_dict().items() if not k.startswith("e.")}
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
-            p = os.path.join(d, "broken.pt")
+            p = _os.path.join(d, "broken.pt")
             torch.save({"model": broken}, p)
             with self.assertRaises(RuntimeError):
                 load_seq_model(p, "cpu")
@@ -156,3 +156,4 @@ class ValueTowerTrainingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
