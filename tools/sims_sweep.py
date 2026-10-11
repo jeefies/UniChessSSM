@@ -52,6 +52,8 @@ def main():
     parser.add_argument("--workers", type=int, default=4, help="对弈进程数（默认 4，同 arena 口径）")
     parser.add_argument("--concurrency", type=int, default=4, help="单进程并发协程数（默认 4，同 arena 口径）")
     parser.add_argument("--out", default=None, help="汇总 JSON 输出路径（默认 <config>_sims_sweep.json）")
+    parser.add_argument("--cand", default=None, help="覆盖配置里 a 方的 checkpoint（逐轮迭代不用改配置）")
+    parser.add_argument("--champ", default=None, help="覆盖配置里 b 方的 checkpoint")
     args = parser.parse_args()
 
     sims_list = _parse_sims(args.sims)
@@ -61,6 +63,13 @@ def main():
         sys.exit(1)
     with open(config_path, encoding="utf-8") as fh:
         conf = json.load(fh)
+
+    if args.cand:
+        conf["a"]["kwargs"]["checkpoint"] = args.cand
+        conf["a"]["label"] = conf["a"].get("label", "A") + "_override"
+    if args.champ:
+        conf["b"]["kwargs"]["checkpoint"] = args.champ
+        conf["b"]["label"] = conf["b"].get("label", "B") + "_override"
 
     spec_a = EngineSpec.from_dict(conf["a"])
     spec_b = EngineSpec.from_dict(conf["b"])
