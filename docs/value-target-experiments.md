@@ -144,9 +144,53 @@ pL=max(−g,0)`）。与 Round 1 的**唯一差别就是投影**（低预算降�
 
 ---
 
-## Round 5（gen_0006）：λ=0.35 —— 继续往低 λ 探
+## Round 5（gen_0006）：λ=0.35 —— 探另一侧，确认 0.5 就是甜点
 
-（待填）
+**配置**：λ=0.35，起点用回退的 gen4（与 Round 4 同基座、同数据，只变 λ），全套修复。
+
+**同口径 cheap gate**：vs 新霸主（λ=0.5）**46.00%** / Elo −27.85 / LOS 0.197。
+
+| λ | 得分率 | 说明 |
+|---|---|---|
+| 1.0 | 43.50% | 纯架构消融（Round 3，vs 旧霸主） |
+| **0.5** | **57.50%** | Round 4（vs 旧霸主），已晋级 |
+| 0.35 | 46.00% | Round 5（vs 新霸主） |
+
+**⇒ λ=0.5 是甜点，两侧都更差。** λ 扫描结束，不再调它。
+
+**另一条观测**：λ=0.35 那轮训练早期 `grad_norm` 冲到 14（Round 1 同期约 2.4）——λ 越低目标越
+"平"，价值损失的梯度尺度越大，收敛更躁。这也是低 λ 不稳的一个佐证。
+
+---
+
+## Round 6 起：交给现役循环（Gen 31+）
+
+Round 4 的晋级是"离 band"完成的（手工训练 + 手工门禁），已按循环自己的格式记进
+`loop_stage_b/loop_state.json`（追加 `generation=30, promoted=true`，`current_gen→31`，
+`opp_champion→champion_gen4.pt`）。复核窗口判定：`consecutive_fails=0 ⇒ window_phase=0`，
+**下一代从新 Champion 启动**（否则会从 gen_0029 的旧 best.pt 继续，白白丢掉晋级收益）。
+
+随后以新目标启动现役大循环：
+
+```bash
+loop_pipeline.py --generations 4 --games 3000 \
+  --champion runs/champion.pt --opp runs/champion_gen3.pt \
+  --workers 8 --concurrency 20 \
+  --value-target lambda --value-lambda-end 0.5 --record-qsearch
+```
+
+配套改动：`loop_pipeline.py` 在开 `--record-qsearch` 时，**回放池只收带 q̂ 的代**——否则 4 代滑窗
+会混入无 q̂ 的老代，那些局的价值目标退化成纯 MC，等价于把 λ 往 1 拉（而 λ=1 比 λ=0.5 差 8.5 分）。
+代价是回放池要几代才能攒满（gen_0031 只有 1 代 3000 局 → 140 步，之后逐代增长到 4 代 560 步）。
+
+**逐代结果**：（待循环跑完补充）
+
+| 代 | 训练基座 | 池(局/步) | Arena 得分率 | Elo | SPRT | 晋级 |
+|---|---|---|---|---|---|---|
+| 31 | 新 Champion | 1 代 / 3000 / ~140 | | | | |
+| 32 | | | | | | |
+| 33 | | | | | |
+| 34 | | | | | |
 
 ---
 
