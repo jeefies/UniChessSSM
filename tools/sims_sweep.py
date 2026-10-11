@@ -4,9 +4,13 @@
 若 0-sim 持平而 32/64-sim 上移，说明 MCTS 回溯用的价值评估变好了；全线不动则说明无效。
 0-sim（纯网络直觉）那一点用 ``tools/evaluate_raw_policy.py`` 单独测，本工具覆盖 sims ≥ 1。
 
-做法：GpuServer 只起一次（模型加载才是贵的那步），在其上按 sims 列表逐点跑
-``Kit.pipelines.match.run_match``；每点关闭 SPRT 早停（固定局数才好横向比较），
+做法：直接复用 ``Kit.pipelines.match.run_match``（与现役循环 arena 同一口径：``engine: fast``、
+进程 worker、g=0），按 sims 列表逐点跑；每点关闭 SPRT 早停（固定局数才好横向比较），
 结果写到 ``<out_stem>_sims<N>.jsonl`` 并汇总成一个 JSON。
+
+2026-10-11：原先在这里自起 GpuServer，但 ``Kit match`` 的 worker 是**进程**，每个进程都会
+为双方各建一个后端 ⇒ 连接数 = workers × 模型数，客户端名额必然爆。arena 本身就用
+``engine: fast``，没必要自起服务，故删除该分支。
 """
 
 from __future__ import annotations
@@ -14,20 +18,16 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
-import os
-import signal
 import sys
 import time
 from pathlib import Path
 
-# 确保导入根在 sys.path
-IMPORT_ROOT = os.environ.get("UNICHESS_IMPORT_ROOT", str(Path(__file__).resolve().parents[2]))
+IMPORT_ROOT = "/home/jeefy/UniChess"
 if IMPORT_ROOT not in sys.path:
     sys.path.insert(0, IMPORT_ROOT)
 
 from Kit.pipelines.match import MatchConfig, run_match
 from Kit.registry import EngineSpec
-from SSM.infer.gpu_server import GpuServer
 
 
 def _parse_sims(text: str) -> list:
@@ -49,12 +49,9 @@ def main():
     parser.add_argument("config", help="评测配置 JSON（{\"a\":..., \"b\":..., \"match\":...}）")
     parser.add_argument("--sims", default="8,32,64", help="逗号分隔的模拟数列表（默认 8,32,64）")
     parser.add_argument("--pairs", type=int, default=50, help="每个 sims 点的成对开局数（默认 50 = 100 局）")
+    parser.add_argument("--workers", type=int, default=4, help="对弈进程数（默认 4，同 arena 口径）")
+    parser.add_argument("--concurrency", type=int, default=4, help="单进程并发协程数（默认 4，同 arena 口径）")
     parser.add_argument("--out", default=None, help="汇总 JSON 输出路径（默认 <config>_sims_sweep.json）")
-    parser.add_argument("--workers", type=int, default=6, help="纯 CPU Worker 进程数（默认 6）")
-    parser.add_argument("--concurrency", type=int, default=8, help="每 Worker 并发协程数（默认 8）")
-    parser.add_argument("--chunk", type=int, default=64, help="CUDA Graph 批块大小（默认 64）")
-    parser.add_argument("--slots-per-client", type=int, default=1024, help="每客户端状态槽上限")
-    parser.add_argument("--precision", default="fp32", choices=["fp32", "tf32"], help="推理精度")
     args = parser.parse_args()
 
     sims_list = _parse_sims(args.sims)
@@ -74,68 +71,32 @@ def main():
     match_dict.pop("sprt", None)          # 扫描点固定局数，不做序贯早停
     base_cfg = MatchConfig.from_dict(match_dict)
 
-    ckpt_a = spec_a.kwargs.get("checkpoint")
-    ckpt_b = spec_b.kwargs.get("checkpoint")
-    use_gpu_server = (spec_a.factory.startswith("SSM.") and spec_b.factory.startswith("SSM.")
-                      and ckpt_a and ckpt_b)
-
     out_base = (Path(args.out) if args.out else
                 config_path.with_name(config_path.stem + "_sims_sweep.json"))
     out_base.parent.mkdir(parents=True, exist_ok=True)
 
-    server = None
-    if use_gpu_server:
-        p_a, p_b = os.path.abspath(ckpt_a), os.path.abspath(ckpt_b)
-        ckpts = [p_a] if p_a == p_b else [p_a, p_b]
-        print(f"[SimsSweep] 启动 GPU 共享服务 (models={len(ckpts)}, clients={args.workers}, "
-              f"slots={args.slots_per_client}, chunk={args.chunk}, precision={args.precision})...")
-        server = GpuServer(checkpoints=ckpts, n_clients=args.workers,
-                           slots_per_client=args.slots_per_client, chunk=args.chunk,
-                           precision=args.precision).start()
-
-        def _cleanup(*_):
-            print("\n[SimsSweep] 收到终止信号，正在关闭 GPU 服务...", file=sys.stderr)
-            if server is not None:
-                server.stop()
-            sys.exit(143)
-
-        signal.signal(signal.SIGTERM, _cleanup)
-        signal.signal(signal.SIGINT, _cleanup)
-
-        runtime = {"engine": "server", "server_dir": server.dir,
-                   "server_chunk": args.chunk, "server_precision": args.precision}
-        kw_a = {k: v for k, v in spec_a.kwargs.items() if k != "engine"}
-        kw_b = {k: v for k, v in spec_b.kwargs.items() if k != "engine"}
-        spec_a = dataclasses.replace(spec_a, kwargs=kw_a, runtime=runtime)
-        spec_b = dataclasses.replace(spec_b, kwargs=kw_b, runtime=runtime)
-
     rows = []
-    try:
-        for sims in sims_list:
-            cfg = dataclasses.replace(base_cfg, simulations=sims)
-            point_out = out_base.with_name(f"{out_base.stem}_sims{sims}.jsonl")
-            t0 = time.perf_counter()
-            print(f"\n[SimsSweep] === sims={sims}：pairs={cfg.pairs}（{2 * cfg.pairs} 局）===")
-            summary = run_match(cfg, spec_a=spec_a, spec_b=spec_b, out_path=point_out)
-            elapsed = time.perf_counter() - t0
-            row = {
-                "simulations": sims,
-                "games": summary["games"],
-                "a_wins": summary["a_wins"], "b_wins": summary["b_wins"],
-                "draws": summary["draws"],
-                "score_a": summary["score_a"], "elo": summary["elo"],
-                "elo_ci95": summary["elo_ci95"], "los": summary["los"],
-                "elapsed_s": round(elapsed, 1),
-                "results": str(point_out),
-            }
-            rows.append(row)
-            print(f"[SimsSweep] sims={sims}: 得分率 {row['score_a']:.4f}  "
-                  f"Elo {row['elo']:+.2f} (CI [{row['elo_ci95'][0]:+.2f}, {row['elo_ci95'][1]:+.2f}])  "
-                  f"LOS {row['los']:.4f}  ({elapsed:.1f}s)")
-    finally:
-        if server is not None:
-            server.stop()
-            print("[SimsSweep] GPU 服务已释放。")
+    for sims in sims_list:
+        cfg = dataclasses.replace(base_cfg, simulations=sims)
+        point_out = out_base.with_name(f"{out_base.stem}_sims{sims}.jsonl")
+        t0 = time.perf_counter()
+        print(f"\n[SimsSweep] === sims={sims}：pairs={cfg.pairs}（{2 * cfg.pairs} 局）===")
+        summary = run_match(cfg, spec_a=spec_a, spec_b=spec_b, out_path=point_out)
+        elapsed = time.perf_counter() - t0
+        row = {
+            "simulations": sims,
+            "games": summary["games"],
+            "a_wins": summary["a_wins"], "b_wins": summary["b_wins"],
+            "draws": summary["draws"],
+            "score_a": summary["score_a"], "elo": summary["elo"],
+            "elo_ci95": summary["elo_ci95"], "los": summary["los"],
+            "elapsed_s": round(elapsed, 1),
+            "results": str(point_out),
+        }
+        rows.append(row)
+        print(f"[SimsSweep] sims={sims}: 得分率 {row['score_a']:.4f}  "
+              f"Elo {row['elo']:+.2f} (CI [{row['elo_ci95'][0]:+.2f}, {row['elo_ci95'][1]:+.2f}])  "
+              f"LOS {row['los']:.4f}  ({elapsed:.1f}s)")
 
     print("\n[SimsSweep] 汇总：")
     print(f"{'sims':>6} {'局数':>6} {'得分率':>9} {'Elo':>9} {'LOS':>8} {'耗时s':>8}")
@@ -145,7 +106,7 @@ def main():
     payload = {
         "a": conf["a"], "b": conf["b"],
         "pairs": args.pairs, "workers": args.workers, "concurrency": args.concurrency,
-        "precision": args.precision, "points": rows,
+        "points": rows,
     }
     with open(out_base, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=1)
