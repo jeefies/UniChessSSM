@@ -85,8 +85,9 @@ class TerminationClassifyTest(unittest.TestCase):
             self.skipTest("需要 torch 与兄弟仓库 Kit")
 
         class _Writer:
-            def add(self, meta, actions, pipol, poff):
+            def add(self, meta, actions, pipol, poff, qsearch=None):
                 self.meta, self.actions = meta, actions
+                self.qsearch = qsearch
 
         board = _claimable_threefold_board()
         decisions = [MoveDecision(m, info={"pi_ids": np.zeros(1, np.uint16),
@@ -100,6 +101,8 @@ class TerminationClassifyTest(unittest.TestCase):
         self.assertEqual(int(writer.meta["result"]), 1)
         self.assertEqual(int(writer.meta["n_plies"]), len(board.move_stack))
         self.assertEqual(sink.truncated_games, 0)
+        # 未开 record_qsearch ⇒ 不产出逐 ply 搜索价值（老行为不变）
+        self.assertIsNone(writer.qsearch)
 
 
 if __name__ == "__main__":
