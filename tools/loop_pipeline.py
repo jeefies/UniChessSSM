@@ -459,12 +459,22 @@ class SsmLoopOrchestrator:
                 p_cand = self.out_dir / f"gen_{gen_id - 1:04d}" / "train" / "best.pt"
                 if p_cand.exists():
                     prev_cand = str(p_cand)
-                # 上一代候选的 Arena Elo CI 下界：明显没打好就别从它继续链
+                # 上一代候选的 Arena Elo CI 下界：明显没打好就别从它继续链。
+                # 优先读 history 记录；老记录没这个字段时退回读 arena summary
+                # （2026-10-12 实测：gen 6–37 全缺该字段，护栏会静默失效）。
                 for h in reversed(self.state.get("history", [])):
                     if h.get("generation") == gen_id - 1:
                         ci = h.get("elo_ci95") or [None, None]
                         prev_ci_lo = ci[0] if ci else None
                         break
+                if prev_ci_lo is None:
+                    sp = self.out_dir / f"gen_{gen_id - 1:04d}" / "arena.jsonl.summary.json"
+                    if sp.exists():
+                        try:
+                            prev_ci_lo = (json.load(open(sp, encoding="utf-8"))
+                                          .get("elo_ci95") or [None, None])[0]
+                        except Exception:
+                            prev_ci_lo = None
 
             # 连续演化只在"上一代候选至少没被打崩"时才有意义：若它的 CI 下界已经很低，
             # 说明累计漂移在把候选拉走，继续链下去 Arena 比的是漂移而不是本轮增量
