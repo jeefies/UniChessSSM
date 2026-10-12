@@ -36,6 +36,8 @@ IMPORT_ROOT = os.environ.get("UNICHESS_IMPORT_ROOT", str(Path(__file__).resolve(
 if IMPORT_ROOT not in sys.path:
     sys.path.insert(0, IMPORT_ROOT)
 
+from Kit.rules.openings import OpeningBook  # noqa: E402
+
 
 def log(msg: str, log_file: Path | None = None) -> None:
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -54,45 +56,61 @@ def write_json(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
-#: 换代门限的 Elo CI 下界阈值：候选"没有显著变弱"即可晋级（见 promotion_gate）
+#: Arena 每代开对数。每对同一开局打 2 局（A 执白 / B 执白），所以总局数 = pairs × 2。
+#: 600 对 = 1200 局：配合 4000 条开局库（openings_4000.txt）零重复，CI 半宽约 ±20.6 Elo，
+#: 是单代分辨 +14 Elo 量级边际增益的实用下限。
+ARENA_PAIRS = 600
+
+#: 换代门限的 Elo CI 下界阈值：候选"没有显著变弱"即可晋级。
 ELO_CI_FLOOR = -5.0
 
-#: 得分率门限（第②条）要求的最少对局数。SPRT 早停可能只剩几十局，那种样本的得分率
-#: 纯噪声（gen_0026 就只有 59 局）；100 局是得分率 55% 能达到 ~±100 Elo 精度的下限。
-MIN_GAMES_FOR_SCORE_GATE = 100
+#: CI 门限要求的最少对局数。SPRT 早停可能只剩几十局，那种样本的 CI 是纯噪声
+#: （gen_0026 仅 59 局）；1000 局是 1200 局预算下 CI 仍有意义的下限。
+MIN_GAMES_FOR_CI = 1000
 
-#: 漂移护栏：上一代候选的 Arena Elo CI 下界低于此值，就不从它继续链式训练，回霸主重训。
-#: 连续 Learner 演化的前提是"上一代候选至少没被打崩"；否则累计漂移会把候选拉偏，
-#: Arena 比的就是漂移而不是本轮增量（Gen 34→37 实测 49.3%→45.9%→38.3%→48.4%）。
-DRIFT_GUARD_CI_FLOOR = -20.0
+#: 漂移护栏：上一代候选的 Elo 点估（CI 中点）低于此值，就不从它继续链式训练，回霸主重训。
+#: 连续 Learner 演化的前提是"上一代候选至少没变差"；否则 init 与数据生成模型（恒为霸主）
+#: 脱钩，Arena 比的就是累计漂移而不是本轮增量（Gen 34→37 实测 49.3%→45.9%→38.3%→48.4%）。
+#: 2026-10-12 根因取证：自对弈 --ckpt 每代都是 champion.pt，数据分布全程持平，
+#: 漂移只来自链式 init——所以判据应该直接看"候选有没有变差"，而不是"CI 下界跌没跌到 -20"。
+DRIFT_GUARD_ELO_FLOOR = 0.0
+
+#: 开局库（自对弈与 Arena 共用）。确定性对局下重复开局 = 逐字节重复棋谱，
+#: 而 match.py 的 elo_ci95 按原始局数算、不按 duplicate_rate 校正 ⇒ 库不够时 CI 虚窄。
+#: 4000 条 = 旧 curated 200 条 + 随机合法 6-12 ply 线路（seed 20261012，可复现）。
+#: 放在 Kit/data/ 是因为 Kit 拥有 OpeningBook，且该目录的 .gitignore 已放行 .txt
+#: （SSM 的 /data/ 是全禁，开局书放那边不会入 git ⇒ 干净克隆跑不了循环）。
+OPENINGS_FILE = os.path.join(IMPORT_ROOT, "Kit/data/openings_4000.txt")
 
 
-def promotion_gate(sprt_verdict, score_a, elo_ci95, games=None,
+def promotion_gate(sprt_verdict, elo_ci95, games=None,
                    elo_ci_floor: float = ELO_CI_FLOOR,
-                   min_games_for_score: int = MIN_GAMES_FOR_SCORE_GATE):
-    """换代门限 → (是否晋升, 依据)。三条任一满足即晋升：
+                   min_games: int = MIN_GAMES_FOR_CI):
+    """换代门限 → (是否晋升, 依据)。以 Elo CI 为主通道，SPRT H1 为快速通道。
 
-    1. ``SPRT H1``——序贯检验判"显著变强"（H₁=35 Elo）；
-    2. ``得分率 ≥ 55%`` **且对局数 ≥ min_games_for_score**（默认 100）——历史沿用的粗门限，
-       加局数约束是因为 SPRT 早停可能只剩几十局，那种样本的得分率是纯噪声；
-    3. ``Elo 95% CI 下界 > elo_ci_floor``（默认 −5）——"没有显著变弱"。
+    1. ``SPRT H1``——序贯检验判"显著变强"。大跨步改进会在远不到局数上限时就越界，
+       这条让它不必等满 1200 局（gen 33 的 +45 Elo 就是 220 局判出的）。
+    2. ``Elo 95% CI 下界 ≥ elo_ci_floor`` **且对局数 ≥ min_games**——主通道。
 
-    第 3 条是 2026-10-12 加的：六任霸主 round-robin 实测彼此差距只在 ±25 Elo 量级，而
-    600 局的 CI 半宽就有 ±25~50，H1 经常达不到；但"CI 下界 > −5"能稳定判定候选没变弱。
-    回测 31 代历史数据：该条件一次都没触发（历史 CI 下界都在 −50 以下），所以是纯粹的
-    救济通道，不会让既有判决变松。它天然自带局数保护——局数少时 CI 必然宽，下界不可能 > −5。
+    为什么不再看"得分率 ≥ 55%"：55% 对应 +45 Elo，在 1000 局下 CI 下界必然远超 −5，
+    被第 2 条完全覆盖；而它要求的效应量远高于当前边际增益（+14 Elo），留着只会让人
+    误以为门禁有这么宽的通道。2026-10-12 用真实 CI 回测 32 代：旧三选一门禁与
+    纯 CI 门禁判决完全一致（零翻转），删掉它不改变任何历史判决。
+
+    为什么 elo1=35 的 SPRT 平时判不出 H1：真实边际增益只有 +14 Elo 时，LLR 的理论
+    漂移 D(+14‖0) − D(+14‖35) 是**负值**，H1 边界结构上够不到（实测 5 代 llr 均值
+    −0.616，理论 −0.504，吻合）。所以 SPRT 只在跨大步时起作用；它的 H0 早停仍然有价值
+    ——候选明显变差时几十局就收工，不浪费 1200 局。
     """
     lo = None
     if elo_ci95 and len(elo_ci95) > 0 and elo_ci95[0] is not None:
         lo = float(elo_ci95[0])
     if sprt_verdict == "H1":
         return True, "SPRT H1"
-    if score_a is not None and score_a >= 0.55:
-        if games is None or int(games) >= int(min_games_for_score):
-            return True, "得分率>=55%%(%s局)" % games
-        # 局数不够 ⇒ 这条不成立，落到 CI 下界那条去判
-    if lo is not None and lo > float(elo_ci_floor):
-        return True, "Elo CI 下界 > %g" % elo_ci_floor
+    if lo is not None and lo >= float(elo_ci_floor):
+        if games is None or int(games) >= int(min_games):
+            return True, "Elo CI 下界 %+.1f ≥ %g（%s 局）" % (lo, elo_ci_floor, games)
+        return False, "CI 达标但局数不足（%s < %d）" % (games, min_games)
     return False, "未达门限"
 
 
@@ -103,8 +121,11 @@ class SsmLoopOrchestrator:
                  python_bin: str = sys.executable,
                  value_target: str = "mc", value_lambda_end: float = 1.0,
                  value_anchor_weight: float = 0.0,
-                 record_qsearch: bool = False):
-        self.out_dir = out_dir
+                 record_qsearch: bool = False,
+                 arena_pairs: int = ARENA_PAIRS,
+                 openings: str = OPENINGS_FILE):
+        # out_dir 收 str 也收 Path（单测/外部调用方常传 str，早先会在这里 AttributeError）
+        self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.total_gens = total_gens
         self.games_per_gen = games_per_gen
@@ -120,6 +141,25 @@ class SsmLoopOrchestrator:
         self.value_lambda_end = float(value_lambda_end)
         self.value_anchor_weight = float(value_anchor_weight)
         self.record_qsearch = bool(record_qsearch)
+        # Arena 开对数（×2 = 总局数）与开局库。两者必须配套：库规模 < pairs 时
+        # OpeningBook.plan 会循环复用开局，而 match.py 的 elo_ci95 按原始局数算、
+        # 不按 duplicate_rate 校正 ⇒ CI 虚窄、门禁被误导。
+        self.arena_pairs = int(arena_pairs)
+        if self.arena_pairs < 1:
+            raise ValueError(f"arena_pairs 必须 ≥ 1，得到 {arena_pairs}")
+        self.openings = str(openings)
+        if not os.path.exists(self.openings):
+            raise FileNotFoundError(f"开局库不存在：{self.openings}")
+        # 不变式：开局库规模必须 ≥ arena_pairs。否则 OpeningBook.plan 会 i % n 循环复用
+        # 开局，而 match.py 的 elo_ci95 按原始局数算、不按 duplicate_rate 校正
+        # ⇒ 报告 CI 虚窄、门禁被误导（2026-10-12：库 200 / pairs 250 时 duplicate_rate
+        # 已达 22.4%）。宁可在这里响亮报错，也不静默产出重复局。
+        book = OpeningBook.from_file(self.openings)
+        if len(book) < self.arena_pairs:
+            raise ValueError(
+                f"开局库只有 {len(book)} 条，撑不起 arena_pairs={self.arena_pairs}"
+                f"（{self.arena_pairs * 2} 局）——会循环复用开局产生逐字节重复棋谱，"
+                f"而 elo_ci95 不按 duplicate_rate 校正。请扩容开局库或调小 --arena-pairs。")
 
         self.log_file = self.out_dir / "loop.log"
         self.state_file = self.out_dir / "loop_state.json"
@@ -181,6 +221,7 @@ class SsmLoopOrchestrator:
             "--contempt", "0.5",
             "--temp-plies", "15",
             "--temperature", "1.0",
+            "--openings", self.openings,
             "--book-plies", "8",
             "--min-book-plies", "6",
             "--pcr-rate", "0.5",
@@ -395,10 +436,10 @@ class SsmLoopOrchestrator:
                 }
             },
             "match": {
-                "pairs": 250,
+                "pairs": self.arena_pairs,
                 "concurrency": 4,
                 "max_plies": 300,
-                "openings": os.path.join(IMPORT_ROOT, "SSM/data/openings_200.txt"),
+                "openings": self.openings,
                 "seed": int(time.time() * 1000) & 0x7FFFFFFF,
                 "workers": 4,
                 "sprt": {
@@ -459,35 +500,45 @@ class SsmLoopOrchestrator:
                 p_cand = self.out_dir / f"gen_{gen_id - 1:04d}" / "train" / "best.pt"
                 if p_cand.exists():
                     prev_cand = str(p_cand)
-                # 上一代候选的 Arena Elo CI 下界：明显没打好就别从它继续链。
+                # 上一代候选的 Arena Elo 点估（CI 中点）：候选没变差才值得继续链。
                 # 优先读 history 记录；老记录没这个字段时退回读 arena summary
                 # （2026-10-12 实测：gen 6–37 全缺该字段，护栏会静默失效）。
+                prev_elo = None
                 for h in reversed(self.state.get("history", [])):
                     if h.get("generation") == gen_id - 1:
                         ci = h.get("elo_ci95") or [None, None]
-                        prev_ci_lo = ci[0] if ci else None
+                        if ci and ci[0] is not None and len(ci) > 1 and ci[1] is not None:
+                            prev_elo = (float(ci[0]) + float(ci[1])) / 2.0
+                        elif h.get("elo") is not None:
+                            prev_elo = float(h["elo"])
                         break
-                if prev_ci_lo is None:
+                if prev_elo is None:
                     sp = self.out_dir / f"gen_{gen_id - 1:04d}" / "arena.jsonl.summary.json"
                     if sp.exists():
                         try:
-                            prev_ci_lo = (json.load(open(sp, encoding="utf-8"))
-                                          .get("elo_ci95") or [None, None])[0]
+                            s = json.load(open(sp, encoding="utf-8"))
+                            if s.get("elo") is not None:
+                                prev_elo = float(s["elo"])
+                            else:
+                                ci = s.get("elo_ci95") or [None, None]
+                                if ci[0] is not None and len(ci) > 1 and ci[1] is not None:
+                                    prev_elo = (float(ci[0]) + float(ci[1])) / 2.0
                         except Exception:
-                            prev_ci_lo = None
+                            prev_elo = None
 
-            # 连续演化只在"上一代候选至少没被打崩"时才有意义：若它的 CI 下界已经很低，
-            # 说明累计漂移在把候选拉走，继续链下去 Arena 比的是漂移而不是本轮增量
+            # 连续演化只在"上一代候选至少没变差"时才有意义：数据每代都由霸主生成
+            # （自对弈 --ckpt 恒为 champion.pt，实测数据分布全程持平），链式 init 越链
+            # 离数据生成模型越远，Arena 比的就是累计漂移而不是本轮增量
             # （实测 Gen 34→37 链式下滑 49.3%→45.9%→38.3%→48.4%）。
-            drift_guard = prev_ci_lo is not None and prev_ci_lo < DRIFT_GUARD_CI_FLOOR
+            drift_guard = prev_elo is not None and prev_elo < DRIFT_GUARD_ELO_FLOOR
 
             if window_phase != 0 and prev_cand and not drift_guard:
                 base_pt = prev_cand
                 log(f"🔄【连续 Learner 演化】五代非回滚窗口 (周期第 {window_phase + 1}/5 代, 累计未晋升: {consecutive_fails})，本代从上一代最优检查点连续推进: {base_pt}", self.log_file)
             elif window_phase != 0 and prev_cand and drift_guard:
                 base_pt = current_champ
-                log(f"🛑【漂移护栏】上一代候选 Elo CI 下界 {prev_ci_lo:+.1f} < {DRIFT_GUARD_CI_FLOOR}，"
-                    f"累计漂移已在拉偏候选，本代回霸主重训: {base_pt}", self.log_file)
+                log(f"🛑【漂移护栏】上一代候选 Elo 点估 {prev_elo:+.1f} < {DRIFT_GUARD_ELO_FLOOR:+.0f}（已变差），"
+                    f"init 与数据生成模型脱钩，本代回霸主重训: {base_pt}", self.log_file)
             elif consecutive_fails > 0 and window_phase == 0:
                 base_pt = current_champ
                 log(f"⚠️【安全熔断回滚】前一个 5 代窗口冲击 Champion 未果 (累计未晋升: {consecutive_fails})，触发安全回滚，本代重置从 Champion 重新热启: {base_pt}", self.log_file)
@@ -507,14 +558,13 @@ class SsmLoopOrchestrator:
             t_arena = time.time() - t0
 
             # 4. 裁决与换代
-            # 门限见 promotion_gate：SPRT H1 / 得分率≥55% / Elo CI 下界 > -5，任一即晋升。
-            # 第 3 条为主——round-robin 实测这一大伙霸主彼此只差 ±25 Elo，而 600 局 CI 半宽
-            # 就有 ±25~50，H1（要 +35 Elo 证据）经常达不到，但"CI 下界 > -5"能稳定判定
-            # "候选没有显著变弱"，在这一大伙的内部差异下才是可用的判别力。
+            # 门限见 promotion_gate：主通道是 Elo 95% CI 下界 ≥ -5 且局数 ≥ 1000；
+            # SPRT H1 是快速通道（大跨步时不必等满局数）。不再看得分率 55%——它对应
+            # +45 Elo，被 CI 通道完全覆盖，而当前边际增益只有 +14 Elo，留着会误导。
             sprt_verdict = arena_summary.get("sprt", {}).get("verdict")
             score_a = arena_summary.get("score_a", 0.0)
             elo_ci = arena_summary.get("elo_ci95") or [None, None]
-            promoted, gate_reason = promotion_gate(sprt_verdict, score_a, elo_ci,
+            promoted, gate_reason = promotion_gate(sprt_verdict, elo_ci,
                                                    games=arena_summary.get("games"))
             elo_ci_lo = elo_ci[0] if elo_ci and elo_ci[0] is not None else None
             elo_ci_hi = elo_ci[1] if len(elo_ci) > 1 and elo_ci[1] is not None else None
@@ -579,6 +629,12 @@ def main():
     parser.add_argument("--opp", default=os.path.join(IMPORT_ROOT, "SSM/runs/champion_gen3.pt"), help="历史对手池检查点")
     parser.add_argument("--workers", type=int, default=8, help="自对弈 Worker 数量 (默认 8)")
     parser.add_argument("--concurrency", type=int, default=20, help="单 Worker 并发 (默认 20)")
+    parser.add_argument("--arena-pairs", type=int, default=ARENA_PAIRS,
+                        help="Arena 开对数（×2 = 总局数，默认 %(default)s = 1200 局）。"
+                             "必须 ≤ 开局库规模，否则开局循环复用会产生逐字节重复棋谱，"
+                             "而 elo_ci95 不按 duplicate_rate 校正 ⇒ CI 虚窄")
+    parser.add_argument("--openings", default=OPENINGS_FILE,
+                        help="开局库（自对弈与 Arena 共用，默认 %(default)s）")
     parser.add_argument("--value-target", default="mc", choices=["mc", "lambda"],
                         help="价值学习目标：mc=终局 z 硬标签（原口径）；lambda=TD(λ) 软目标（D2/D4）")
     parser.add_argument("--value-lambda-end", type=float, default=1.0,
@@ -597,6 +653,8 @@ def main():
         opp_checkpoint=args.opp,
         workers=args.workers,
         concurrency=args.concurrency,
+        arena_pairs=args.arena_pairs,
+        openings=args.openings,
         value_target=args.value_target,
         value_lambda_end=args.value_lambda_end,
         value_anchor_weight=args.value_anchor_weight,

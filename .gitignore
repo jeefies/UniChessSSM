@@ -1,5 +1,7 @@
-# 运行时产物
-/data/
+# 运行时产物（.txt 例外：开局书是小体积配置类资源，必须入 git——
+# 否则干净克隆没有开局库，循环起不来。Kit/data/.gitignore 同理）
+/data/*
+!/data/*.txt
 /runs/
 /logs/
 
