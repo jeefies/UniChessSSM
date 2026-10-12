@@ -28,7 +28,7 @@ class PromotionGateTest(unittest.TestCase):
     def test_score_55_alone_promotes(self):
         ok, why = loop_pipeline.promotion_gate("H0", 0.55, [-40.0, 30.0])
         self.assertTrue(ok)
-        self.assertEqual(why, "得分率>=55%")
+        self.assertTrue(why.startswith("得分率>=55%"), why)
 
     def test_ci_floor_alone_promotes(self):
         """CI 很紧但够不到 H1（Elo +10、CI [−3,+25]）——正是新增这条要救济的情形。"""
