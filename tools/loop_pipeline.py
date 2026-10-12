@@ -61,6 +61,11 @@ ELO_CI_FLOOR = -5.0
 #: 纯噪声（gen_0026 就只有 59 局）；100 局是得分率 55% 能达到 ~±100 Elo 精度的下限。
 MIN_GAMES_FOR_SCORE_GATE = 100
 
+#: 漂移护栏：上一代候选的 Arena Elo CI 下界低于此值，就不从它继续链式训练，回霸主重训。
+#: 连续 Learner 演化的前提是"上一代候选至少没被打崩"；否则累计漂移会把候选拉偏，
+#: Arena 比的就是漂移而不是本轮增量（Gen 34→37 实测 49.3%→45.9%→38.3%→48.4%）。
+DRIFT_GUARD_CI_FLOOR = -20.0
+
 
 def promotion_gate(sprt_verdict, score_a, elo_ci95, games=None,
                    elo_ci_floor: float = ELO_CI_FLOOR,
@@ -449,14 +454,30 @@ class SsmLoopOrchestrator:
 
             window_phase = consecutive_fails % 5  # 0: 周期第1代(新王/回滚重置), 1..4: 连续推进代
             prev_cand = None
+            prev_ci_lo = None
             if gen_id > 1:
                 p_cand = self.out_dir / f"gen_{gen_id - 1:04d}" / "train" / "best.pt"
                 if p_cand.exists():
                     prev_cand = str(p_cand)
+                # 上一代候选的 Arena Elo CI 下界：明显没打好就别从它继续链
+                for h in reversed(self.state.get("history", [])):
+                    if h.get("generation") == gen_id - 1:
+                        ci = h.get("elo_ci95") or [None, None]
+                        prev_ci_lo = ci[0] if ci else None
+                        break
 
-            if window_phase != 0 and prev_cand:
+            # 连续演化只在"上一代候选至少没被打崩"时才有意义：若它的 CI 下界已经很低，
+            # 说明累计漂移在把候选拉走，继续链下去 Arena 比的是漂移而不是本轮增量
+            # （实测 Gen 34→37 链式下滑 49.3%→45.9%→38.3%→48.4%）。
+            drift_guard = prev_ci_lo is not None and prev_ci_lo < DRIFT_GUARD_CI_FLOOR
+
+            if window_phase != 0 and prev_cand and not drift_guard:
                 base_pt = prev_cand
                 log(f"🔄【连续 Learner 演化】五代非回滚窗口 (周期第 {window_phase + 1}/5 代, 累计未晋升: {consecutive_fails})，本代从上一代最优检查点连续推进: {base_pt}", self.log_file)
+            elif window_phase != 0 and prev_cand and drift_guard:
+                base_pt = current_champ
+                log(f"🛑【漂移护栏】上一代候选 Elo CI 下界 {prev_ci_lo:+.1f} < {DRIFT_GUARD_CI_FLOOR}，"
+                    f"累计漂移已在拉偏候选，本代回霸主重训: {base_pt}", self.log_file)
             elif consecutive_fails > 0 and window_phase == 0:
                 base_pt = current_champ
                 log(f"⚠️【安全熔断回滚】前一个 5 代窗口冲击 Champion 未果 (累计未晋升: {consecutive_fails})，触发安全回滚，本代重置从 Champion 重新热启: {base_pt}", self.log_file)
