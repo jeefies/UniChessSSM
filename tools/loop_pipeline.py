@@ -54,6 +54,37 @@ def write_json(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
+#: 换代门限的 Elo CI 下界阈值：候选"没有显著变弱"即可晋级（见 promotion_gate）
+ELO_CI_FLOOR = -5.0
+
+
+def promotion_gate(sprt_verdict, score_a, elo_ci95, elo_ci_floor: float = ELO_CI_FLOOR):
+    """换代门限 → (是否晋升, 依据)。三条任一满足即晋升：
+
+    1. ``SPRT H1``——序贯检验判"显著变强"（H₁=35 Elo）；
+    2. ``得分率 ≥ 55%%``——历史沿用的粗门限；
+    3. ``Elo 95%% CI 下界 > elo_ci_floor``（默认 −5）——"没有显著变弱"。
+
+    第 3 条是 2026-10-12 加的：六任霸主 round-robin 实测彼此差距只在 ±25 Elo 量级，而
+    600 局的 CI 半宽就有 ±25~50，H1 经常达不到；但"CI 下界 > −5"能稳定判定候选没变弱。
+    回测 31 代历史数据：该条件一次都没触发（历史 CI 下界都在 −50 以下），所以是纯粹的
+    救济通道，不会让既有判决变松。
+
+    注意：第 2 条（得分率≥55%）本身不带 CI 保护，运气好的抽样也能满足——若将来要进一步
+    降噪，应把这条也加上 CI 下界要求。
+    """
+    lo = None
+    if elo_ci95 and len(elo_ci95) > 0 and elo_ci95[0] is not None:
+        lo = float(elo_ci95[0])
+    if sprt_verdict == "H1":
+        return True, "SPRT H1"
+    if score_a is not None and score_a >= 0.55:
+        return True, "得分率>=55%"
+    if lo is not None and lo > float(elo_ci_floor):
+        return True, "Elo CI 下界 > %g" % elo_ci_floor
+    return False, "未达门限"
+
+
 class SsmLoopOrchestrator:
     def __init__(self, out_dir: Path, total_gens: int, games_per_gen: int,
                  initial_champion: str, opp_checkpoint: str,
@@ -439,9 +470,16 @@ class SsmLoopOrchestrator:
             t_arena = time.time() - t0
 
             # 4. 裁决与换代
+            # 门限见 promotion_gate：SPRT H1 / 得分率≥55% / Elo CI 下界 > -5，任一即晋升。
+            # 第 3 条为主——round-robin 实测这一大伙霸主彼此只差 ±25 Elo，而 600 局 CI 半宽
+            # 就有 ±25~50，H1（要 +35 Elo 证据）经常达不到，但"CI 下界 > -5"能稳定判定
+            # "候选没有显著变弱"，在这一大伙的内部差异下才是可用的判别力。
             sprt_verdict = arena_summary.get("sprt", {}).get("verdict")
             score_a = arena_summary.get("score_a", 0.0)
-            promoted = (sprt_verdict == "H1") or (score_a >= 0.55)
+            elo_ci = arena_summary.get("elo_ci95") or [None, None]
+            promoted, gate_reason = promotion_gate(sprt_verdict, score_a, elo_ci)
+            elo_ci_lo = elo_ci[0] if elo_ci and elo_ci[0] is not None else None
+            elo_ci_hi = elo_ci[1] if len(elo_ci) > 1 and elo_ci[1] is not None else None
 
             champion_before = current_champ
             if promoted:
@@ -451,13 +489,19 @@ class SsmLoopOrchestrator:
                 # 晋升候选模型
                 shutil.copy2(cand_pt, current_champ)
                 self.state["opp_champion"] = str(backup_champ)
-                log(f"🎉【加冕新霸主】Gen {gen_id} 满足换代门限 (SPRT={sprt_verdict}, 得分率={score_a:.2%})，晋升为现役 Champion！", self.log_file)
+                log(f"🎉【加冕新霸主】Gen {gen_id} 满足换代门限（依据：{gate_reason}；"
+                    f"SPRT={sprt_verdict}, 得分率={score_a:.2%}, Elo CI=[{elo_ci_lo}, {elo_ci_hi}]），"
+                    f"晋升为现役 Champion！", self.log_file)
             else:
-                log(f"🛡️【前任守擂】Gen {gen_id} 未突破换代门限 (SPRT={sprt_verdict}, 得分率={score_a:.2%})，现任 Champion 守擂成功。(连续冲击窗口: {consecutive_fails + 1}/5 代)", self.log_file)
+                log(f"🛡️【前任守擂】Gen {gen_id} 未突破换代门限（依据：{gate_reason}；"
+                    f"SPRT={sprt_verdict}, 得分率={score_a:.2%}, Elo CI=[{elo_ci_lo}, {elo_ci_hi}]）。"
+                    f"(连续冲击窗口: {consecutive_fails + 1}/5 代)", self.log_file)
 
             record = {
                 "generation": gen_id,
                 "promoted": promoted,
+                "gate_reason": gate_reason,
+                "elo_ci95": [elo_ci_lo, elo_ci_hi],
                 "candidate": str(cand_pt),
                 "train_base": base_pt,
                 "champion_before": champion_before,
