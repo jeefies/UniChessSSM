@@ -57,21 +57,25 @@ def write_json(path: Path, data: dict) -> None:
 #: 换代门限的 Elo CI 下界阈值：候选"没有显著变弱"即可晋级（见 promotion_gate）
 ELO_CI_FLOOR = -5.0
 
+#: 得分率门限（第②条）要求的最少对局数。SPRT 早停可能只剩几十局，那种样本的得分率
+#: 纯噪声（gen_0026 就只有 59 局）；100 局是得分率 55% 能达到 ~±100 Elo 精度的下限。
+MIN_GAMES_FOR_SCORE_GATE = 100
 
-def promotion_gate(sprt_verdict, score_a, elo_ci95, elo_ci_floor: float = ELO_CI_FLOOR):
+
+def promotion_gate(sprt_verdict, score_a, elo_ci95, games=None,
+                   elo_ci_floor: float = ELO_CI_FLOOR,
+                   min_games_for_score: int = MIN_GAMES_FOR_SCORE_GATE):
     """换代门限 → (是否晋升, 依据)。三条任一满足即晋升：
 
     1. ``SPRT H1``——序贯检验判"显著变强"（H₁=35 Elo）；
-    2. ``得分率 ≥ 55%%``——历史沿用的粗门限；
-    3. ``Elo 95%% CI 下界 > elo_ci_floor``（默认 −5）——"没有显著变弱"。
+    2. ``得分率 ≥ 55%`` **且对局数 ≥ min_games_for_score**（默认 100）——历史沿用的粗门限，
+       加局数约束是因为 SPRT 早停可能只剩几十局，那种样本的得分率是纯噪声；
+    3. ``Elo 95% CI 下界 > elo_ci_floor``（默认 −5）——"没有显著变弱"。
 
     第 3 条是 2026-10-12 加的：六任霸主 round-robin 实测彼此差距只在 ±25 Elo 量级，而
     600 局的 CI 半宽就有 ±25~50，H1 经常达不到；但"CI 下界 > −5"能稳定判定候选没变弱。
     回测 31 代历史数据：该条件一次都没触发（历史 CI 下界都在 −50 以下），所以是纯粹的
-    救济通道，不会让既有判决变松。
-
-    注意：第 2 条（得分率≥55%）本身不带 CI 保护，运气好的抽样也能满足——若将来要进一步
-    降噪，应把这条也加上 CI 下界要求。
+    救济通道，不会让既有判决变松。它天然自带局数保护——局数少时 CI 必然宽，下界不可能 > −5。
     """
     lo = None
     if elo_ci95 and len(elo_ci95) > 0 and elo_ci95[0] is not None:
@@ -79,7 +83,9 @@ def promotion_gate(sprt_verdict, score_a, elo_ci95, elo_ci_floor: float = ELO_CI
     if sprt_verdict == "H1":
         return True, "SPRT H1"
     if score_a is not None and score_a >= 0.55:
-        return True, "得分率>=55%"
+        if games is None or int(games) >= int(min_games_for_score):
+            return True, "得分率>=55%%(%s局)" % games
+        # 局数不够 ⇒ 这条不成立，落到 CI 下界那条去判
     if lo is not None and lo > float(elo_ci_floor):
         return True, "Elo CI 下界 > %g" % elo_ci_floor
     return False, "未达门限"
@@ -477,7 +483,8 @@ class SsmLoopOrchestrator:
             sprt_verdict = arena_summary.get("sprt", {}).get("verdict")
             score_a = arena_summary.get("score_a", 0.0)
             elo_ci = arena_summary.get("elo_ci95") or [None, None]
-            promoted, gate_reason = promotion_gate(sprt_verdict, score_a, elo_ci)
+            promoted, gate_reason = promotion_gate(sprt_verdict, score_a, elo_ci,
+                                                   games=arena_summary.get("games"))
             elo_ci_lo = elo_ci[0] if elo_ci and elo_ci[0] is not None else None
             elo_ci_hi = elo_ci[1] if len(elo_ci) > 1 and elo_ci[1] is not None else None
 

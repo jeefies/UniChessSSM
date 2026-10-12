@@ -61,8 +61,34 @@ class PromotionGateTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(why, "Elo CI 下界 > -5")
 
+    def test_score_gate_requires_min_games(self):
+        """得分率≥55% 但局数不够 ⇒ 这条不成立（SPRT 早停可能只剩几十局，得分率是噪声）。"""
+        ok, why = loop_pipeline.promotion_gate("H0", 0.60, [-40.0, 30.0], games=59)
+        self.assertFalse(ok)
+        self.assertEqual(why, "未达门限")
+
+    def test_score_gate_min_games_boundary(self):
+        # 恰好 100 局算够，99 局不算
+        ok, why = loop_pipeline.promotion_gate("H0", 0.56, [-40.0, 30.0], games=100)
+        self.assertTrue(ok)
+        self.assertIn("100局", why)
+        ok, _ = loop_pipeline.promotion_gate("H0", 0.56, [-40.0, 30.0], games=99)
+        self.assertFalse(ok)
+
+    def test_score_gate_falls_through_to_ci(self):
+        """得分率够但局数不够时，仍可由 CI 下界那条晋级。"""
+        ok, why = loop_pipeline.promotion_gate("H0", 0.60, [-2.0, 25.0], games=40)
+        self.assertTrue(ok)
+        self.assertEqual(why, "Elo CI 下界 > -5")
+
+    def test_games_none_keeps_score_gate(self):
+        """games 缺失（老记录）时不因局数约束否掉得分率门限。"""
+        ok, why = loop_pipeline.promotion_gate("H0", 0.56, [-40.0, 30.0], games=None)
+        self.assertTrue(ok)
+        self.assertIn("得分率", why)
+
     def test_backtest_history_no_flip(self):
-        """回测 31 代历史：新门限不应让任何一代的判决翻转（CI 下界都远低于 -5）。"""
+        """回测 31 代历史：新门限不应让任何一代的判决翻转。"""
         import glob
         import json
         rows = []
@@ -73,13 +99,17 @@ class PromotionGateTest(unittest.TestCase):
             s = json.load(open(p, encoding="utf-8"))
             sprt = (s.get("sprt") or {}).get("verdict")
             score = s.get("score_a")
+            games = s.get("games")
             ci = s.get("elo_ci95") or [None, None]
             old = (sprt == "H1") or (score is not None and score >= 0.55)
-            new, _ = loop_pipeline.promotion_gate(sprt, score, ci)
-            rows.append((old, new))
+            new, _ = loop_pipeline.promotion_gate(sprt, score, ci, games=games)
+            rows.append((old, new, games))
         self.assertTrue(rows, "没读到历史 Arena 记录（远端才有 runs/，本机应跳过）")
-        for old, new in rows:
-            self.assertEqual(old, new, "新门限改改了历史判决")
+        for old, new, g in rows:
+            self.assertEqual(old, new, f"新门限改改了历史判决（{g} 局那代）")
+        # 顺便确认：历史上确有不足 100 局的代（SPRT 早停），它们不能被得分率门限放走
+        small = [g for _, _, g in rows if g is not None and g < 100]
+        self.assertTrue(small, "历史里没有不足 100 局的代，这条约束没被验证到")
 
 
 if __name__ == "__main__":
