@@ -42,6 +42,9 @@ UniChessSSM 是 UniChess 的**状态序列模型（state-sequence model）**：�
 **Stage B 实验总录**：`docs/stage-b-experiment.md`（Round 1~5 攻坚、Champion gen4 确立、Gen 6~9 循环实录）。
 **Elo 衰退根因诊断**：`docs/elo-degradation-analysis.md`（Val Policy Loss 新低与 MCTS Arena 守擂偏科根因深度剖析）。
 **Stage B 实施规格**：`docs/stage-b-implementation.md`（唯一规格来源，与 handoff 冲突时以规格为准）。
+**表征与强度审计**：`docs/representation-and-strength-audit.md`（E/h_t 坍缩探针、动力学 VoE、
+Champion 谱系单调性、SF 绝对强度标尺；含一个因漏加 `cond` 导致测量虚高 10 倍的踩坑）。
+**价值目标实验总录**：`docs/value-target-experiments.md`（λ-return / 开局库扩容 / 门禁重设计 / 漂移护栏）。
 
 ## 2. 设备与连接路由
 
