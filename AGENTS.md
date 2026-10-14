@@ -43,7 +43,8 @@ UniChessSSM 是 UniChess 的**状态序列模型（state-sequence model）**：�
 **Elo 衰退根因诊断**：`docs/elo-degradation-analysis.md`（Val Policy Loss 新低与 MCTS Arena 守擂偏科根因深度剖析）。
 **Stage B 实施规格**：`docs/stage-b-implementation.md`（唯一规格来源，与 handoff 冲突时以规格为准）。
 **表征与强度审计**：`docs/representation-and-strength-audit.md`（E/h_t 坍缩探针、动力学 VoE、
-Champion 谱系单调性、SF 绝对强度标尺；含一个因漏加 `cond` 导致测量虚高 10 倍的踩坑）。
+Champion 谱系单调性、SF 绝对强度标尺、Maia 人类 Elo 标尺尝试；含两个因测量口径写错而导致
+结论作废的踩坑：漏加 `cond` 使 `dyn_rel_err` 虚高 10 倍、lc0 历史平面未逐个按行棋方定向）。
 **价值目标实验总录**：`docs/value-target-experiments.md`（λ-return / 开局库扩容 / 门禁重设计 / 漂移护栏）。
 
 ## 2. 设备与连接路由
